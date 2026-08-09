@@ -41,7 +41,7 @@ OUT_DIR=""
 PREFIX=""
 ARCH=""
 BRANCHES=1
-ALL_PATHS=""
+ALL_PATHS=()
 KEEP_ARGS=()
 EXCLUDE_ARGS=()
 PRESET=""
@@ -53,7 +53,7 @@ while [[ $# -gt 0 ]]; do
     --out-dir)          OUT_DIR="$2"; shift 2 ;;
     --toolchain-prefix) PREFIX="$2"; shift 2 ;;
     --arch)             ARCH="$2"; shift 2 ;;
-    --all-paths)        ALL_PATHS="--all-paths"; shift ;;
+    --all-paths)        ALL_PATHS=(--all-paths); shift ;;
     --keep)             KEEP_ARGS+=(--keep "$2"); shift 2 ;;
     --exclude)          EXCLUDE_ARGS+=(--exclude "$2"); shift 2 ;;
     --preset)           PRESET="$2"; shift 2 ;;
@@ -80,7 +80,12 @@ PREFIX_OPT=(--toolchain-prefix "$PREFIX")
 
 # Path-selection options passed through to every producer, so the covered and
 # coverable sides derive identical keys. They must agree or the merge is wrong.
-PATH_OPTS=("${SRC_OPT[@]}" $ALL_PATHS "${KEEP_ARGS[@]}" "${EXCLUDE_ARGS[@]}")
+#
+# Note the ${arr[@]+"${arr[@]}"} idiom used for every possibly-empty array
+# below: bash before 4.4 -- which includes the 3.2 that macOS still ships --
+# treats "${arr[@]}" on an empty array as an unbound variable under `set -u`.
+PATH_OPTS=(${SRC_OPT[@]+"${SRC_OPT[@]}"} ${ALL_PATHS[@]+"${ALL_PATHS[@]}"} ${KEEP_ARGS[@]+"${KEEP_ARGS[@]}"} \
+          ${EXCLUDE_ARGS[@]+"${EXCLUDE_ARGS[@]}"})
 [[ -n "$PRESET" ]] && PATH_OPTS+=(--preset "$PRESET")
 
 read_meta() {  # read_meta <cov> <key>
@@ -115,7 +120,7 @@ for cov in "${covs[@]}"; do
 
   # Covered lines: what actually ran.
   "${TCGCOV[@]}" symbolize --cov "$cov" --elf "$elf" \
-    "${PREFIX_OPT[@]}" "${PATH_OPTS[@]}" --arch "$ARCH" \
+    "${PREFIX_OPT[@]}" ${PATH_OPTS[@]+"${PATH_OPTS[@]}"} --arch "$ARCH" \
     --out "$SYM_DIR/$base.jsonl"
 
   # Coverable lines: the denominator. Test-agnostic, so cache it per ELF.
@@ -123,7 +128,7 @@ for cov in "${covs[@]}"; do
   cab="$CAB_DIR/$safe.jsonl"
   if [[ ! -s "$cab" ]]; then
     "${TCGCOV[@]}" coverable --elf "$elf" \
-      "${PREFIX_OPT[@]}" "${PATH_OPTS[@]}" --arch "$ARCH" \
+      "${PREFIX_OPT[@]}" ${PATH_OPTS[@]+"${PATH_OPTS[@]}"} --arch "$ARCH" \
       --out "$cab"
   fi
 
@@ -133,7 +138,7 @@ for cov in "${covs[@]}"; do
     br="$OUT_DIR/branches/$base.jsonl"
     mkdir -p "$OUT_DIR/branches"
     if "${TCGCOV[@]}" branches --cov "$cov" --elf "$elf" \
-         "${PREFIX_OPT[@]}" "${PATH_OPTS[@]}" --arch "$ARCH" \
+         "${PREFIX_OPT[@]}" ${PATH_OPTS[@]+"${PATH_OPTS[@]}"} --arch "$ARCH" \
          --out "$br" 2>"$br.log"; then
       BR_OPT=(--branches "$br")
     else
@@ -142,7 +147,7 @@ for cov in "${covs[@]}"; do
   fi
 
   "${TCGCOV[@]}" lcov "$SYM_DIR/$base.jsonl" \
-    --coverable "$cab" "${BR_OPT[@]}" --out "$PT_DIR/$base.info"
+    --coverable "$cab" ${BR_OPT[@]+"${BR_OPT[@]}"} --out "$PT_DIR/$base.info"
 done
 
 "${TCGCOV[@]}" merge "$PT_DIR"/*.info --name "$ARCH" --out "$AGG"
