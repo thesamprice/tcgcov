@@ -1,0 +1,11 @@
+# The wheel is pure Python, but the sdist should be enough to actually USE the
+# tool: that means the TCG plugin source (the Python half is useless without an
+# artifact to read) and the documentation that explains the format and the
+# architecture profiles.
+include CHANGELOG.md
+include tcgcov-report.sh
+recursive-include plugin *.c Makefile .gitignore
+recursive-include docs *.md
+recursive-include examples *.c *.md
+recursive-include tests *.py
+recursive-include tests/data *.txt

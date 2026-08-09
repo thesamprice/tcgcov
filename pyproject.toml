@@ -28,6 +28,7 @@ classifiers = [
 Homepage = "https://github.com/thesamprice/tcgcov"
 Source = "https://github.com/thesamprice/tcgcov"
 Issues = "https://github.com/thesamprice/tcgcov/issues"
+Changelog = "https://github.com/thesamprice/tcgcov/blob/main/CHANGELOG.md"
 
 [project.scripts]
 tcgcov = "tcgcov.cli:main"
