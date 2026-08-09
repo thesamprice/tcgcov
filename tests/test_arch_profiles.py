@@ -372,18 +372,146 @@ MIPS = [
     ("bbit132 $a0, 3, 400 <x>", COND, True),
     ("addiu $sp, $sp, -32", OTHER, False),
     ("lw $a0, 0($sp)", OTHER, False),
+
+    # --- microMIPS, which this profile also covers (see the fold-vs-fork note
+    # in cfg.py). Delay-slot column is the opcode table's UBD/CBD/NODS flag.
+    # binutils prints the 16-bit forms under the PLAIN names -- there is no
+    # "16" string anywhere in micromips-opc.c -- so the plain spellings are
+    # already pinned above; the '16' spellings below are llvm-objdump's.
+    #
+    # 'b16' is UNCONDITIONAL despite reading like the beqz16/bnez16 pair:
+    # micromips-opc.c:322 is UBD (not CBD) and LLVM derives it from
+    # UncondBranchMM16 (MicroMipsInstrInfo.td:673).
+    ("b16 400 <x>", UNCOND, True),            # micromips-opc.c:322, UBD
+    ("bc16 400 <x>", UNCOND, False),          # MicroMips32r6InstrInfo.td:370
+    ("beqz16 $a0, 400 <x>", COND, True),      # micromips-opc.c:386, CBD
+    ("bnez16 $a0, 400 <x>", COND, True),      # micromips-opc.c:444, CBD
+    ("beqzc16 $a0, 400 <x>", COND, False),    # :395 beqzc, NODS|CBR
+    ("bnezc16 $a0, 400 <x>", COND, False),    # :453 bnezc, NODS|CBR
+    # short-delay-slot conditional-and-link: COND, like bgezal/bltzal
+    ("bgezals $a0, 400 <x>", COND, True),     # micromips-opc.c:409, CBD|BD16
+    ("bltzals $a0, 400 <x>", COND, True),     # micromips-opc.c:442, CBD|BD16
+    # short-delay-slot / 16-bit register jumps. BD16 constrains the slot to a
+    # 2-byte instruction; it does not remove it, so these all still delay.
+    ("jrs t0", UNCOND, True),                 # micromips-opc.c:734, UBD|BD16
+    ("jrs ra", RET, True),
+    ("jrs.hb t0", UNCOND, True),              # micromips-opc.c:740
+    ("jr16 t0", UNCOND, True),                # :732 jr "mj"; llvm 'jr16'
+    ("jr16 ra", RET, True),
+    ("jrc16 t0", UNCOND, False),              # :752 jrc, NODS|UBR; llvm r6
+    ("jrc16 ra", RET, False),
+    ("jalrs t9", CALL, True),                 # micromips-opc.c:762, UBD|BD16
+    ("jalrs16 t9", CALL, True),               # MicroMipsInstrInfo.td:661
+    ("jalrs.hb t9", CALL, True),              # micromips-opc.c:766
+    ("jalr16 t9", CALL, True),                # MicroMipsInstrInfo.td:659
+    # DIRECT microMIPS calls -- operand is a real target, must not be indirect
+    ("jals 400 <x>", CALL, True),             # micromips-opc.c:779, UBD|BD16
+    ("bals 400 <x>", CALL, True),             # micromips-opc.c:329, UBD|BD16
+    # compact return-and-pop: the operand is a STACK ADJUSTMENT, not a target
+    ("jraddiusp 16", RET, False),             # :735, NODS|UBR, RD_31
+    ("jrcaddiusp 16", RET, False),            # MicroMips32r6InstrInfo.td:493
+    # NOT transfers. Every one of these is a real microMIPS mnemonic that a
+    # too-greedy pattern would eat: 'addiusp' shares a tail with 'jraddiusp',
+    # 'balign'/'bitrev' start with 'bal'/'b', and the MSA bit ops spell
+    # 'bneg'/'bclr'/'bsel'/'bset' (micromips-opc.c:1366-1367, 1259, 1444, 1428,
+    # 1766, 1436). 'restore'/'save' write/read $31 but only move the frame.
+    ("addiusp 16", OTHER, False),             # micromips-opc.c:352
+    ("addiur1sp $a0, 16", OTHER, False),      # micromips-opc.c:350
+    ("balign $a0, $a1, 2", OTHER, False),     # micromips-opc.c:1367
+    ("bitrev $a0, $a1", OTHER, False),        # micromips-opc.c:1259
+    ("bneg.b $w0, $w1, $w2", OTHER, False),   # micromips-opc.c:1444
+    ("bclr.b $w0, $w1, $w2", OTHER, False),   # micromips-opc.c:1428
+    ("bset.b $w0, $w1, $w2", OTHER, False),   # micromips-opc.c:1436
+    ("bsel.v $w0, $w1, $w2", OTHER, False),   # micromips-opc.c:1766
+    ("break16", OTHER, False),                # MicroMipsInstrInfo.td:675
+    ("sdbbp16", OTHER, False),
+    ("movep $a0, $a1, $a2, $a3", OTHER, False),   # micromips-opc.c:902, NODS
+    ("lwm $s0-$s1, 8($sp)", OTHER, False),        # micromips-opc.c:842, NODS
 ]
 
 # Every jr/jalr/jic/jialc form, in both register spellings. 'jr ra' and
 # 'jic ra,0' are here even though they classify RET: the `ret` pattern is tried
 # first so the RETURN classification still wins, but the target of a return
 # through $ra is a register all the same. j/jal/jalx/bc/balc are PC-relative
-# and must stay out -- swallowing them would delete every MIPS jump target.
+# and must stay out -- swallowing them would delete every MIPS jump target, and
+# so are the DIRECT microMIPS forms b16/beqz16/jals/bals for the same reason.
 INDIRECT_MIPS = [
     "jr $t0", "jr t0", "jr $ra", "jr ra", "jr.hb t0",
     "jalr $t0", "jalr v1", "jalr a0,v1", "jalr.hb a0,v1",
     "jrc at", "jalrc t0",
     "jic v1,-32768", "jic ra,0", "jialc v1,32767",
+    # microMIPS register-target jumps
+    "jrs t0", "jrs ra", "jrs.hb t0", "jr16 t0", "jr16 ra",
+    "jrc16 t0", "jrc16 ra",
+    "jalrs t9", "jalrs16 t9", "jalrs.hb t9", "jalr16 t9",
+    "jraddiusp 16", "jrcaddiusp 16",
+]
+
+
+# --- MIPS16 / MIPS16e -------------------------------------------------------
+# A SEPARATE profile because mips16-opc.c contradicts mips-opc.c on identical
+# mnemonics: the five PC-relative branches carry pinfo2 UBR/CBR and NO
+# INSN_*_BRANCH_DELAY at all (there is no CBD macro in mips16-opc.c), so
+# "beqz a0, 400" does not delay here while it does on MIPS32. Only the jumps
+# delay, and the MIPS16e compact jrc/jalrc do not.
+MIPS16 = [
+    # PC-relative branches -- NO delay slot (mips16-opc.c:237-263)
+    ("b 400 <x>", UNCOND, False),          # :237, pinfo 0, pinfo2 UBR
+    ("beqz a0, 400 <x>", COND, False),     # :240, pinfo2 CBR
+    ("bnez a0, 400 <x>", COND, False),     # :259, pinfo2 CBR
+    ("beqz $4, 400 <x>", COND, False),     # -M gpr-names=numeric spelling
+    ("bteqz 400 <x>", COND, False),        # :262, branches on the $t8 bit
+    ("btnez 400 <x>", COND, False),        # :263
+    # register jumps -- these DO delay (mips16-opc.c:325-334, UBD). 'R' is the
+    # fixed $31 operand (mips16-opc.c:69, reg_31_map), so it prints as 'ra'.
+    ("jr a0", UNCOND, True),               # :331, "x"
+    ("jr ra", RET, True),                  # :332, "R"
+    ("jr $31", RET, True),
+    ("j a0", UNCOND, True),                # :333, alias of jr
+    ("j ra", RET, True),                   # :334
+    ("jalr a0", CALL, True),               # :325, "x"
+    ("jalr ra, a0", CALL, True),           # :326, "R,x"
+    ("jal ra, a0", CALL, True),            # :327-328, alias of jalr
+    # direct calls -- 32-bit encodings with a real printed target
+    ("jal 400 <x>", CALL, True),           # :329, "a"  JUMP(26,0,2)
+    ("jalx 400 <x>", CALL, True),          # :330, "i"  JALX(26,0,2)
+    # MIPS16e compact jumps -- NODS, no delay slot (mips16-opc.c:338-341)
+    ("jrc a0", UNCOND, False),             # :340, "x"
+    ("jrc ra", RET, False),                # :341, "R"
+    ("jalrc a0", CALL, False),             # :338, "x"
+    ("jalrc ra, a0", CALL, False),         # :339, "R,x"
+    # NOT transfers. 'restore' writes $31 and 'save' reads it, and both carry
+    # NODS (mips16-opc.c:447-448) -- exactly the bits a "writes ra => call" or
+    # "NODS => compact branch" heuristic keys on -- but they only move the
+    # frame pointer. entry/exit/break/sdbbp are TRAP rows (:316-321, :260,
+    # :449); 'extend' (:478) is the 32-bit-immediate prefix, not an
+    # instruction; 'b' must not swallow 'break'.
+    ("restore 16", OTHER, False),
+    ("save 16", OTHER, False),
+    ("break", OTHER, False),
+    ("sdbbp", OTHER, False),
+    ("entry", OTHER, False),
+    ("exit", OTHER, False),
+    ("extend", OTHER, False),
+    ("addiu a0, 16", OTHER, False),        # mips16-opc.c:217
+    ("addiu sp, -32", OTHER, False),       # mips16-opc.c:218
+    ("move a0, a1", OTHER, False),         # mips16-opc.c:373
+    ("cmp a0, a1", OTHER, False),          # mips16-opc.c:377, sets $t8
+    ("lw a0, 0(sp)", OTHER, False),
+]
+
+# jr/jrc/jalr/jalrc are unconditionally register-target. 'jal' and 'j' are
+# ambiguous and split on the first operand character (a letter/'$' means
+# register, a digit means the operand IS the address) -- the same trick ARM
+# uses for 'blx' and SPARC for 'call'. 'jalx' has no register form and stays
+# direct, as do "jal 400 <x>" and every PC-relative branch. This split is
+# load-bearing: "a0" and "ra" are spelled entirely in hex digits, so without it
+# the bare-hex reader turns "jr a0" into a branch to 0xa0.
+INDIRECT_MIPS16 = [
+    "jr a0", "jr ra", "jr $31", "j a0", "j ra",
+    "jrc a0", "jrc ra",
+    "jalr a0", "jalr ra, a0", "jal ra, a0",
+    "jalrc a0", "jalrc ra, a0",
 ]
 
 
@@ -587,17 +715,44 @@ RISCV = [
     ("c.jalr a0", CALL, False),            # riscv-opc.c:1194, -M no-aliases
     ("ret", RET, False),
     ("c.ret", RET, False),
+    # Zcmt table jumps (riscv-opc.c:2343-2344). The operand is an index into
+    # the JVT-based jump table, printed as a bare unsigned decimal
+    # (riscv-dis.c:746-750, "%" PRIu64) -- so these MUST terminate their block
+    # AND must be refused a target, or the index parses as an address.
+    ("cm.jt 5", UNCOND, False),
+    ("cm.jt 20", UNCOND, False),
+    ("cm.jalt 32", CALL, False),
+    ("cm.jalt 255", CALL, False),
+    # Zcmp pop-and-return (riscv-opc.c:2337-2338).
+    ("cm.popret {ra}, 16", RET, False),
+    ("cm.popret {ra, s0-s11}, 64", RET, False),
+    ("cm.popretz {ra}, 16", RET, False),
+    # ...and the Zcmp rows that do NOT transfer control. cm.push/cm.pop are the
+    # false-positive guard for the `ret` pattern: 'cm.pop' must not reach
+    # 'cm.popret' (riscv-opc.c:2335-2336), and cm.mva01s/cm.mvsa01
+    # (:2339-2340) are register moves.
+    ("cm.push {ra, s0-s11}, -64", OTHER, False),
+    ("cm.pop {ra}, 16", OTHER, False),
+    ("cm.mva01s s0, s1", OTHER, False),
+    ("cm.mvsa01 s0, s1", OTHER, False),
+    ("c.mop.1", OTHER, False),             # Zcmop hint, riscv-opc.c:2324-2332
+    ("c.zext.b s0", OTHER, False),         # Zcb, riscv-opc.c:2309-2322
     ("addi sp, sp, -32", OTHER, False),
     ("sd ra, 24(sp)", OTHER, False),
     ("li a0, 0", OTHER, False),
 ]
 
-# jr/jalr are the only register-indirect transfers in riscv_opcodes[]; j/jal
-# (and the call/tail macros) are PC-relative and must stay out.
+# jr/jalr are the only register-indirect transfers in the base ISA; the Zcmt
+# table jumps join them because their operand is a table INDEX, not an address.
+# j/jal (and the call/tail macros) are PC-relative and must stay out, as must
+# every non-transfer cm.* row. cm.popret/cm.popretz stay out for the same
+# reason 'ret' does on this arch and 'ret'/'retaa' do on AArch64: they classify
+# RET, and RET is never target-parsed.
 INDIRECT_RISCV = [
     "jr a0", "jr 16(a0)", "c.jr a0",
     "jalr a0", "jalr 16(a0)", "jalr 0x10(a0)", "jalr a1,16(a0)", "jalr a1,a0",
     "c.jalr a0",
+    "cm.jt 5", "cm.jt 20", "cm.jalt 32", "cm.jalt 255",
 ]
 
 
@@ -607,6 +762,7 @@ TABLES = (
     ("aarch64", AARCH64, INDIRECT_AARCH64),
     ("x86_64", X86, INDIRECT_X86),
     ("mips", MIPS, INDIRECT_MIPS),
+    ("mips16", MIPS16, INDIRECT_MIPS16),
     ("sparc", SPARC, INDIRECT_SPARC),
     ("powerpc", POWERPC, INDIRECT_POWERPC),
     ("riscv", RISCV, INDIRECT_RISCV),
@@ -637,8 +793,8 @@ class TestClassificationTables(unittest.TestCase):
                 self.assertGreaterEqual(len(table), 28)
 
     def test_delay_slot_flag_matches_the_arch(self):
-        """Only MicroBlaze, MIPS and SPARC have architectural delay slots."""
-        delaying = {"microblaze", "mips", "sparc"}
+        """Only MicroBlaze, the MIPS family and SPARC have delay slots."""
+        delaying = {"microblaze", "mips", "micromips", "mips16", "sparc"}
         for arch, table, _ in TABLES:
             profile = cfg.get_profile(arch)
             with self.subTest(arch=arch):
@@ -788,6 +944,184 @@ class TestSparcBranchNever(unittest.TestCase):
         p = cfg.get_profile("sparc")
         self.assertEqual(p.classify("cb 10024 <x>"), cfg.UNCOND)
         self.assertEqual(p.classify("cba 10024 <x>"), cfg.UNCOND)
+
+
+class TestMicroMipsIsFoldedIntoMips(unittest.TestCase):
+    """microMIPS shares the MIPS32 pattern set; only insn_size differs.
+
+    The fold is deliberate and the reasoning is in cfg.py: microMIPS spells
+    every shared transfer identically to MIPS32 AND flags it identically
+    (UBD/CBD/NODS), and objdump switches between the two per SYMBOL inside one
+    ELF (is_compressed_mode_p, mips-dis.c:2655-2679), so a single disassembly
+    interleaves both and one profile has to classify both. If the two pattern
+    sets ever drift apart, that assumption is broken and this fails.
+    """
+
+    def test_classification_is_identical_to_mips(self):
+        mips, micro = cfg.get_profile("mips"), cfg.get_profile("micromips")
+        self.assertIsNot(mips, micro)
+        for text, _, _ in MIPS:
+            with self.subTest(insn=text):
+                kind = mips.classify(text)
+                self.assertEqual(micro.classify(text), kind)
+                self.assertEqual(micro.delays(kind, text),
+                                 mips.delays(kind, text))
+                self.assertEqual(micro.is_indirect(text),
+                                 mips.is_indirect(text))
+
+    def test_only_the_section_end_size_fallback_differs(self):
+        """2 bytes, because microMIPS fetches in 16-bit chunks.
+
+        insn_size is consulted only for an instruction with no successor to
+        measure against -- the last one in a section. Inheriting MIPS32's 4
+        there puts the fall-through of a section-final 16-bit branch two bytes
+        past the real one, which leaves it permanently half-covered.
+        """
+        self.assertEqual(cfg.get_profile("mips").insn_size, 4)
+        self.assertEqual(cfg.get_profile("micromips").insn_size, 2)
+        self.assertEqual(cfg.get_profile("mips16").insn_size, 2)
+
+    def test_compressed_names_do_not_leak_onto_plain_mips_lookups(self):
+        """'micromips'/'mips16' must win over the 'mips' substring.
+
+        ARCH_ALIASES is an ordered list of SUBSTRING tests and every one of
+        these names contains "mips", so ordering is the only thing keeping
+        --arch micromips off the 4-byte profile -- the same trap 'thumb' vs
+        'arm' has.
+        """
+        for name, expected in (("micromips", "micromips"),
+                               ("mips:micromips", "micromips"),
+                               ("micromips32r2", "micromips"),
+                               ("umips", "micromips"),
+                               ("mips16", "mips16"),
+                               ("mips:16", "mips16"),
+                               ("mips16e2", "mips16"),
+                               ("mips", "mips"),
+                               ("mipsel", "mips"),
+                               ("mips64", "mips")):
+            with self.subTest(name=name):
+                self.assertEqual(cfg.get_profile(name).name, expected)
+
+    def test_a_micromips_elf_still_detects_as_plain_mips(self):
+        """No BFD name distinguishes microMIPS, and that is the right answer.
+
+        objdump's "file format" line is the target-vector name
+        (binutils/objdump.c:5809-5811) and _bfd_elf_mips_mach
+        (bfd/elfxx-mips.c:7044-7160) never derives bfd_mach_mips_micromips from
+        an ELF at all. Landing on 'mips' is correct: the ELF may interleave
+        compressed and MIPS32 functions, and 'mips' classifies both.
+        """
+        banner = "a.elf:     file format elf32-tradlittlemips\n"
+        self.assertEqual(cfg.detect_arch(banner), "mips")
+
+
+class TestMips16BranchesDoNotDelay(unittest.TestCase):
+    """The contradiction that forced a separate profile.
+
+    mips16-opc.c:237-263 gives b/beqz/bnez/bteqz/btnez pinfo2 UBR/CBR and NO
+    INSN_COND_BRANCH_DELAY -- there is no CBD macro in that file. Under the
+    MIPS32 profile the same text delays, so _fallthrough skips one extra
+    instruction and the branch's not-taken edge can never match.
+    """
+
+    BRANCHES = ("b 400 <x>", "beqz a0, 400 <x>", "bnez a0, 400 <x>",
+                "bteqz 400 <x>", "btnez 400 <x>")
+
+    def test_mips16_branches_have_no_delay_slot(self):
+        p = cfg.get_profile("mips16")
+        for text in self.BRANCHES:
+            with self.subTest(insn=text):
+                self.assertFalse(p.delays(p.classify(text), text))
+
+    def test_mips32_disagrees_which_is_why_the_profile_forked(self):
+        p = cfg.get_profile("mips")
+        for text in ("b 400 <x>", "beqz a0, 400 <x>", "bnez a0, 400 <x>"):
+            with self.subTest(insn=text):
+                self.assertTrue(p.delays(p.classify(text), text))
+
+    def test_mips16_jumps_do_delay_but_the_compact_ones_do_not(self):
+        p = cfg.get_profile("mips16")
+        for text in ("jr a0", "jalr a0", "jal 400 <x>", "jalx 400 <x>"):
+            with self.subTest(insn=text):
+                self.assertTrue(p.delays(p.classify(text), text))
+        for text in ("jrc a0", "jalrc a0", "jrc ra"):
+            with self.subTest(insn=text):
+                self.assertFalse(p.delays(p.classify(text), text))
+
+    def test_a_mips16_branch_fallthrough_is_the_next_instruction(self):
+        """End-to-end: the wrong delay flag moves the fall-through address."""
+        text = "\n".join([
+            "", "a.elf:     file format elf32-tradbigmips", "",
+            "Disassembly of section .text:", "",
+            "00400000 <main>:",
+            "  400000:\t6a01     \tli\ta0, 1",
+            "  400002:\t2202     \tbeqz\ta0, 400008 <done>",
+            "  400004:\t6a02     \tli\ta0, 2",
+            "  400006:\t6a03     \tli\ta0, 3",
+            "",
+            "00400008 <done>:",
+            "  400008:\te8a0     \tjrc\tra",
+        ]) + "\n"
+        graph = cfg.analyze(text, cfg.get_profile("mips16"))
+        self.assertEqual([(bp.addr, bp.mnemonic, bp.taken, bp.fallthrough)
+                          for bp in graph.branch_points],
+                         [(0x400002, "beqz", 0x400008, 0x400004)])
+        # Under the MIPS32 profile the same text delays, so the fall-through
+        # comes out as 0x400006 -- an address no recorded edge will ever carry.
+        wrong = cfg.analyze(text, cfg.get_profile("mips"))
+        self.assertEqual([bp.fallthrough for bp in wrong.branch_points],
+                         [0x400006])
+
+
+class TestMicroMipsTransfersTerminateTheirBlock(unittest.TestCase):
+    """The compressed transfers used to fall through to OTHER.
+
+    An unrecognized transfer does not end its block, so blocks silently merge
+    across it; and 'beqz16'/'bnez16' were missing from the branch DENOMINATOR
+    entirely, not merely mis-blocked.
+    """
+
+    def test_every_compressed_transfer_is_a_terminator(self):
+        p = cfg.get_profile("mips")
+        for text in ("b16 400 <x>", "bc16 400 <x>",
+                     "beqz16 $a0, 400 <x>", "bnez16 $a0, 400 <x>",
+                     "beqzc16 $a0, 400 <x>", "bnezc16 $a0, 400 <x>",
+                     "bgezals $a0, 400 <x>", "bltzals $a0, 400 <x>",
+                     "jr16 t0", "jrc16 t0", "jrs t0", "jrs.hb t0",
+                     "jalrs t9", "jalrs16 t9", "jalrs.hb t9", "jalr16 t9",
+                     "jals 400 <x>", "bals 400 <x>",
+                     "jraddiusp 16", "jrcaddiusp 16"):
+            with self.subTest(insn=text):
+                self.assertIn(p.classify(text), cfg.TERMINATORS)
+
+    def test_the_conditional_ones_are_branch_points(self):
+        p = cfg.get_profile("mips")
+        for text in ("beqz16 $a0, 400 <x>", "bnez16 $a0, 400 <x>",
+                     "beqzc16 $a0, 400 <x>", "bnezc16 $a0, 400 <x>",
+                     "bgezals $a0, 400 <x>", "bltzals $a0, 400 <x>"):
+            with self.subTest(insn=text):
+                self.assertEqual(p.classify(text), cfg.COND)
+
+    def test_b16_is_unconditional_not_conditional(self):
+        """It reads like the beqz16/bnez16 pair but is UBD, not CBD.
+
+        micromips-opc.c:322 carries INSN_UNCOND_BRANCH_DELAY and LLVM derives
+        it from UncondBranchMM16 (MicroMipsInstrInfo.td:673). Calling it COND
+        would add a branch point whose "not taken" side does not exist.
+        """
+        p = cfg.get_profile("mips")
+        self.assertEqual(p.classify("b16 400 <x>"), cfg.UNCOND)
+        self.assertEqual(p.classify("bc16 400 <x>"), cfg.UNCOND)
+
+    def test_jr_ra_and_jrc_ra_are_not_regressed(self):
+        """The RET/UNCOND split the microMIPS additions had to preserve."""
+        p = cfg.get_profile("mips")
+        self.assertEqual(p.classify("jr $ra"), cfg.RET)
+        self.assertEqual(p.classify("jr ra"), cfg.RET)
+        self.assertEqual(p.classify("jr t0"), cfg.UNCOND)
+        self.assertEqual(p.classify("jrc ra"), cfg.RET)
+        self.assertTrue(p.is_indirect("jrc ra"))
+        self.assertTrue(p.is_indirect("jr $ra"))
 
 
 if __name__ == "__main__":

@@ -456,6 +456,105 @@ class TestRegisterDisplacementIsNotATarget(unittest.TestCase):
                          0x1000)
 
 
+class TestZcmtTableIndexIsNotATarget(unittest.TestCase):
+    """A Zcmt jump-table INDEX must never be read as a branch target.
+
+    Same failure shape as TestRegisterDisplacementIsNotATarget above, one step
+    worse. RISC-V `cm.jt`/`cm.jalt` (riscv-opc.c:2343-2344) take an index into
+    the jump-vector table based at the JVT CSR; the disassembler prints it as a
+    bare unsigned decimal (riscv-dis.c:746-750, "%" PRIu64) and cannot resolve
+    it, because it has no way to read JVT. Two consequences:
+
+      * they were classified OTHER, so they did not terminate their block and
+        blocks merged straight across an unconditional transfer;
+      * once classified, the bare-hex reader would take "cm.jt 20" as a branch
+        to 0x20 -- and when 0x20 names a real instruction, build_blocks splits
+        a block there. That is exactly the `jmpl %g1+0x10` corruption.
+
+    Both rows also carry pinfo 0 rather than INSN_BRANCH/INSN_JSR, so binutils
+    never sets info->insn_type or info->target for them either: nothing
+    downstream of objdump flags these, which is why they have to be named here.
+    """
+
+    def test_zcmt_table_jumps_are_indirect(self):
+        p = cfg.get_profile("riscv")
+        for text in ("cm.jt 5", "cm.jt 20", "cm.jalt 32", "cm.jalt 255"):
+            with self.subTest(insn=text):
+                self.assertTrue(p.is_indirect(text))
+                self.assertIsNone(cfg._parse_target(text, 0x1000, p))
+                # ...and still None when the index IS a real instruction
+                # address, which is the case that corrupts the block map.
+                self.assertIsNone(cfg._parse_target(
+                    text, 0x1000, p, None, {0x5, 0x20, 0x32, 0x255}))
+
+    def test_zcmt_terminates_its_block_and_injects_no_leader(self):
+        """The end-to-end shape: index 20 that reads as the address 0x20.
+
+        Before the fix `cm.jt` classified OTHER, so the whole function was one
+        block and the transfer was invisible. A too-eager fix that classified
+        it UNCOND without marking it indirect would instead make 0x20 a block
+        leader. Neither may happen: one block ends AT the cm.jt, and 0x20 is
+        not a leader (nothing branches there).
+        """
+        text = objdump([
+            "00000000 <main>:",
+            (0x0000, "4501", "li\ta0, 0"),
+            (0x0002, "a052", "cm.jt\t20"),
+            (0x0004, "4505", "li\ta0, 1"),
+            (0x0006, "4509", "li\ta0, 2"),
+            (0x0008, "450d", "li\ta0, 3"),
+            (0x000a, "4511", "li\ta0, 4"),
+            (0x000c, "4515", "li\ta0, 5"),
+            (0x000e, "4519", "li\ta0, 6"),
+            (0x0010, "451d", "li\ta0, 7"),
+            (0x0012, "4521", "li\ta0, 8"),
+            (0x0014, "4525", "li\ta0, 9"),
+            (0x0016, "4529", "li\ta0, 10"),
+            (0x0018, "452d", "li\ta0, 11"),
+            (0x001a, "4531", "li\ta0, 12"),
+            (0x001c, "4535", "li\ta0, 13"),
+            (0x001e, "4539", "li\ta0, 14"),
+            (0x0020, "453d", "li\ta0, 15"),
+            (0x0022, "8082", "ret"),
+        ], fmt="elf64-littleriscv")
+        graph = cfg.analyze(text, cfg.get_profile("riscv"))
+        jt = [i for i in graph.insns if i.mnemonic == "cm.jt"][0]
+        self.assertEqual(jt.kind, cfg.UNCOND)
+        self.assertIsNone(jt.target)
+        self.assertEqual([(b.start, b.end) for b in graph.blocks], [
+            (0x0000, 0x0002),   # ends AT the cm.jt: it is a transfer
+            (0x0004, 0x0022),   # NOT split at 0x20
+        ])
+        self.assertEqual(graph.branch_points, [])
+
+    def test_zcmp_popret_returns_and_push_does_not(self):
+        """cm.popret ends the block; cm.push must stay straight-line code.
+
+        The false-positive direction matters as much: 'cm.pop' shares its whole
+        prefix with 'cm.popret' (riscv-opc.c:2335-2338), and a `ret` pattern
+        loose enough to catch one would end a block in the middle of a
+        prologue.
+        """
+        p = cfg.get_profile("riscv")
+        self.assertEqual(p.classify("cm.popret {ra}, 16"), cfg.RET)
+        self.assertEqual(p.classify("cm.popretz {ra, s0-s11}, 64"), cfg.RET)
+        self.assertEqual(p.classify("cm.push {ra, s0-s11}, -64"), cfg.OTHER)
+        self.assertEqual(p.classify("cm.pop {ra}, 16"), cfg.OTHER)
+        self.assertNotIn(cfg.OTHER, cfg.TERMINATORS)
+
+        text = objdump([
+            "00000000 <main>:",
+            (0x0000, "b8f2", "cm.push\t{ra, s0-s11}, -64"),
+            (0x0002, "4501", "li\ta0, 0"),
+            (0x0004, "bef2", "cm.popret\t{ra, s0-s11}, 64"),
+            (0x0006, "4505", "li\ta0, 1"),
+        ], fmt="elf64-littleriscv")
+        graph = cfg.analyze(text, cfg.get_profile("riscv"))
+        # cm.push does not split the block; cm.popret ends it.
+        self.assertEqual([(b.start, b.end) for b in graph.blocks],
+                         [(0x0000, 0x0004), (0x0006, 0x0006)])
+
+
 class TestExplicitHexOperandIsValidated(unittest.TestCase):
     """A leading '0x' says hexadecimal, not "this is an address".
 

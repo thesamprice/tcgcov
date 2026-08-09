@@ -275,9 +275,19 @@ _p("riscv",
             "littleriscv", "bigriscv"),
    conditional=r"^(c\.)?(beqz|bnez|blez|bgez|bltz|bgtz|beq|bne|bltu|bgeu|blt"
                r"|bge|bgtu|bleu|bgt|ble)\b",
-   unconditional=r"^(c\.)?(jr|j)\b",
-   call=r"^(c\.)?(jalr|jal|call|tail)\b",
-   ret=r"^(c\.)?ret\b",
+   # 'cm.jt' is the Zcmt TABLE jump (riscv-opc.c:2343). See the Zcmt block
+   # below for why its operand must never be read as an address.
+   unconditional=r"^((c\.)?(jr|j)|cm\.jt)\b",
+   # 'cm.jalt' (riscv-opc.c:2344) is the linking table jump: same indexed
+   # target, plus a write to ra, so it is a call.
+   call=r"^((c\.)?(jalr|jal|call|tail)|cm\.jalt)\b",
+   # Zcmp 'cm.popret'/'cm.popretz' (riscv-opc.c:2337-2338) pop the saved
+   # register list AND return through ra (popretz additionally zeroes a0), so
+   # they are returns, not loads. Their sibling rows 'cm.push'/'cm.pop'
+   # (riscv-opc.c:2335-2336) do NOT transfer and must stay OTHER -- the 'ret'
+   # here is anchored inside the mnemonic precisely so 'cm.pop' cannot reach
+   # it; tests/test_arch_profiles.py pins that as a false-positive guard.
+   ret=r"^((c\.)?ret|cm\.popretz?)\b",
    # jr and jalr are the ISA's ONLY register-indirect transfers (they are the
    # only riscv_opcodes[] entries with INSN_BRANCH/INSN_JSR that are not
    # PC-relative -- riscv-opc.c:486-497 for the uncompressed forms, :1193-1194
@@ -298,14 +308,42 @@ _p("riscv",
    # sets it (riscv-dis.c:96-97), and the alias rows precede the c.* rows in the
    # first-match scan (riscv-dis.c:1074-1095). So a c.jr encoding prints as
    # "jr a0", and c.jr ra prints as "ret" (riscv-opc.c:484).
-   indirect=r"^(c\.)?(jr|jalr)\b",
+   #
+   # ZCMT TABLE JUMPS. 'cm.jt'/'cm.jalt' are the third register-indirect
+   # transfer family, and the most dangerous one, because their single operand
+   # is a small NUMBER that is not an address:
+   #
+   #   riscv-opc.c:2343  {"cm.jt",   ..., "WcI", MATCH_CM_JT,   ..., 0 }
+   #   riscv-opc.c:2344  {"cm.jalt", ..., "Wci", MATCH_CM_JALT, ..., 0 }
+   #
+   # The operand is an INDEX into the jump-vector table based at the JVT CSR
+   # (match_cm_jt/match_cm_jalt, riscv-opc.c:404-419, split the shared encoding
+   # at index 32), and riscv-dis.c:746-750 prints it with "%" PRIu64 -- a bare
+   # unsigned decimal, with no 0x, no <sym> and no resolved-target comment,
+   # because the disassembler has no way to read JVT. So "cm.jt 5" offers the
+   # bare-hex reader a trailing "5" that it would take as the address 0x5.
+   # That is the exact shape of the SPARC `jmpl %g1+0x10` bug: an UNCOND with a
+   # fabricated target makes that address a basic-block leader.
+   #
+   # Note also that both rows carry pinfo 0 -- NOT INSN_BRANCH/INSN_JSR -- so
+   # riscv-dis.c:1111-1127 never sets info->insn_type or info->target for them
+   # either. binutils itself does not treat them as transfers, which is why
+   # nothing downstream of objdump can be relied on to flag them; they are
+   # listed here from the ISA semantics, not from a pinfo bit.
+   indirect=r"^((c\.)?(jr|jalr)|cm\.(jt|jalt))\b",
    insn_size=4,
    notes="compressed 2-byte forms are handled: instruction sizes come from "
          "address deltas, so a mixed RVC/RV32I stream is fine. call/tail/jump "
          "are INSN_MACRO (riscv-opc.c:503-507) and are skipped outright by the "
          "disassembler (riscv-dis.c:1076-1078), so objdump never prints them; "
          "they are recognized only because llvm-objdump and hand-written .s "
-         "listings do.")
+         "listings do. Zcmt cm.jt/cm.jalt are indirect table jumps (their "
+         "operand is a JVT index, not an address); Zcmp cm.popret/cm.popretz "
+         "are returns; cm.push/cm.pop/cm.mva01s/cm.mvsa01 "
+         "(riscv-opc.c:2335-2336,2339-2340) do not transfer control and are "
+         "OTHER. The Zcmop rows c.mop.1..c.mop.15 (riscv-opc.c:2324-2332) are "
+         "hint no-ops, and every Zcb row (riscv-opc.c:2309-2322) is a "
+         "load/store/ALU op -- no other Zc mnemonic transfers.")
 
 # ARM A32/T32 -- objdump prints the condition suffix on the mnemonic (and maps
 # 'al' to the empty string, so a bare 'b' is unconditional). Thumb adds the
@@ -476,9 +514,23 @@ _p("x86", aliases=("i386", "i486", "i586", "i686"), **_X86_KW)
 #   mips-opc.c:2146-2148  bposge32 / bposge64 CBD, bposge32c NODS -- DSP ASE
 #   mips-opc.c:718-723    bbit0 / bbit1 /     CBD -- Octeon branch-on-bit
 #                         bbit032 / bbit132
-_p("mips",
-   aliases=("mips64", "mipsel", "mipsisa32", "mipsisa64", "tradlittlemips",
-            "tradbigmips"),
+#
+# MICROMIPS IS FOLDED IN HERE, MIPS16 IS NOT. See the two profiles below the
+# keyword block for the evidence; the short version is that microMIPS spells
+# its transfers with the SAME mnemonics and the SAME delay-slot flags as MIPS32
+# (so one pattern set serves both, which is required anyway because objdump
+# switches between the two per SYMBOL inside one ELF -- is_compressed_mode_p,
+# mips-dis.c:2655-2679), whereas MIPS16 gives `beqz` no delay slot at all and
+# therefore contradicts this profile on identical text.
+#
+# The microMIPS additions below are cited against micromips-opc.c for the
+# encoding and delay-slot flags, and against LLVM's MicroMips .td files for the
+# '16'-suffixed SPELLINGS -- binutils prints the 16-bit forms under the plain
+# names ('b', 'beqz', 'jr', 'jalrs'; there is no "16" string anywhere in
+# micromips-opc.c), while llvm-objdump prints the architecture-manual names.
+# Both are accepted, exactly as this file already accepts llvm-objdump's
+# "jalr 0x10(a0)" alongside GNU's "jalr 16(a0)" on RISC-V.
+_MIPS_KW = dict(
    conditional=r"^(beqzl|bnezl|beql|bnel|blezl|bgtzl|bltzl|bgezl"
                r"|bltzall|bgezall|bltzalc?|bgezalc?|blezalc|bgtzalc"
                r"|beqzalc|bnezalc"
@@ -486,15 +538,66 @@ _p("mips",
                r"|bltuc|bgeuc|bltc|bgec|bovc|bnvc"
                r"|bc[0-3][tf]l?|bc[12](eqz|nez)"
                r"|bposge(32c?|64)|bbit[01](32)?"
-               r"|bn?z\.[bhwvd])\b",
+               r"|bn?z\.[bhwvd]"
+               # microMIPS. The 16-bit conditional branches are CBD like their
+               # 32-bit twins (micromips-opc.c:386 beqz "md,mE",
+               # :444 bnez "md,mE"), spelled beqz16/bnez16 by LLVM
+               # (MicroMipsInstrInfo.td:669,671). Their r6 replacements are
+               # COMPACT -- NODS|CBR (micromips-opc.c:395 beqzc, :453 bnezc) --
+               # and LLVM spells the 16-bit pair beqzc16/bnezc16
+               # (MicroMips32r6InstrInfo.td:390-391); the delay_slot lookahead
+               # below names them, since they do not end in a bare 'c'.
+               # bgezals/bltzals are the short-delay-slot conditional-and-link
+               # forms (micromips-opc.c:409,442, CBD|BD16;
+               # MicroMipsInstrInfo.td:968,971) and are COND for the same
+               # reason bgezal/bltzal are: the link is a side effect.
+               r"|beqz16|bnez16|beqzc16|bnezc16|bgezals|bltzals)\b",
    # 'jic' (mips-opc.c:3257) was missing: an r6 Jump Indexed Compact is an
    # unconditional transfer and has to END ITS BLOCK, but it fell through to
    # OTHER, so the block map ran straight past it. Its sibling 'jialc'
    # (mips-opc.c:3261) was already in `call`, and the `ret` pattern below
    # already special-cased "jic ra", which is what gave the omission away.
-   unconditional=r"^(bc|b|j|jr|jr\.hb|jrc|jic)\b",
-   call=r"^(jalx?|jalrc?|jalr\.hb|balc?|jialc)\b",
-   ret=r"^(jr(\.hb)?\s+\$?(ra|31)\b|jrc\s+\$?ra\b|jic\s+\$?ra\b)",
+   #
+   # microMIPS adds, in the same role:
+   #   micromips-opc.c:322       b     "mD"  UBD   16-bit PC-relative branch,
+   #                                               llvm 'b16'
+   #                                               (MicroMipsInstrInfo.td:673,
+   #                                               UncondBranchMM16 -- it is
+   #                                               UNCONDITIONAL, despite the
+   #                                               'b16' name reading like the
+   #                                               conditional pair)
+   #   MicroMips32r6InstrInfo.td:370-373  'bc16' -- the r6 compact spelling of
+   #                                               the same 10-bit branch
+   #   micromips-opc.c:732,741   jr/j  "mj"  UBD   16-bit register jump,
+   #                                               llvm 'jr16'
+   #                                               (MicroMipsInstrInfo.td:667)
+   #   micromips-opc.c:734,740   jrs / jrs.hb UBD|BD16 -- SHORT-delay-slot
+   #                                               register jumps
+   #   micromips-opc.c:752       jrc   "mj"  NODS|UBR   compact register jump;
+   #                                               llvm r6 spells the 16-bit
+   #                                               one 'jrc16'
+   #                                               (MicroMips32r6InstrInfo.td
+   #                                               :491)
+   unconditional=r"^(bc16|bc|b16|b|jrs(\.hb)?|jrc16|jrc|jr16|jr(\.hb)?"
+                 r"|jic|j)\b",
+   # microMIPS calls: 'jals' (micromips-opc.c:779, UBD|BD16;
+   # MicroMipsInstrInfo.td:942) and 'bals' (micromips-opc.c:329, UBD|BD16) are
+   # DIRECT -- their operand is a real jump/branch target and must keep being
+   # parsed, which is why neither appears in `indirect` below. 'jalrs'
+   # (micromips-opc.c:762-765; MicroMipsInstrInfo.td:944), 'jalrs.hb' (:766-767)
+   # and the 16-bit register forms are register-target and do.
+   call=r"^(jalx?|jals|jalrc?|jalr\.hb|jalr16|jalrs(16|\.hb)?"
+        r"|balc?|bals|jialc)\b",
+   # Returns. 'jraddiusp' (micromips-opc.c:735, NODS|UBR with RD_31|WR_sp|RD_sp)
+   # is microMIPS's compact return-and-pop: it jumps to $ra AND adds its
+   # operand to $sp, so the printed number is a STACK ADJUSTMENT. Reading
+   # "jraddiusp 16" as a branch to 0x16 is precisely the cm.jt/jmpl failure, so
+   # it is both RET here and indirect below. 'jrcaddiusp' is the r6 spelling
+   # (MicroMips32r6InstrInfo.td:493-496).
+   ret=r"^(jrs?(\.hb)?\s+\$?(ra|31)\b"
+       r"|jrc?16\s+\$?(ra|31)\b"
+       r"|jrc\s+\$?ra\b|jic\s+\$?ra\b"
+       r"|jraddiusp\b|jrcaddiusp\b)",
    # Register-target jumps. All of them print a register as their FIRST
    # operand, and several print a second operand that reads as hex:
    #
@@ -516,15 +619,160 @@ _p("mips",
    # keyed on the register, so the RET/UNCOND split is untouched -- is_indirect
    # is a separate question and the answer for a return through $ra is still
    # "the target is in a register".
-   indirect=r"^(jalrc|jalr|jialc|jrc|jr|jic)(\.hb)?(?=\s|$)",
+   #
+   # The microMIPS register jumps join them (micromips-opc.c:732-767), longest
+   # spelling first so 'jalr16' is not consumed by the 'jalr' alternative. Note
+   # the direct forms 'jals'/'bals'/'jal'/'jalx'/'b16'/'beqz16' are all absent
+   # by construction: swallowing them would delete real targets.
+   indirect=r"^(jalrs16|jalrs|jalrc|jalr16|jalr|jialc"
+            r"|jrcaddiusp|jraddiusp|jrc16|jrc|jrs|jr16|jr|jic)"
+            r"(\.hb)?(?=\s|$)",
    has_delay_slot=True,
-   delay_slot=r"^(?!\w+c\b)\w+",
-   insn_size=4,
+   # Two exclusions. (1) the r6 compact branches, which are exactly the
+   # mnemonics ending in a bare 'c'. (2) the microMIPS NODS forms whose 'c'
+   # is followed by the "16" width suffix, plus jr(c)addiusp -- none of which
+   # the first lookahead can see. Everything else delays, INCLUDING the
+   # 's'-suffixed short-delay-slot forms (jrs/jalrs/jals/bals/bgezals/...):
+   # BD16 (micromips-opc.c:216) constrains the delay slot to a 2-byte
+   # instruction, it does not remove it, and _fallthrough takes the address of
+   # the instruction after the slot from the disassembly rather than computing
+   # it, so a 2-byte slot needs no special handling here.
+   delay_slot=r"^(?!\w+c\b)"
+              r"(?!(bc16|beqzc16|bnezc16|jrc16|jraddiusp|jrcaddiusp)\b)"
+              r"\w+")
+
+_p("mips",
+   aliases=("mips64", "mipsel", "mipsisa32", "mipsisa64", "tradlittlemips",
+            "tradbigmips"),
+   insn_size=4, **_MIPS_KW,
    notes="delay_slot excludes the r6 compact branches (mnemonics ending in "
-         "'c'). The 'likely' (*l) forms nullify the delay slot when not taken, "
-         "which does not change the fall-through ADDRESS. The microMIPS and "
-         "MIPS16 register jumps (jrs/jalrs/jraddiusp, micromips-opc.c:734-767) "
-         "are not modeled at all, so they are not listed as indirect either.")
+         "'c') and the microMIPS compact forms bc16/beqzc16/bnezc16/jrc16/"
+         "jraddiusp/jrcaddiusp. The 'likely' (*l) forms nullify the delay slot "
+         "when not taken, which does not change the fall-through ADDRESS. "
+         "microMIPS is covered by this same profile (see the 'micromips' "
+         "profile for the size-only difference); MIPS16 is NOT -- it needs the "
+         "separate 'mips16' profile because its branches have no delay slot. "
+         "eret/eretnc/deret/iret (micromips-opc.c:601,718,719,731; "
+         "mips-opc.c) are control transfers carrying only NODS and are not "
+         "modeled as terminators on any MIPS profile.")
+
+# microMIPS -- the SAME pattern set as MIPS32, with a 2-byte base encoding.
+#
+# WHY FOLDED RATHER THAN FORKED. Thumb needed its own profile because its
+# encoding size differs AND detect_arch cannot reach it; microMIPS differs on
+# the first count only, and the second cuts the other way:
+#
+#   * No mnemonic CONFLICTS. Every transfer microMIPS shares with MIPS32 is
+#     spelled identically and carries the same delay-slot flag: b/beqz/bnez/
+#     jr/jalr/j/jal are UBD or CBD (micromips-opc.c:322,386,444,732,749,756,
+#     775) exactly as in mips-opc.c, and the compact forms bc/beqzc/bnezc/jrc
+#     are NODS (:327,395,453,752) exactly as in r6. Nothing this profile says
+#     about a shared mnemonic is wrong for the other ISA. Contrast MIPS16,
+#     where `beqz` has NO delay slot at all (mips16-opc.c:240 carries CBR in
+#     pinfo2 and no CBD in pinfo) -- a direct contradiction on identical text,
+#     which is why that one had to fork.
+#   * A single ELF legitimately contains BOTH. objdump selects microMIPS per
+#     SYMBOL from st_other (is_compressed_mode_p, mips-dis.c:2655-2679), so one
+#     disassembly interleaves microMIPS and MIPS32 functions and ONE profile
+#     has to classify both. Forking the mnemonics would guarantee a wrong
+#     answer for whichever half you did not pick.
+#   * There is NO BFD name to detect it by. objdump's "file format" line is the
+#     target vector name (binutils/objdump.c:5809-5811), i.e. elf32-tradlittle-
+#     mips for microMIPS and MIPS32 alike, and _bfd_elf_mips_mach
+#     (bfd/elfxx-mips.c:7044-7160) never returns bfd_mach_mips_micromips from
+#     an ELF's e_flags at all -- only GDB ever sets it (gdb/mips-tdep.c:7029).
+#     So detect_arch lands on 'mips' for a microMIPS binary, which is the right
+#     answer given the point above.
+#
+# This profile therefore exists for exactly ONE reason: insn_size. That is the
+# size of an instruction with no successor to measure against -- the last one
+# in a section (parse_objdump) -- and microMIPS fetches in 16-bit chunks
+# (info->bytes_per_chunk = 2, mips-dis.c:2536), so 4 is wrong for a
+# section-final 16-bit branch and leaves it permanently half-covered. A user
+# who knows the section boundary matters selects it with --arch micromips;
+# everyone else is correctly served by 'mips'.
+_p("micromips",
+   aliases=("mips:micromips", "micromips32", "micromips32r2", "micromips32r6",
+            "umips"),
+   insn_size=2, **_MIPS_KW,
+   notes="identical classification to 'mips' (microMIPS shares every mnemonic "
+         "and every delay-slot flag with MIPS32); the only difference is the "
+         "2-byte section-end size fallback. Not reachable from detect_arch -- "
+         "no BFD name distinguishes a microMIPS ELF -- so it is selected only "
+         "by an explicit --arch/QEMU target name.")
+
+# MIPS16 / MIPS16e -- a SEPARATE profile, and not by preference.
+#
+# WHY IT CANNOT FOLD INTO 'mips'. MIPS16 spells its conditional branches with
+# the same strings as MIPS32 and gives them the OPPOSITE delay-slot behaviour:
+#
+#   mips16-opc.c:237  b      "q"    pinfo 0, pinfo2 UBR   <- no delay slot
+#   mips16-opc.c:240  beqz   "x,p"  pinfo RD_1, pinfo2 CBR
+#   mips16-opc.c:259  bnez   "x,p"  pinfo RD_1, pinfo2 CBR
+#   mips16-opc.c:262  bteqz  "p"    pinfo RD_T, pinfo2 CBR
+#   mips16-opc.c:263  btnez  "p"    pinfo RD_T, pinfo2 CBR
+#
+# None of those five carries INSN_COND_BRANCH_DELAY or
+# INSN_UNCOND_BRANCH_DELAY -- there is no CBD macro in mips16-opc.c at all;
+# they are flagged only in pinfo2 so the disassembler can classify them
+# (mips-dis.c:2493-2505). Under the 'mips' profile "beqz a0, 400 <x>" delays,
+# so _fallthrough skips one extra instruction and reports a fall-through
+# address that matches no recorded edge: the branch stays half-covered
+# forever, with no error. Same family, different semantics, same text -- the
+# thumb argument exactly.
+#
+# The JUMPS do delay (INSN_UNCOND_BRANCH_DELAY on jr/j/jalr/jal/jalx,
+# mips16-opc.c:325-334) and the MIPS16e compact forms jrc/jalrc do not
+# (mips16-opc.c:338-341, NODS|UBR), which is what delay_slot below encodes.
+#
+# HOW A USER REACHES IT: --arch mips16 (or a QEMU/objdump name containing
+# "mips16"/"mips:16"). detect_arch cannot: bfd_mach_mips16 exists
+# (bfd/archures.c:174, name "mips:16" at bfd/cpu-mips.c:142) but, like
+# bfd_mach_mips_micromips, _bfd_elf_mips_mach never derives it from an ELF, and
+# the "file format" banner is the same elf32-*mips either way. Since a MIPS16
+# binary can also interleave MIPS32 functions, this profile keeps the MIPS32
+# spellings it does not contradict -- only the delay-slot rule is narrowed.
+_p("mips16",
+   aliases=("mips:16", "mips16e", "mips16e2"),
+   # mips16-opc.c:240,259,262-263. bteqz/btnez branch on the $t8 condition bit
+   # set by cmp/cmpi/slt (mips16-opc.c:377) -- real branch points.
+   conditional=r"^(beqz|bnez|bteqz|btnez)\b",
+   # 'b' (mips16-opc.c:237) is UBR, branch-ALWAYS. jr/j/jrc are the register
+   # jumps (:331-334,:340-341); objdump prints 'jr'/'jrc' because those rows
+   # precede the 'j' aliases in the table, but both spellings are accepted.
+   unconditional=r"^(b|jrc|jr|j)\b",
+   # jalr/jalrc are always register-target (:325-326,:338-339); 'jal'/'jalx'
+   # cover both the 32-bit direct forms (:329-330, JUMP(26,0,2)) and the
+   # register aliases of jalr (:327-328), split by operand in `indirect`.
+   call=r"^(jalrc|jalr|jalx|jal)\b",
+   # 'R' is the fixed $31 operand (mips16-opc.c:69, reg_31_map), so the return
+   # idiom prints as "jr ra" / "jrc ra" (or "$31" under -M gpr-names=numeric).
+   ret=r"^(jrc?|j)\s+\$?(ra|31)\b",
+   # jr/jrc/jalr/jalrc always take a register. 'jal'/'j' are ambiguous and are
+   # split on the first operand character exactly as ARM splits 'blx' and SPARC
+   # splits 'call': a letter (or '$') means the target came out of a register,
+   # a digit means the operand IS the address. 'jalx' stays direct -- there is
+   # no register form of it. This split is load-bearing: a MIPS16 register name
+   # like "a0" or "ra" is spelled entirely in hex digits, so without `indirect`
+   # the bare-hex reader turns "jr a0" into a branch to 0xa0.
+   indirect=r"^(jalrc|jalr|jrc|jr)(?=\s|$)"
+            r"|^(jal|j)\s+\$?[a-z]",
+   has_delay_slot=True,
+   # ONLY the register/absolute jumps delay (mips16-opc.c:325-334, UBD). The
+   # five PC-relative branches do not, and neither do the MIPS16e compact
+   # jrc/jalrc (:338-341, NODS).
+   delay_slot=r"^(jr|j|jalr|jal|jalx)(?=\s|$)",
+   insn_size=2,
+   notes="MIPS16 branches (b/beqz/bnez/bteqz/btnez, mips16-opc.c:237-263) have "
+         "NO delay slot -- only the jumps jr/j/jalr/jal/jalx do (:325-334), "
+         "and the MIPS16e compact jrc/jalrc do not (:338-341). That "
+         "contradiction with MIPS32 is why this is a separate profile. Base "
+         "encoding is 2 bytes; the EXTEND prefix (:478) and the 32-bit jal/"
+         "jalx rows (:329-330) make individual instructions 4, which comes out "
+         "of the address deltas. 'restore'/'save' (:447-448) write/read $31 "
+         "and carry NODS but are stack-frame ops, not transfers; "
+         "'entry'/'exit'/'break'/'sdbbp' (:316-321,:260,:449) are TRAP rows "
+         "and are not modeled as transfers.")
 
 # PowerPC -- objdump prints the extended mnemonics (blt bgt beq bso bge ble bne
 # bns, bdnz/bdz, bt/bf, raw bc) with the suffixes glued on: 'l' (link), 'a'
@@ -696,6 +944,16 @@ ARCH_ALIASES = (
     ("i586", "x86"),
     ("i686", "x86"),
     ("x86", "x86"),
+    # 'micromips'/'mips16' before 'mips', for the same reason 'thumb' comes
+    # before 'arm': these are SUBSTRING tests in order, and every one of those
+    # names contains "mips". Note detect_arch deliberately keeps mapping a
+    # microMIPS/MIPS16 ELF to plain 'mips' -- there is no BFD name that
+    # distinguishes them (see the micromips profile) and one disassembly can
+    # interleave compressed and MIPS32 functions.
+    ("micromips", "micromips"),
+    ("mips:micromips", "micromips"),
+    ("mips16", "mips16"),
+    ("mips:16", "mips16"),
     ("mips", "mips"),
     ("powerpc", "powerpc"),
     ("ppc", "powerpc"),

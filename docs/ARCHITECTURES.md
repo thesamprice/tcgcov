@@ -45,7 +45,7 @@ returns `UNSUPPORTED_PROFILE` (`tcgcov/cfg.py:210-213`), and
 ```
 error: branch coverage unsupported for this arch (<arch or 'unknown'>): no branch
 mnemonics are known for it, and guessing would produce wrong data.
-       known arches: aarch64, arm, microblaze, mips, powerpc, riscv, sparc, x86, x86_64
+       known arches: aarch64, arm, microblaze, micromips, mips, mips16, powerpc, riscv, sparc, thumb, x86, x86_64
        add your own with --arch-profile FILE (see tcgcov/cfg.py load_profile_file for the schema)
 ```
 
@@ -75,10 +75,12 @@ most profiles have only the first:
 | **arm** (A32/T32) | 335-366 | 46 | partial — `arm-dis.c:4410-4422` (low-overhead loops), `:4425-4433` (branch-future), `:4563-4565` (`tbb`/`tbh`), `:4919` (condition suffixes) | `tests/data/llvm-armv7.txt` — 5 insns, **0 conditional branches**; proves layout parsing only | no |
 | **aarch64** | 371-404 | 32 | the register-indirect family only — `aarch64-tbl.h:4413-4430`, `aarch64-opc.c:4096-4099`, `:5201-5211`; the conditional-branch rows in the test table carry none | `tests/data/llvm-aarch64.txt` — 4 insns, **0 conditional branches** | no |
 | **x86 / x86_64** | 406-432 | 37 | one — `i386-dis.c:14640` (APX `jmpabs`); the 16 Jcc spellings are asserted but not line-cited | `tests/data/llvm-x86_64.txt` — 5 insns, **0 conditional branches**; does prove variable-length sizing from address deltas (`test_golden_disasm.py:115-120`) | no |
-| **mips** | 452-471 | 42 | good — `mips-opc.c:223-228` (CBD/UBD/CBL/NODS), plus `:718-723`, `:729`, `:734`, `:2146-2148`, `:3366`, `:3371` | **none** | no |
+| **mips** (+ microMIPS) | 533-693 | 89 (12 non-branch guards) | good — `mips-opc.c:223-228` (CBD/UBD/CBL/NODS), plus `:718-723`, `:729`, `:734`, `:2146-2148`, `:3366`, `:3371`; microMIPS per-row from `micromips-opc.c:322-453`, `:732-780`, with the `16`-suffixed spellings cited to LLVM's `MicroMipsInstrInfo.td` / `MicroMips32r6InstrInfo.td` | **none** | no |
+| **micromips** | 694-734 | shares the `mips` table | same as `mips` — identical pattern set, `insn_size=2` | **none** | no |
+| **mips16** | 735-783 | 32 (11 non-branch guards) | **good** — per-row across `mips16-opc.c:237-263` (branches, no delay), `:325-341` (jumps and compact jumps), `:69` (`R` = `$31`), `:447-449` (non-transfers) | **none** | no |
 | **sparc** | 524-544 | 54 | **good** — per-row citations across `sparc-opc.c:1361-1706` and `:1953-1967` | **none** | no |
 | **powerpc** | 480-490 | 29 | **none inline**; `ppc-opc.c` named only in the test-file header | **none** | no |
-| **riscv** | 273-308 | 28 | the indirect/alias analysis only — `riscv-opc.c:484-507`, `riscv-dis.c:85`, `:96-97`, `:565-566`, `:1074-1095`; the conditional-branch rows carry none | `tests/data/llvm-riscv64.txt` — 3 insns, **0 conditional branches** | no |
+| **riscv** | 273-372 | 46 (6 non-branch guards) | the indirect/alias analysis and the Zc extensions — `riscv-opc.c:484-507`, `:2309-2344` (Zcb/Zcmop/Zcmp/Zcmt, incl. `:404-419` match functions), `riscv-dis.c:85`, `:96-97`, `:565-566`, `:746-750`, `:1074-1095`, `:1111-1127`; the conditional-branch rows carry none | `tests/data/llvm-riscv64.txt` — 3 insns, **0 conditional branches** | no |
 
 Read that table as: **MicroBlaze is the only profile that has been shown to
 produce a correct branch report on a real program.** Every other profile is a
@@ -98,10 +100,45 @@ Two more scope notes:
 
 * Nine profile objects are registered but eight ISA families are tested: `x86`
   and `x86_64` are the same pattern set registered twice (`cfg.py:431-432`).
+  Two more MIPS-family profiles have since been added — see below.
 * The CI end-to-end job (`ci/integration.sh`) compiles real C and runs real
   `objdump`/`addr2line`, but it synthesizes the `.cov` artifact and asserts a
   **line** number only — it never calls `tcgcov branches` and never runs QEMU.
   Branch coverage has no end-to-end CI on any architecture.
+
+### 2.1 The two compressed MIPS profiles
+
+microMIPS and MIPS16 are separate instruction sets that share the MIPS name,
+have 16-bit encodings, and have different delay-slot rules from MIPS32. They
+are handled differently from each other, on evidence:
+
+| ISA | Handling | Why |
+|---|---|---|
+| **microMIPS** | **folded into `mips`** (a `micromips` profile exists, sharing the same pattern set, and differs only in `insn_size=2`) | It spells every transfer it shares with MIPS32 identically *and* flags it identically: `b`/`beqz`/`bnez`/`jr`/`jalr`/`j`/`jal` are UBD or CBD (`micromips-opc.c:322,386,444,732,749,756,775`), the compact `bc`/`beqzc`/`bnezc`/`jrc` are NODS (`:327,395,453,752`). No statement in the `mips` profile is wrong for microMIPS. Decisive: objdump selects microMIPS **per symbol** from `st_other` (`is_compressed_mode_p`, `mips-dis.c:2655-2679`), so a single disassembly interleaves microMIPS and MIPS32 functions and **one** profile must classify both. |
+| **MIPS16** | **its own `mips16` profile** | It *contradicts* MIPS32 on identical text. `b`/`beqz`/`bnez`/`bteqz`/`btnez` (`mips16-opc.c:237-263`) carry only `UBR`/`CBR` in `pinfo2` and **no** `INSN_COND_BRANCH_DELAY` — there is no `CBD` macro in that file at all. Under the `mips` profile `beqz a0, 400` delays, so `_fallthrough` skips one extra instruction and the not-taken edge can never match: a permanently half-covered branch, reported with exit 0. Same family, different semantics, same text — exactly the `thumb` argument. |
+
+**Neither is reachable from `detect_arch`, and that is a binutils fact, not an
+omission.** objdump's "file format" line is the BFD *target vector* name
+(`binutils/objdump.c:5809-5811`), i.e. `elf32-tradlittlemips` for a microMIPS
+binary and a MIPS32 one alike. The machs exist — `bfd_mach_mips16`
+(`bfd/archures.c:174`, printable name `"mips:16"` at `bfd/cpu-mips.c:142`) and
+`bfd_mach_mips_micromips` (`bfd/archures.c:199`, `"mips:micromips"` at
+`bfd/cpu-mips.c:168`) — but `_bfd_elf_mips_mach` (`bfd/elfxx-mips.c:7044-7160`)
+never returns either from an ELF's `e_flags`; only GDB ever sets them
+(`gdb/mips-tdep.c:7027-7030`). So:
+
+* a microMIPS/MIPS16 ELF detects as **`mips`**, which is the right default —
+  the ELF may interleave compressed and MIPS32 functions, and `mips` classifies
+  the transfers of all three;
+* to get the 2-byte section-end size fallback, pass **`--arch micromips`** (or
+  `mips:micromips`, `micromips32r2`, `umips`);
+* for MIPS16 code, pass **`--arch mips16`** (or `mips:16`, `mips16e`,
+  `mips16e2`) — this one changes classification, not just sizing, so it is the
+  only way to get MIPS16 branch fall-throughs right.
+
+`micromips`/`mips16` are listed **before** `mips` in `ARCH_ALIASES` because
+those are ordered substring tests and every one of those names contains
+`mips` — the same ordering trap `thumb` has against `arm`.
 
 ---
 
@@ -173,14 +210,67 @@ listed here is not a claim of completeness — it is the absence of a note.
   supplied separately) is **refused outright** rather than resolved from the
   printed low half (`cfg.py:839-845`).
 
-### MIPS
+### MIPS (and microMIPS / MIPS16)
 
 * The `likely` (`*l`) forms nullify the delay slot when not taken. That does
   not change the fall-through **address**, so the model is unaffected
   (`cfg.py:469-471`) — but it does mean the delay-slot instruction did not
   execute on that path while the block map says it belongs to the block.
 * r6 compact branches (mnemonics ending in `c`) have no delay slot, encoded as
-  a negative lookahead (`cfg.py:467`).
+  a negative lookahead. The microMIPS compact forms whose `c` is followed by
+  a `16` width suffix (`bc16`, `beqzc16`, `bnezc16`, `jrc16`) and the
+  `jraddiusp`/`jrcaddiusp` pair are invisible to that lookahead and are named
+  explicitly beside it.
+* **The `s`-suffixed microMIPS forms still delay.** `jrs`, `jalrs`, `jals`,
+  `bals`, `bgezals`, `bltzals` carry `BD16` (`micromips-opc.c:216`), which
+  constrains the delay slot to a *2-byte* instruction; it does not remove it.
+  The distinction costs nothing here because `_fallthrough` takes the address
+  of the instruction after the slot **from the disassembly** rather than
+  computing it from a size.
+* **`b16` is unconditional**, despite sitting next to `beqz16`/`bnez16` and
+  reading like one of them: `micromips-opc.c:322` is `UBD`, not `CBD`, and LLVM
+  derives it from `UncondBranchMM16` (`MicroMipsInstrInfo.td:673`).
+* **`jraddiusp`/`jrcaddiusp` are returns whose operand is a stack adjustment.**
+  They jump to `$ra` *and* add the printed number to `$sp`
+  (`micromips-opc.c:735`, `NODS|UBR` with `RD_31|WR_sp|RD_sp`;
+  `MicroMips32r6InstrInfo.td:493-496`), so they are marked indirect — reading
+  `jraddiusp 16` as a branch to `0x16` is the same failure as
+  `jmpl %g1+0x10`.
+* **Two spellings per 16-bit form, and only one comes from binutils.** There is
+  no `"16"` string anywhere in `micromips-opc.c`: GNU objdump prints the 16-bit
+  encodings under the plain names (`b`, `beqz`, `jr`, `jalrs`), distinguished
+  only by mask width (`mips_opcode_32bit_p`, `include/opcode/mips.h:511-518`).
+  The `b16`/`beqz16`/`bnez16`/`jr16`/`jrc16`/`jalrs16`/`bc16`/`beqzc16`/
+  `bnezc16` spellings are **llvm-objdump's**, cited to LLVM's MicroMips `.td`
+  files. Both are accepted, exactly as RISC-V accepts llvm's `jalr 0x10(a0)`
+  alongside GNU's `jalr 16(a0)`.
+* **`jalr16` could not be confirmed as a printed spelling.** LLVM's record is
+  `JALR16_MM` but its asm string is plain `"jalr"`
+  (`MicroMipsInstrInfo.td:659`), and binutils has no such name either. It is
+  accepted anyway because every `jalr*` form is register-target, so the pattern
+  cannot swallow a direct branch — but no disassembler is known to emit it.
+* **`eret`/`eretnc`/`deret`/`iret` are not modelled as transfers on any MIPS
+  profile.** They *are* control transfers but carry only `NODS`
+  (`micromips-opc.c:601,718,719,731`) — none of the `UBD`/`CBD`/`UBR`/`CBR`
+  bits — so they were left out rather than guessed at. A missed return merges
+  two blocks; function symbols are also block leaders, which limits the damage.
+* **`NODS` alone cannot identify a compact branch.** `NODS`, `TRAP` and
+  `DSP_VOLA` are literally the same bit (`INSN_NO_DELAY_SLOT`,
+  `micromips-opc.c:210-211,270`; `mips16-opc.c:189-190`), so `break`, `sdbbp`,
+  `syscall`, `restore`, `save`, `lwm`, `swm`, `movep` and much of the DSP ASE
+  all carry it. The classification here keys on mnemonics, not on that bit;
+  the non-branches are pinned as `OTHER` in the test tables for exactly this
+  reason.
+* MIPS16 `restore`/`save` (`mips16-opc.c:447-448`) write and read `$31` and
+  carry `NODS`, but only move the frame; `entry`/`exit`/`break`/`sdbbp`
+  (`:316-321,:260,:449`) are `TRAP` rows; `extend` (`:478`) is the
+  32-bit-immediate prefix, not an instruction. None are modelled as transfers.
+* MIPS16's `jal`/`j` are ambiguous — `mips16-opc.c:327-328,333-334` give them
+  register forms that alias `jalr`/`jr` — so `indirect` splits them on the
+  first operand character, the way ARM splits `blx` and SPARC splits `call`.
+  objdump in practice prints `jalr`/`jr` for those encodings (the aliases come
+  later in the table), so the ambiguous spellings should not appear; they are
+  handled anyway.
 
 ### RISC-V
 
@@ -194,6 +284,31 @@ listed here is not a claim of completeness — it is the absence of a note.
   instance of §4.5: same instruction, two disassemblers, two shapes.
 * Compressed forms print under the alias name (`c.jr` prints as `jr`, `c.jr ra`
   as `ret`, `riscv-opc.c:484`), so both spellings are accepted.
+* **Zcmt `cm.jt`/`cm.jalt` are table jumps with no static target.** Their
+  operand is an index into the jump-vector table based at the JVT CSR
+  (`riscv-opc.c:2343-2344`; `match_cm_jt`/`match_cm_jalt` at `:404-419` split
+  the shared encoding at index 32), printed as a bare unsigned decimal
+  (`riscv-dis.c:746-750`, `"%" PRIu64`) with no `0x`, no `<sym>` and no
+  resolved-target comment — the disassembler cannot read JVT. They terminate
+  their block and are marked **indirect**, so the index can never be read as an
+  address. They are therefore *excluded* from branch coverage rather than
+  reported: a `cm.jt`-based switch contributes nothing to the denominator.
+* **binutils does not flag the Zcmt/Zcmp transfers at all.** All eight `cm.*`
+  rows (`riscv-opc.c:2335-2344`) carry `pinfo == 0` — not `INSN_BRANCH`, not
+  `INSN_JSR` — so `riscv-dis.c:1111-1127` never sets `info->insn_type` or
+  `info->target` for them. Nothing downstream of objdump identifies these as
+  transfers; they are listed in the profile from ISA semantics, not from an
+  opcode-table bit. The same is true of `cm.popret`/`cm.popretz`
+  (`:2337-2338`), classified `RET` here.
+* `cm.push`/`cm.pop` (`riscv-opc.c:2335-2336`) and `cm.mva01s`/`cm.mvsa01`
+  (`:2339-2340`) do **not** transfer control and are deliberately `OTHER`;
+  `cm.pop` sharing its whole prefix with `cm.popret` is pinned as a
+  false-positive guard in the test table.
+* No other Zc mnemonic transfers: the Zcmop rows `c.mop.1`…`c.mop.15`
+  (`riscv-opc.c:2324-2332`) are hint no-ops, and every Zcb row (`:2309-2322`)
+  is a load, store or ALU op — several of which print under non-`c.` aliases
+  (`lbu`, `sb`, `not`, `mul`) because those alias rows precede them in the
+  table.
 
 ### AArch64
 
