@@ -94,13 +94,29 @@ jobs:
           make -C plugin QEMU_INCLUDE="$PWD/.ci/include"
           test -f plugin/libtcgcov.so
 
+  integration:
+    name: end-to-end with a real toolchain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile, symbolize and assert a known coverage number
+        # The unit tests feed hand-written fixtures, so they only prove the code
+        # agrees with itself. This compiles real C, runs real objdump and real
+        # addr2line, and asserts a result known by construction -- the only
+        # check that the subcommands actually compose and that the parsers
+        # handle what the toolchain really emits.
+        run: ./ci/integration.sh
+
   shellcheck:
     name: shellcheck
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - run: shellcheck tcgcov-report.sh
+      - run: shellcheck tcgcov-report.sh ci/integration.sh
 
   no-local-paths:
     name: no local paths
