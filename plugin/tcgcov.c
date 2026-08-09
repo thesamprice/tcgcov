@@ -695,7 +695,26 @@ out:
 /* ------------------------------------------------------------------ */
 
 /* Parse "0xSTART-0xEND[,0xSTART-0xEND...]" into g_state.ranges. */
-static void parse_filter(CovState *s, const char *spec)
+/*
+ * Parse one "0xSTART-0xEND" half. g_ascii_strtoull returns 0 on failure with
+ * no error signal, so the endptr must be checked: an unexpanded shell variable
+ * or a typo would otherwise parse as 0 and produce an empty range, which
+ * matches nothing and silently discards ALL coverage.
+ */
+static bool parse_addr(const char *text, uint64_t *out)
+{
+    char *endp = NULL;
+    const char *stripped = g_strstrip((char *)text);
+
+    if (*stripped == '\0') {
+        return false;
+    }
+    *out = g_ascii_strtoull(stripped, &endp, 0);
+    return endp != NULL && *endp == '\0';
+}
+
+/* Returns false on a malformed spec, so installation can fail loudly. */
+static bool parse_filter(CovState *s, const char *spec)
 {
     g_autofree char **parts = g_strsplit(spec, ",", -1);
     for (int i = 0; parts[i] != NULL; i++) {
@@ -703,35 +722,81 @@ static void parse_filter(CovState *s, const char *spec)
             continue;
         }
         g_autofree char **se = g_strsplit(parts[i], "-", 2);
+        uint64_t start, end;
+
         if (!se[0] || !se[1]) {
-            g_printerr("tcgcov: bad filter range '%s'\n", parts[i]);
-            continue;
+            g_printerr("tcgcov: bad filter range '%s' (want START-END)\n",
+                       parts[i]);
+            return false;
         }
-        uint64_t start = g_ascii_strtoull(g_strstrip(se[0]), NULL, 0);
-        uint64_t end = g_ascii_strtoull(g_strstrip(se[1]), NULL, 0);
+        if (!parse_addr(se[0], &start) || !parse_addr(se[1], &end)) {
+            g_printerr("tcgcov: filter range '%s' is not a number pair\n",
+                       parts[i]);
+            return false;
+        }
+        if (end <= start) {
+            g_printerr("tcgcov: filter range '%s' is empty "
+                       "(end must exceed start)\n", parts[i]);
+            return false;
+        }
         s->ranges = g_realloc(s->ranges, (s->range_count + 1) * sizeof(Range));
         s->ranges[s->range_count].start = start;
         s->ranges[s->range_count].end = end;
         s->range_count++;
     }
+    return true;
 }
 
-static void parse_arg(CovState *s, const char *arg)
+/*
+ * Parse a boolean argument. QEMU's own idiom is on/off/true/false/yes/no, and
+ * its plugin loader rewrites the bare `arg="edges"` form into literally
+ * "edges=on" (plugins/loader.c). Accepting only "1" therefore silently
+ * disabled the option for anyone following QEMU convention, which for edges
+ * meant a report where every branch reads as never evaluated. Accept "1"/"0"
+ * too, since that is what this plugin documented before.
+ *
+ * Returns false if the value is not a boolean at all, so the caller can refuse
+ * to start rather than guess.
+ */
+static bool parse_bool_arg(const char *k, const char *v, bool *out)
+{
+    if (g_strcmp0(v, "1") == 0) {
+        *out = true;
+        return true;
+    }
+    if (g_strcmp0(v, "0") == 0) {
+        *out = false;
+        return true;
+    }
+    return qemu_plugin_bool_parse(k, v, out);
+}
+
+/* Returns false on a bad argument, so installation can fail loudly. */
+static bool parse_arg(CovState *s, const char *arg)
 {
     g_autofree char **kv = g_strsplit(arg, "=", 2);
     const char *k = kv[0];
     const char *v = kv[1] ? kv[1] : "";
+
+    /* g_strsplit("") yields a 1-element vector holding only the terminator. */
+    if (k == NULL) {
+        g_printerr("tcgcov: empty argument\n");
+        return false;
+    }
 
     if (g_strcmp0(k, "out") == 0) {
         g_free(s->out_path);
         s->out_path = g_strdup(v);
     } else if (g_strcmp0(k, "test_id") == 0) {
         /* Free-form metadata string, copied verbatim into the JSON. */
+        g_free(s->test_id);
         s->test_id = g_strdup(v);
     } else if (g_strcmp0(k, "bsp") == 0) {
         /* Free-form metadata string, copied verbatim into the JSON. */
+        g_free(s->bsp);
         s->bsp = g_strdup(v);
     } else if (g_strcmp0(k, "elf") == 0) {
+        g_free(s->elf_path);
         s->elf_path = g_strdup(v);
     } else if (g_strcmp0(k, "mode") == 0) {
         if (g_strcmp0(v, "tb") == 0) {
@@ -739,19 +804,22 @@ static void parse_arg(CovState *s, const char *arg)
         } else if (g_strcmp0(v, "tb-insn") == 0 || g_strcmp0(v, "insn") == 0) {
             s->expand_tb_to_insns = true;
         } else {
-            g_printerr("tcgcov: unknown mode '%s'\n", v);
+            g_printerr("tcgcov: unknown mode '%s' (want tb or tb-insn)\n", v);
+            return false;
         }
     } else if (g_strcmp0(k, "filter") == 0) {
-        parse_filter(s, v);
+        return parse_filter(s, v);
     } else if (g_strcmp0(k, "counts") == 0) {
-        s->counts = (g_strcmp0(v, "1") == 0);
+        return parse_bool_arg(k, v, &s->counts);
     } else if (g_strcmp0(k, "edges") == 0) {
-        s->edges = (g_strcmp0(v, "1") == 0);
+        return parse_bool_arg(k, v, &s->edges);
     } else if (g_strcmp0(k, "verbose") == 0) {
-        s->verbose = (g_strcmp0(v, "1") == 0);
+        return parse_bool_arg(k, v, &s->verbose);
     } else {
-        g_printerr("tcgcov: ignoring unknown arg '%s'\n", arg);
+        g_printerr("tcgcov: unknown argument '%s'\n", arg);
+        return false;
     }
+    return true;
 }
 
 QEMU_PLUGIN_EXPORT
@@ -768,8 +836,17 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     s->system_emulation = info->system_emulation;
     s->expand_tb_to_insns = true;  /* default mode=tb-insn */
 
+    /*
+     * Refuse to start on a bad argument rather than run with settings the
+     * caller did not ask for. A coverage run that silently records nothing
+     * (or records no edges) looks like a genuine coverage regression, which
+     * is far more expensive to diagnose than a failed launch.
+     */
     for (int i = 0; i < argc; i++) {
-        parse_arg(s, argv[i]);
+        if (!parse_arg(s, argv[i])) {
+            g_printerr("tcgcov: refusing to start\n");
+            return -1;
+        }
     }
 
     if (s->edges) {
