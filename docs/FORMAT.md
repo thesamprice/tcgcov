@@ -4,8 +4,23 @@ This document specifies the binary artifact written by the `tcgcov` QEMU TCG
 plugin (`plugin/tcgcov.c`). It is complete enough to write an independent
 reader without consulting the plugin source.
 
-Conventional file extension: `.cov`. The plugin writes to `<out>.tmp` and
-`rename(2)`s it into place, so a `.cov` file is either absent or complete.
+Conventional file extension: `.cov`. The plugin assembles the artifact in a
+temporary file in the destination's **own directory** and `rename(2)`s it into
+place, so a `.cov` file is either absent or complete — a reader never sees a
+partially written one. Two further guarantees follow from how that is done:
+
+* **A failed write never destroys a good artifact.** Every write is checked,
+  and so are the flush and the close — which is where an out-of-space or quota
+  error on a small artifact actually surfaces, since stdio buffers. On any
+  failure the temporary is deleted, the rename is skipped, and the error is
+  reported on stderr; a `.cov` already at that path is left byte-for-byte
+  intact.
+* **Concurrent writers do not corrupt each other.** The temporary name is
+  unique per writing process, so several QEMU runs may target one `out=` path
+  at once. They race only to `rename(2)`; the last to finish wins and the file
+  under that name is always the complete output of exactly one run. (Their
+  coverage is *not* merged — for that, write separate files and merge them
+  offline.)
 
 ---
 
@@ -41,12 +56,13 @@ each field out (`memcpy`, `struct.unpack_from`, `int.from_bytes`, ...) instead.
 
 ## 2. Header
 
-88 bytes. Field offsets and sizes below are byte-exact and were verified with
-`offsetof` on LP64 (macOS/arm64, Linux/x86-64). The C declaration contains no
-packing attribute because every field is already naturally aligned at its
-declared offset; the plugin carries a
-`G_STATIC_ASSERT(sizeof(tcgcov_header) == 88)` so a hostile ABI fails the
-build rather than emitting an unreadable file.
+88 bytes. Field offsets and sizes below are byte-exact. The C declaration
+contains no packing attribute because every field is already naturally aligned
+at its declared offset; the plugin carries a
+`G_STATIC_ASSERT(sizeof(tcgcov_header) == 88)` **and one `offsetof` assertion
+per field** — the total size alone would still hold if a field moved and the
+padding moved with it — so an ABI that lays the struct out differently fails
+the build rather than emitting an unreadable file.
 
 | Offset | Size | Type       | Field             | Meaning |
 |-------:|-----:|------------|-------------------|---------|
@@ -293,9 +309,29 @@ The binary header is authoritative. Where a metadata field duplicates a header
 field, a reader should prefer the header and may treat a mismatch as
 corruption.
 
-Note that `test_id`, `bsp` and `elf` are interpolated verbatim without JSON
-escaping. A value containing `"` or `\` will produce malformed JSON; callers
-should not pass such values.
+### 6.1 Escaping
+
+`test_id`, `bsp` and `elf` are free-form strings taken from the plugin's
+command line, and `elf` is a filesystem path — a Windows-style path or a
+shell-quoted label really does contain `"` or `\`. The producer therefore
+JSON-escapes them: `"` and `\` are backslash-escaped, and control characters
+are emitted as `\b`, `\f`, `\n`, `\r`, `\t` or `\u00XX`.
+
+**The metadata section is valid JSON and valid UTF-8 whatever those arguments
+contain.** This matters more than it looks: the metadata is one blob, so a
+single stray quote used to make the *entire artifact* unreadable — every
+correct binary record in it included — and the failure appeared at read time,
+far from the launch line that caused it.
+
+A reader must unescape normally and must not assume these values contain no
+backslashes.
+
+One case is lossy. A POSIX path is a byte string with no encoding attached, so
+it may contain a byte that is not part of a well-formed UTF-8 sequence. Such a
+byte is emitted as the escape `\u00XX` of its own value, because the
+alternative — passing it through — yields a metadata section the reader cannot
+decode at all. That value reads back as text but is not byte-recoverable.
+Well-formed UTF-8 passes through unchanged.
 
 ---
 
@@ -518,16 +554,16 @@ For reference, the plugin arguments that shape the output:
 
 | Argument       | Default        | Effect |
 |----------------|----------------|--------|
-| `out=PATH`     | `tcgcov.cov`   | Output file path. |
+| `out=PATH`     | `tcgcov.cov`   | Output file path. Written via a private temporary in the same directory and renamed into place; a failed write leaves any existing file untouched, and concurrent runs sharing one path do not corrupt each other. See §1. |
 | `mode=tb`      | —              | `record_type = 1`, one record per executed translation-block start. Cheapest; one callback per block. |
 | `mode=tb-insn` | *(default)*    | `record_type = 2`, one record per instruction the CPU actually reached. `insn_fidelity = "exact"`. Costs one callback per in-range instruction — the slowest mode, and the default because a coverage tool that over-reports is worse than a slow one. `mode=insn` is an accepted alias. |
 | `mode=tb-insn-fast` | —         | `record_type = 2`, but instruction addresses are expanded from a single per-block callback. `insn_fidelity = "tb-approx"`; **over-reports instructions after an aborted block**. See §4.1. |
 | `counts=1`     | off            | Sets `HAS_COUNTS`; also sets `EDGE_COUNTS` when edges are on. |
 | `edges=1`      | off            | Sets `HAS_EDGES` and emits the edge section. |
 | `filter=A-B[,C-D...]` | none    | Only record addresses in `[start, end)`. Values accept `0x` hex. Recorded in `metadata.filters`. |
-| `elf=PATH`     | none           | Recorded in `metadata.elf` for offline symbolization. |
-| `test_id=STR`  | none           | Free-form metadata string. |
-| `bsp=STR`      | none           | Free-form metadata string. |
+| `elf=PATH`     | none           | Recorded in `metadata.elf` for offline symbolization. JSON-escaped, so any path is safe; see §6.1. |
+| `test_id=STR`  | none           | Free-form metadata string. JSON-escaped; see §6.1. |
+| `bsp=STR`      | none           | Free-form metadata string. JSON-escaped; see §6.1. |
 | `verbose=1`    | off            | Diagnostics on stderr; does not affect the file. |
 
 Boolean arguments accept `1`/`0` as well as QEMU's own `on`/`off`,

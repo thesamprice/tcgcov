@@ -32,12 +32,17 @@
  *   See the COPYING file in the top-level directory.
  */
 
+#include <errno.h>
 #include <inttypes.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 #include <glib.h>
 
 #include <qemu-plugin.h>
@@ -125,6 +130,27 @@ typedef struct tcgcov_header {
  */
 G_STATIC_ASSERT(sizeof(tcgcov_header) == 88);
 
+/*
+ * The total size only proves the struct as a whole is 88 bytes; it would still
+ * hold if a field moved and the padding moved with it. The reader addresses
+ * every field by a hardcoded offset (FORMAT.md section 2), so pin the interior
+ * layout too.
+ */
+G_STATIC_ASSERT(offsetof(tcgcov_header, magic)           ==  0);
+G_STATIC_ASSERT(offsetof(tcgcov_header, version)         ==  8);
+G_STATIC_ASSERT(offsetof(tcgcov_header, endian)          == 10);
+G_STATIC_ASSERT(offsetof(tcgcov_header, header_size)     == 12);
+G_STATIC_ASSERT(offsetof(tcgcov_header, record_type)     == 16);
+G_STATIC_ASSERT(offsetof(tcgcov_header, flags)           == 20);
+G_STATIC_ASSERT(offsetof(tcgcov_header, record_count)    == 24);
+G_STATIC_ASSERT(offsetof(tcgcov_header, metadata_offset) == 32);
+G_STATIC_ASSERT(offsetof(tcgcov_header, metadata_size)   == 40);
+G_STATIC_ASSERT(offsetof(tcgcov_header, records_offset)  == 48);
+G_STATIC_ASSERT(offsetof(tcgcov_header, records_size)    == 56);
+G_STATIC_ASSERT(offsetof(tcgcov_header, edge_count)      == 64);
+G_STATIC_ASSERT(offsetof(tcgcov_header, edges_offset)    == 72);
+G_STATIC_ASSERT(offsetof(tcgcov_header, edges_size)      == 80);
+
 /* ------------------------------------------------------------------ */
 /* Internal data structures.                                          */
 /* ------------------------------------------------------------------ */
@@ -188,11 +214,19 @@ typedef struct InsnSlab {
     CovInsn items[TCGCOV_INSN_SLAB_ITEMS];
 } InsnSlab;
 
-/* { address, execution count } record used when counts mode is enabled. */
+/*
+ * { address, execution count } record used when counts mode is enabled. The
+ * first `addr_rec` bytes of this struct ARE the on-disk record (8 bytes without
+ * counts, 16 with), and its size is what records_size is computed from, so it
+ * carries the same size assertion as the other on-disk structs.
+ */
 typedef struct {
     uint64_t addr;
     uint64_t count;
 } AddrCount;
+
+G_STATIC_ASSERT(sizeof(AddrCount) == 16);
+G_STATIC_ASSERT(offsetof(AddrCount, count) == 8);
 
 /*
  * A directed control-flow edge. src/dst are written to disk in this order;
@@ -424,6 +458,22 @@ static CovInsn *insn_alloc(CovState *s, uint64_t vaddr)
     ci->vaddr = vaddr;
     return ci;
 }
+
+/*
+ * Portability note for the 64-bit atomics below (`count` fields, incremented
+ * with __atomic_fetch_add on a uint64_t).
+ *
+ * On a 32-bit host there is no native 64-bit read-modify-write, so the
+ * compiler may emit a call to __atomic_fetch_add_8 in libatomic instead of an
+ * inline instruction sequence. This file is built as a standalone shared
+ * object by plugin/Makefile, which does not link -latomic, so such a build
+ * would fail to link (or, worse, load with an unresolved symbol). It has not
+ * been addressed here because it cannot be fixed inside this file: the
+ * remedies are a link flag (-latomic) or dropping to a 32-bit-safe counter
+ * type, and both belong to the build/format contract rather than the source.
+ * Counts are only used in counts=1 mode; the coverage bitmap itself uses
+ * `unsigned int`, which is lock-free everywhere.
+ */
 
 /*
  * Mark a monotonic 0 -> 1 flag. Deliberately not g_atomic_int_set(): GLib's
@@ -720,6 +770,82 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 /* Output.                                                            */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Append `s` to `out` as the body of a JSON string (the caller supplies the
+ * quotes), escaping everything RFC 8259 requires: the two mandatory escapes
+ * (" and \) and every C0 control character.
+ *
+ * This is not cosmetic. test_id=, bsp= and elf= are free-form strings handed
+ * to the plugin from a shell script - elf= is a filesystem path, which may
+ * legally contain a quote or a backslash - and an unescaped one used to make
+ * the metadata invalid JSON. The reader then throws on json.loads and the
+ * WHOLE artifact is lost, every perfectly good binary record with it, at read
+ * time and far from the cause. Escaping here is what makes the "metadata is
+ * valid JSON" guarantee in FORMAT.md section 6 unconditional.
+ *
+ * Non-ASCII input is passed through byte-for-byte when it is well-formed
+ * UTF-8, because the reader decodes this section as UTF-8. A byte that is not
+ * part of a valid UTF-8 sequence - which a POSIX path may well contain, since
+ * a path is a byte string with no encoding attached - cannot be passed through
+ * without making the whole artifact undecodable, so it is emitted as the
+ * escape \u00XX of its own value. The result is always valid UTF-8 and always
+ * valid JSON; a byte-exact path is not recoverable in that case, but the
+ * alternative is losing the entire file.
+ *
+ * Deliberately hand-rolled rather than pulling in a JSON library: this is the
+ * only string the plugin ever emits, and a QEMU plugin should not acquire a
+ * dependency for eight lines of escaping.
+ */
+static void json_escape_append(GString *out, const char *s)
+{
+    const unsigned char *p = (const unsigned char *)(s ? s : "");
+
+    while (*p) {
+        unsigned char c = *p;
+
+        if (c == '"' || c == '\\') {
+            g_string_append_c(out, '\\');
+            g_string_append_c(out, (gchar)c);
+            p++;
+        } else if (c < 0x20 || c == 0x7f) {
+            switch (c) {
+            case '\b': g_string_append(out, "\\b"); break;
+            case '\f': g_string_append(out, "\\f"); break;
+            case '\n': g_string_append(out, "\\n"); break;
+            case '\r': g_string_append(out, "\\r"); break;
+            case '\t': g_string_append(out, "\\t"); break;
+            default:   g_string_append_printf(out, "\\u%04x", c); break;
+            }
+            p++;
+        } else if (c < 0x80) {
+            g_string_append_c(out, (gchar)c);
+            p++;
+        } else {
+            gunichar u = g_utf8_get_char_validated((const char *)p, -1);
+
+            /* (gunichar)-1 = invalid sequence, (gunichar)-2 = truncated. */
+            if (u == (gunichar)-1 || u == (gunichar)-2) {
+                g_string_append_printf(out, "\\u%04x", c);
+                p++;
+            } else {
+                const unsigned char *next =
+                    (const unsigned char *)g_utf8_next_char(p);
+
+                g_string_append_len(out, (const char *)p, next - p);
+                p = next;
+            }
+        }
+    }
+}
+
+/* Emit one `"key": "value",` line with the value escaped. Keys are literals. */
+static void json_append_str(GString *m, const char *key, const char *val)
+{
+    g_string_append_printf(m, "  \"%s\": \"", key);
+    json_escape_append(m, val);
+    g_string_append(m, "\",\n");
+}
+
 static char *build_metadata_json(CovState *s, uint64_t record_count,
                                  uint64_t edge_count)
 {
@@ -728,17 +854,14 @@ static char *build_metadata_json(CovState *s, uint64_t record_count,
     g_string_append(m, "{\n");
     g_string_append(m, "  \"format\": \"tcgcov\",\n");
     g_string_append(m, "  \"version\": 1,\n");
-    g_string_append_printf(m, "  \"mode\": \"%s\",\n", mode_name(s->mode));
-    g_string_append_printf(m, "  \"target_name\": \"%s\",\n",
-                           s->target_name ? s->target_name : "");
+    json_append_str(m, "mode", mode_name(s->mode));
+    json_append_str(m, "target_name", s->target_name);
     g_string_append_printf(m, "  \"system_emulation\": %s,\n",
                            s->system_emulation ? "true" : "false");
-    g_string_append_printf(m, "  \"test_id\": \"%s\",\n",
-                           s->test_id ? s->test_id : "");
-    g_string_append_printf(m, "  \"bsp\": \"%s\",\n", s->bsp ? s->bsp : "");
-    g_string_append_printf(m, "  \"elf\": \"%s\",\n",
-                           s->elf_path ? s->elf_path : "");
-    g_string_append_printf(m, "  \"address_kind\": \"vaddr\",\n");
+    json_append_str(m, "test_id", s->test_id);
+    json_append_str(m, "bsp", s->bsp);
+    json_append_str(m, "elf", s->elf_path);
+    json_append_str(m, "address_kind", "vaddr");
     g_string_append_printf(m, "  \"counts_enabled\": %s,\n",
                            s->counts ? "true" : "false");
     g_string_append_printf(m, "  \"record_count\": %" PRIu64 ",\n",
@@ -751,8 +874,7 @@ static char *build_metadata_json(CovState *s, uint64_t record_count,
      * them must ignore unknown keys (as JSON readers should), and readers that
      * want them must tolerate their absence in older files.
      */
-    g_string_append_printf(m, "  \"insn_fidelity\": \"%s\",\n",
-                           fidelity_name(s->mode));
+    json_append_str(m, "insn_fidelity", fidelity_name(s->mode));
     g_string_append_printf(m, "  \"discon_tracking\": %s,\n",
                            (s->edges && TCGCOV_HAVE_DISCON) ? "true" : "false");
 
@@ -921,18 +1043,147 @@ static void fill_edge_header(CovState *s, tcgcov_header *h, uint64_t n_edges)
     h->edges_size = n_edges * (uint64_t)edge_record_size(s);
 }
 
-static void write_edges(CovState *s, FILE *f, GArray *edges, guint n)
+/*
+ * Write exactly `len` bytes, reporting a short write as failure.
+ *
+ * A true return does NOT mean the bytes are in the file - stdio buffers, so
+ * for an artifact smaller than the buffer the underlying write(2) has not even
+ * been attempted yet. Only close_out() can answer that.
+ */
+static bool write_all(FILE *f, const void *buf, size_t len)
+{
+    return len == 0 || fwrite(buf, 1, len, f) == len;
+}
+
+static bool write_edges(CovState *s, FILE *f, GArray *edges, guint n)
 {
     size_t rec = edge_record_size(s);
 
     if (!s->edges) {
-        return;
+        return true;
     }
     for (guint i = 0; i < n; i++) {
         const Edge *e = &g_array_index(edges, Edge, i);
         /* Edge is { src, dst, count }; the first `rec` bytes are the record. */
-        fwrite(e, rec, 1, f);
+        if (!write_all(f, e, rec)) {
+            return false;
+        }
     }
+    return true;
+}
+
+/*
+ * Permissions to give the artifact.
+ *
+ * mkstemp() creates its file 0600, but the fopen() this replaced created it
+ * 0666 & ~umask, and an artifact is routinely read back by a different user
+ * than the one QEMU ran as (CI collector, a shared results directory). Match
+ * whatever the file being replaced had, so repeatedly overwriting an artifact
+ * never quietly changes who can read it, and fall back to the umask default
+ * when there is nothing to match.
+ */
+static mode_t artifact_mode(const char *dest)
+{
+    struct stat st;
+    mode_t um;
+
+    if (stat(dest, &st) == 0) {
+        return st.st_mode & 0777;
+    }
+    /* There is no reader for the umask; it has to be set to be read. */
+    um = umask(0);
+    umask(um);
+    return 0666 & ~um;
+}
+
+/*
+ * Create the temporary file the artifact is assembled in and return a stdio
+ * stream on it, storing its path in *tmp_path_out for the caller to rename or
+ * unlink. Returns NULL (having reported why) on failure.
+ *
+ * Two properties matter here.
+ *
+ * Same directory as the destination: rename(2) is only atomic within a
+ * filesystem, and fails outright across one, so the temporary cannot live in
+ * /tmp.
+ *
+ * Unique per writer: the name used to be a fixed "<out>.tmp", which is not a
+ * private name at all. Two QEMU processes launched with the same out= - an
+ * easy mistake when a test suite runs in parallel - both opened that one file
+ * with O_TRUNC and interleaved their writes into it, so each renamed a file
+ * containing a blend of two runs' bytes into place. mkstemp() gives every
+ * writer its own file; concurrent runs then simply race to rename, the last
+ * one wins, and every artifact that is ever visible under the destination name
+ * is the complete output of exactly one run.
+ */
+static FILE *open_tmp(const char *dest, char **tmp_path_out)
+{
+    g_autofree char *dir = g_path_get_dirname(dest);
+    g_autofree char *base = g_path_get_basename(dest);
+    g_autofree char *leaf = g_strdup_printf(".%s.XXXXXX", base);
+    char *tmp = g_build_filename(dir, leaf, NULL);
+    int fd = mkstemp(tmp);
+    FILE *f;
+
+    if (fd < 0) {
+        g_printerr("tcgcov: cannot create a temporary file for %s: %s\n",
+                   dest, g_strerror(errno));
+        g_free(tmp);
+        return NULL;
+    }
+    if (fchmod(fd, artifact_mode(dest)) != 0) {
+        /* Not fatal: the artifact is still correct, just more private. */
+        g_printerr("tcgcov: warning: cannot set permissions on %s: %s\n",
+                   tmp, g_strerror(errno));
+    }
+    f = fdopen(fd, "wb");
+    if (f == NULL) {
+        g_printerr("tcgcov: cannot open %s for writing: %s\n",
+                   tmp, g_strerror(errno));
+        close(fd);
+        unlink(tmp);
+        g_free(tmp);
+        return NULL;
+    }
+
+    *tmp_path_out = tmp;
+    return f;
+}
+
+/*
+ * Flush, sync and close. Returns true only if every byte actually reached the
+ * file. `ok` is the running result of the writes; the stream is closed exactly
+ * once whatever it is.
+ *
+ * The close is the check that matters. Because stdio buffers, a typical
+ * artifact is handed to write(2) exactly once, inside the flush - so an
+ * ENOSPC or EDQUOT is reported by fflush()/fclose() and by no fwrite() at all.
+ * Checking only fwrite() (the previous behaviour was to check nothing) would
+ * let a truncated file be renamed over a good one, and the loss would surface
+ * later as a reader error on a file the run appeared to write successfully.
+ */
+static bool close_out(FILE *f, bool ok)
+{
+    if (ok && ferror(f)) {
+        ok = false;
+    }
+    if (ok && fflush(f) != 0) {
+        ok = false;
+    }
+    /*
+     * Sync before the rename publishes the name, so a host that dies moments
+     * later cannot leave the destination pointing at unwritten data. EINVAL
+     * and ENOTSUP mean the target simply does not implement fsync, which is
+     * not a write error.
+     */
+    if (ok && fsync(fileno(f)) != 0
+        && errno != EINVAL && errno != ENOTSUP) {
+        ok = false;
+    }
+    if (fclose(f) != 0) {
+        ok = false;
+    }
+    return ok;
 }
 
 static void plugin_exit(qemu_plugin_id_t id, void *userdata)
@@ -945,8 +1196,9 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
     char *meta;
     size_t meta_size;
     tcgcov_header h;
-    char *tmp;
+    char *tmp = NULL;
     FILE *f;
+    bool ok;
 
     (void)id;
     (void)userdata;
@@ -977,26 +1229,37 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
     h.records_size = (uint64_t)n_addrs * addr_rec;
     fill_edge_header(s, &h, n_edges);
 
-    tmp = g_strdup_printf("%s.tmp", s->out_path);
-    f = fopen(tmp, "wb");
+    f = open_tmp(s->out_path, &tmp);
     if (!f) {
-        g_printerr("tcgcov: failed to open %s\n", tmp);
+        /* Nothing was touched, so any previous artifact is still valid. */
         goto out;
     }
 
-    fwrite(&h, sizeof(h), 1, f);
-    fwrite(meta, 1, meta_size, f);
-    for (guint i = 0; i < n_addrs; i++) {
+    ok = write_all(f, &h, sizeof(h)) && write_all(f, meta, meta_size);
+    for (guint i = 0; ok && i < n_addrs; i++) {
         /* AddrCount is { addr, count }; the first `addr_rec` bytes are it. */
         const AddrCount *ac = &g_array_index(pairs, AddrCount, i);
-        fwrite(ac, addr_rec, 1, f);
+        ok = write_all(f, ac, addr_rec);
     }
-    write_edges(s, f, edges, n_edges);
-    fclose(f);
+    ok = ok && write_edges(s, f, edges, n_edges);
+
+    /*
+     * On any failure the temporary is removed and the rename is skipped: a
+     * previously written artifact stays intact and readable, which is strictly
+     * more useful than a truncated file bearing the expected name. The reader
+     * rejects a short file loudly, but the point is never to hand it one.
+     */
+    if (!close_out(f, ok)) {
+        g_printerr("tcgcov: failed to write %s: %s; leaving %s unchanged\n",
+                   tmp, g_strerror(errno), s->out_path);
+        unlink(tmp);
+        goto out;
+    }
 
     if (rename(tmp, s->out_path) != 0) {
-        g_printerr("tcgcov: failed to rename %s -> %s\n",
-                   tmp, s->out_path);
+        g_printerr("tcgcov: failed to rename %s -> %s: %s\n",
+                   tmp, s->out_path, g_strerror(errno));
+        unlink(tmp);
     } else if (s->verbose) {
         g_printerr("tcgcov: wrote %u %s records (%s), %u edges to %s\n",
                    n_addrs, s->counts ? "count" : "address",
@@ -1109,11 +1372,11 @@ static bool parse_arg(CovState *s, const char *arg)
         g_free(s->out_path);
         s->out_path = g_strdup(v);
     } else if (g_strcmp0(k, "test_id") == 0) {
-        /* Free-form metadata string, copied verbatim into the JSON. */
+        /* Free-form metadata string; JSON-escaped on the way out. */
         g_free(s->test_id);
         s->test_id = g_strdup(v);
     } else if (g_strcmp0(k, "bsp") == 0) {
-        /* Free-form metadata string, copied verbatim into the JSON. */
+        /* Free-form metadata string; JSON-escaped on the way out. */
         g_free(s->bsp);
         s->bsp = g_strdup(v);
     } else if (g_strcmp0(k, "elf") == 0) {
