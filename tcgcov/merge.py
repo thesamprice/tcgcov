@@ -7,10 +7,17 @@ percentages survive: a line is covered in the aggregate if any input covers it;
 coverable if any input lists it. Execution counts are SUMMED across tests.
 
 Branch records merge the same way, keyed by (source file, line, block, branch)
--- the analogous source identity for a branch outcome. Counts are summed, and
-the LCOV '-' (never evaluated) survives only if EVERY input says '-': as soon as
-one test evaluated the branch, the aggregate knows the outcome count, so '-'
-would understate it.
+-- the analogous source identity for a branch outcome. That only holds because
+`block` is itself source-derived (tcgcov.branches emits the SOURCE LINE of the
+branch's target): a block that ranked this binary's branches would shift the
+moment one binary inlined a call site more, or folded half of `a && b` away, and
+this merge would then sum two unrelated branches. Counts are summed, and the
+LCOV '-' (never evaluated) survives only if EVERY input says '-': as soon as one
+test evaluated the branch, the aggregate knows the outcome count, so '-' would
+understate it.
+
+Two branches that share a key are summed on purpose -- at source-line
+granularity they are the same branch (see tcgcov.branches.block_number).
 """
 
 import argparse

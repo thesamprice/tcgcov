@@ -16,6 +16,11 @@ differently: '-' means the branch was never EVALUATED (the code never ran), '0'
 means it ran but that outcome never happened -- an untested else-path, which is
 exactly what branch coverage exists to surface. Branch 0 of each block is the
 taken outcome, branch 1 the fall-through.
+
+`block` is passed through from `tcgcov branches`, where it is the source line of
+the branch's target rather than a position among this binary's branches, so
+(line, block, branch) identifies the same source branch in every separately-
+linked binary and `tcgcov merge` can key on it.
 """
 
 import argparse
@@ -66,8 +71,13 @@ def load_branches(path):
 
     `taken` is None when the branch was never evaluated (LCOV '-') and an
     integer otherwise. Branch 0 is the taken outcome, branch 1 the fall-through.
+    `block` is the source-derived block id from `tcgcov branches` (the target's
+    source line), not a rank among this binary's branches.
+
     Records for the same key from several inputs are summed, so a per-test run
-    that saw a branch twice still reports one entry.
+    that saw a branch twice still reports one entry -- and so do the two branch
+    points that legitimately share a block because they exit to the same source
+    line, which at this granularity are one branch.
     """
     by_file = defaultdict(dict)
     with open(path) as f:

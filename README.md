@@ -163,14 +163,30 @@ Plugin arguments are `key=value`, comma-separated:
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `out=` | `qemu-rtems.cov` | output artifact path (written atomically via `.tmp` + rename) |
-| `mode=` | `tb-insn` | `tb-insn` — record every in-range instruction address of each executed block; `tb` — record only block start addresses |
+| `out=` | `tcgcov.cov` | output artifact path (written atomically via `.tmp` + rename) |
+| `mode=` | `tb-insn` | see the fidelity table below |
 | `filter=` | *(none)* | `0xSTART-0xEND[,…]` address ranges to record; empty means everything |
-| `counts=1` | off | record 64-bit per-block execution counts (turns the report into a hotspot view) |
-| `edges=1` | off | record control-flow edges, the input to branch coverage |
+| `counts=` | `off` | record 64-bit execution counts (turns the report into a hotspot view) |
+| `edges=` | `off` | record control-flow edges, the input to branch coverage |
 | `elf=` | `""` | path to the ELF, copied into the artifact's metadata so the host tools need no manifest |
 | `test_id=`, `bsp=` | `""` | free-form labels (run name, board/platform) copied into the metadata |
-| `verbose=1` | off | log a one-line summary at exit |
+| `verbose=` | `off` | log a one-line summary at exit |
+
+Boolean arguments accept `on`/`off`, `true`/`false`, `yes`/`no` and `1`/`0`.
+**An unknown argument, an unparseable value or a malformed `filter=` range
+refuses to start QEMU** rather than running with settings you did not ask for —
+a run that silently records nothing costs far more to diagnose than a failed
+launch.
+
+`mode=` trades cost against fidelity:
+
+| `mode=` | Records | Fidelity |
+|---|---|---|
+| `tb` | one address per executed block (its start) | exact for what it claims: reaching a block proves its first instruction was reached |
+| `tb-insn` *(default)* | every instruction that individually executed | **exact** — an execution callback per instruction, so an instruction after an abort point (exception, interrupt) is never reported |
+| `tb-insn-fast` | every instruction the block was *translated* with, gated on block entry | cheap, but **over-reports**: a block that aborts part way through still reports all of its instructions |
+
+The artifact records which fidelity it was produced at, so a reader can tell.
 
 **How it works.** A translation callback records each block and its in-range
 instruction addresses; a minimal execution callback marks the block executed.
@@ -345,6 +361,36 @@ LCOV `BRDA:` records. `genhtml --branch-coverage` then reports a branch whose
 Enable edge recording with `edges=1` on the plugin, then run
 `tcgcov branches`; the driver does both by default and takes `--no-branches` to
 turn it off. See `tcgcov branches --help` for the current options.
+
+### How a branch is identified across binaries
+
+Branch records have to merge across separately-linked binaries for the same
+reason lines do, so they need a source-level identity too. An LCOV branch is
+addressed by `BRDA:<line>,<block>,<branch>`, and tcgcov fills `block` with **the
+source line the branch jumps to** (falling back to its fall-through's line, then
+to 0), resolved through the same `addr2line` and the same path normalizer as
+everything else.
+
+The obvious alternative — numbering the branches found on a line — is wrong, and
+was the original implementation. A rank is a property of *this* binary: inline a
+call site once more in one image, or let the optimizer fold one half of
+`a && b` away in another, and every rank after it shifts, so the aggregate sums
+two unrelated branches and reports a count belonging to neither. A target's
+source line does not move when the image is relinked.
+
+Two branches on one line normally jump to different lines — for `a || b`, the
+first test exits into the body and the second past it — so they normally stay
+distinct. Where they genuinely coincide (`a && b` compiled so both tests exit to
+the same `else`) they are indistinguishable at source-line granularity and are
+summed, which costs a little resolution and invents nothing.
+
+DWARF's `discriminator` would be the purpose-built answer and `addr2line` does
+print it, but measurement says it cannot carry this: GCC assigns discriminators
+to the *blocks* on a line rather than to the branches that select them (for
+`if (a && b)` at `-O2`, both condition branches come back with no discriminator
+while the two call blocks get 1 and 2), and Clang emits none at all unless built
+with `-fdebug-info-for-profiling`. A column number would be better still, and
+`addr2line` does not report one.
 
 ---
 

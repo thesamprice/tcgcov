@@ -20,12 +20,16 @@ The count appears in the summary line.
 
 Output JSONL fields: file, line, function, address, block, taken, nottaken,
 evaluated, target, fallthrough, arch, test_id, bsp.
+
+`block` is the SOURCE LINE of the branch's target, not a position among this
+binary's branches, so that (file, line, block, branch) means the same thing in
+every separately-linked binary an aggregate merges -- the same way line coverage
+keys on (file, line) rather than on an address. See block_number.
 """
 
 import argparse
 import json
 import sys
-from collections import defaultdict
 
 from . import cfg
 from .format import read_all
@@ -35,7 +39,11 @@ from .paths import path_options
 
 
 def resolve_locations(addr2line, elf, addrs, args):
-    """Return {address: (file, line, function)} for the branch addresses.
+    """Return {address: (file, line, function)} for the given addresses.
+
+    Callers pass both the branch addresses and their taken/fall-through TARGET
+    addresses, because the block id is derived from the target's source line
+    (see block_number).
 
     Uses the same batched addr2line and the same path normalization as the
     covered/coverable producers, so branch records key on exactly the source
@@ -53,39 +61,79 @@ def resolve_locations(addr2line, elf, addrs, args):
     return best
 
 
+def block_number(bp, locations):
+    """LCOV `block` for one branch point: the SOURCE LINE of its target.
+
+    LCOV's block field is an opaque integer -- genhtml only uses it to group
+    outcomes -- but merge.py keys branch outcomes on
+    (file, line, block, branch), exactly the way line coverage keys on
+    (file, line), so whatever goes in it has to mean the same thing in every
+    separately-linked binary the aggregate merges.
+
+    A RANK among the branches this binary happens to have on the line does not:
+    inline one more call site in binary A, or let the optimizer fold one half of
+    `a && b` away in binary B, and every rank after it shifts, so the merge sums
+    two unrelated branches as if they were one. That was the original bug here.
+
+    The target's source line is a property of the SOURCE, not of this binary's
+    layout: relink the same object at another address and it is unchanged, and a
+    branch that survives into several binaries keeps jumping to the same line.
+    Two branches on one line normally jump to different lines -- `a || b` exits
+    to the body from the first test and past it from the second -- so they
+    normally get different blocks. Where they genuinely land on the same line
+    (`a && b` compiled so both tests exit to the same `else`) the two are
+    indistinguishable at source-line granularity, and summing them is the honest
+    answer rather than a mis-attribution.
+
+    Falls back to the fall-through target's line when the taken target has no
+    kept source mapping (unbuilt path, excluded tree, no DWARF), and to 0 when
+    neither has one. Indirect branches never reach here: they have no known
+    target and are excluded from branch coverage upstream.
+    """
+    for addr in (bp.taken, bp.fallthrough):
+        if addr is None:
+            continue
+        loc = locations.get(addr)
+        if loc is not None:
+            return loc[1]
+    return 0
+
+
 def build_records(branch_points, counts, locations, base_fields):
     """Join static branch points with observed counts -> LCOV-ready records.
 
-    `block` numbers the branch points that share a source line, in address
-    order, so the (file, line, block, branch) key stays stable across the
-    different test binaries an aggregate merges -- the same way line coverage
-    keys on (file, line) rather than on an address.
+    `locations` must map the branch addresses AND their taken/fall-through
+    target addresses; block_number needs the targets to derive a merge-stable
+    block id, and it must come from the same map so every key in the record went
+    through one symbolizer and one path normalizer.
+
+    Two branch points on one line can legitimately share a block (see
+    block_number); the downstream BRDA loaders sum such records, which is why
+    this returns them as they are rather than renumbering.
     """
-    by_line = defaultdict(list)
+    records = []
     for bp in branch_points:
         if bp.indirect:
             continue
         loc = locations.get(bp.addr)
         if loc is None:
             continue          # branch in code with no (kept) source mapping
-        by_line[(loc[0], loc[1])].append((bp, loc[2]))
-
-    records = []
-    for (sf, line) in sorted(by_line):
-        entries = sorted(by_line[(sf, line)], key=lambda e: e[0].addr)
-        for block, (bp, func) in enumerate(entries):
-            bc = counts.get(bp.addr)
-            rec = {
-                "file": sf, "line": line, "function": func,
-                "address": "0x%x" % bp.addr, "block": block,
-                "taken": bc.taken if bc else 0,
-                "nottaken": bc.nottaken if bc else 0,
-                "evaluated": bool(bc and bc.evaluated),
-                "target": "0x%x" % bp.taken,
-                "fallthrough": "0x%x" % bp.fallthrough,
-            }
-            rec.update(base_fields)
-            records.append(rec)
+        sf, line, func = loc
+        bc = counts.get(bp.addr)
+        rec = {
+            "file": sf, "line": line, "function": func,
+            "address": "0x%x" % bp.addr,
+            "block": block_number(bp, locations),
+            "taken": bc.taken if bc else 0,
+            "nottaken": bc.nottaken if bc else 0,
+            "evaluated": bool(bc and bc.evaluated),
+            "target": "0x%x" % bp.taken,
+            "fallthrough": "0x%x" % bp.fallthrough,
+        }
+        rec.update(base_fields)
+        records.append(rec)
+    records.sort(key=lambda r: (r["file"], r["line"], r["block"],
+                                int(r["address"], 16)))
     return records
 
 
@@ -176,9 +224,17 @@ def run(args):
     locations = {}
     direct = [bp for bp in graph.branch_points if not bp.indirect]
     if direct:
+        # Branch addresses AND their two targets, in one batched call: the
+        # block id is the target's source line, and it has to come out of the
+        # same addr2line and the same normalizer as everything else or the keys
+        # are not comparable across binaries.
+        wanted = set()
+        for bp in direct:
+            wanted.update((bp.addr, bp.taken, bp.fallthrough))
+        wanted.discard(None)
         try:
             locations = resolve_locations(
-                addr2line, args.elf, [bp.addr for bp in direct], args)
+                addr2line, args.elf, sorted(wanted), args)
         except (OSError, RuntimeError) as e:
             print(f"error: {e}", file=sys.stderr)
             return 1

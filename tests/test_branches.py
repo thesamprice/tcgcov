@@ -1,8 +1,9 @@
 """Tests for branch records and their LCOV BRDA emission.
 
-Covers the join of the static inventory with observed edges, the block/branch
-numbering that lets BRDA merge across test binaries, and the '-' vs '0'
-distinction that tells "never evaluated" apart from "evaluated, never taken".
+Covers the join of the static inventory with observed edges, the source-derived
+block id that lets BRDA merge across separately-linked test binaries, and the
+'-' vs '0' distinction that tells "never evaluated" apart from "evaluated, never
+taken".
 """
 
 import json
@@ -24,9 +25,9 @@ SRC = "/work/proj/src/main.c"
 # Two conditional branches on the SAME source line (a short-circuit &&), plus a
 # never-executed one on another line, in MicroBlaze delay-slot form.
 #   90000000  addik
-#   90000004  beqid  -> 90000020   (line 10, block 0)   delay slot 90000008
+#   90000004  beqid  -> 90000020   (line 10)   delay slot 90000008
 #   9000000c  addik
-#   90000010  bneid  -> 90000020   (line 10, block 1)   delay slot 90000014
+#   90000010  bneid  -> 90000020   (line 10)   delay slot 90000014
 #   90000018  addik
 #   9000001c  bnei   -> 90000028   (line 20, never runs)
 #   90000020  addik
@@ -54,10 +55,16 @@ TEXT = "\n".join([
     "",
 ])
 
+# Branch addresses AND their taken/fall-through targets: the block id is the
+# target's source line, so the targets must resolve too.
 LOCATIONS = {
-    0x90000004: (SRC, 10, "main"),
-    0x90000010: (SRC, 10, "main"),
-    0x9000001c: (SRC, 20, "main"),
+    0x90000004: (SRC, 10, "main"),   # `a && b`, first test
+    0x9000000c: (SRC, 10, "main"),   #   its fall-through: still line 10
+    0x90000010: (SRC, 10, "main"),   # `a && b`, second test
+    0x90000018: (SRC, 11, "main"),   #   its fall-through: the then-body
+    0x90000020: (SRC, 12, "main"),   # both tests exit here (the else)
+    0x9000001c: (SRC, 20, "main"),   # unrelated branch on another line
+    0x90000028: (SRC, 22, "main"),   #   its taken target
 }
 
 
@@ -113,12 +120,14 @@ class TestBuildRecords(unittest.TestCase):
         self.assertTrue(all(r["taken"] == 0 and r["nottaken"] == 0
                             for r in recs))
 
-    def test_block_numbering_is_per_line_in_address_order(self):
+    def test_block_is_the_targets_source_line(self):
         recs = {r["address"]: r for r in self.records([])}
-        self.assertEqual(recs["0x90000004"]["block"], 0)
-        self.assertEqual(recs["0x90000010"]["block"], 1)
-        # A different line restarts at block 0.
-        self.assertEqual(recs["0x9000001c"]["block"], 0)
+        # Both halves of the `&&` exit to the else at line 12, so both carry
+        # block 12 -- NOT 0 and 1, which would be their rank in this binary.
+        self.assertEqual(recs["0x90000004"]["block"], 12)
+        self.assertEqual(recs["0x90000010"]["block"], 12)
+        # The unrelated branch on line 20 jumps to line 22.
+        self.assertEqual(recs["0x9000001c"]["block"], 22)
         self.assertEqual(recs["0x9000001c"]["line"], 20)
 
     def test_counts_join_onto_the_right_branch(self):
@@ -138,6 +147,71 @@ class TestBuildRecords(unittest.TestCase):
         recs = branches.build_records(self.graph.branch_points, counts,
                                       {0x90000004: (SRC, 10, "main")}, {})
         self.assertEqual([r["address"] for r in recs], ["0x90000004"])
+
+
+class TestBlockIsSourceIdentity(unittest.TestCase):
+    """`block` must name a branch by SOURCE, never by its position among the
+    branches this particular binary happens to carry on the line.
+
+    A rank shifts the moment one binary inlines a call site more, or folds one
+    half of `a && b` away -- and merge.py, keying on (file, line, block,
+    branch), would then add two unrelated branches together.
+    """
+
+    @staticmethod
+    def bp(addr, taken, fallthrough):
+        # block_start/block_end only matter to edge matching, not to the key.
+        return cfg.BranchPoint(addr, "bnei", taken, fallthrough, addr, addr)
+
+    def blocks(self, points, locations):
+        recs = branches.build_records(points, {}, locations, {})
+        return {r["address"]: r["block"] for r in recs}
+
+    def test_same_source_branch_at_different_addresses_keys_the_same(self):
+        """The whole point: relinking moves every address and must move no key.
+
+        `if (b) then; else after;` on line 10, compiled into two separately
+        linked binaries at unrelated bases.
+        """
+        a = self.blocks([self.bp(0x90000004, 0x90000014, 0x90000008)],
+                        {0x90000004: (SRC, 10, "main"),
+                         0x90000014: (SRC, 13, "main"),
+                         0x90000008: (SRC, 11, "main")})
+        b = self.blocks([self.bp(0x80002004, 0x80002010, 0x80002008)],
+                        {0x80002004: (SRC, 10, "main"),
+                         0x80002010: (SRC, 13, "main"),
+                         0x80002008: (SRC, 11, "main")})
+        self.assertEqual(list(a.values()), [13])
+        self.assertEqual(list(b.values()), [13])
+
+    def test_a_neighbouring_branch_appearing_does_not_renumber(self):
+        """`a || b` on line 10: the first test exits into the body (line 11),
+        the second past it (line 13). Fold `a` away in the second binary and the
+        surviving branch must keep its key -- under address ranking it would
+        drop from block 1 to block 0 and merge onto the wrong branch."""
+        locs = {0x90000004: (SRC, 10, "main"), 0x90000008: (SRC, 10, "main"),
+                0x9000000c: (SRC, 10, "main"), 0x90000010: (SRC, 11, "main"),
+                0x90000014: (SRC, 11, "main"), 0x9000001c: (SRC, 13, "main")}
+        both = self.blocks([self.bp(0x90000004, 0x90000014, 0x90000008),
+                            self.bp(0x9000000c, 0x9000001c, 0x90000010)], locs)
+        self.assertEqual(both, {"0x90000004": 11, "0x9000000c": 13})
+
+        only_second = self.blocks(
+            [self.bp(0x9000000c, 0x9000001c, 0x90000010)], locs)
+        self.assertEqual(only_second, {"0x9000000c": 13})
+        self.assertEqual(both["0x9000000c"], only_second["0x9000000c"])
+
+    def test_falls_back_to_fallthrough_then_to_zero(self):
+        point = self.bp(0x90000004, 0x90000014, 0x90000008)
+        # Taken target outside the kept path set -> the fall-through's line.
+        self.assertEqual(
+            self.blocks([point], {0x90000004: (SRC, 10, "main"),
+                                  0x90000008: (SRC, 11, "main")}),
+            {"0x90000004": 11})
+        # Neither target mapped -> 0, and the branch is still reported.
+        self.assertEqual(
+            self.blocks([point], {0x90000004: (SRC, 10, "main")}),
+            {"0x90000004": 0})
 
 
 class TestBranchesCommand(unittest.TestCase):

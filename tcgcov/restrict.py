@@ -38,13 +38,20 @@ def load_target_inventory(args):
 
     if args.coverable:
         with open(args.coverable) as f:
-            for raw in f:
+            for lineno, raw in enumerate(f, 1):
                 raw = raw.strip()
                 if not raw:
                     continue
-                rec = json.loads(raw)
-                sf = rec["file"]
-                keep_lines.add((sf, int(rec["line"])))
+                try:
+                    rec = json.loads(raw)
+                    sf = rec["file"]
+                    line = int(rec["line"])
+                except (ValueError, KeyError, TypeError) as e:
+                    # A truncated/foreign JSONL used to abort with a bare
+                    # KeyError traceback, or a JSONDecodeError naming no file.
+                    raise ValueError(f"{args.coverable}:{lineno}: not a "
+                                     f"coverable record ({e})")
+                keep_lines.add((sf, line))
                 fn = rec.get("function")
                 if fn:
                     keep_funcs.add((sf, fn))
@@ -52,12 +59,47 @@ def load_target_inventory(args):
 
     objdump = args.objdump or (args.toolchain_prefix + "objdump")
     addr2line = args.addr2line or (args.toolchain_prefix + "addr2line")
-    addrs = disassemble_addresses(objdump, args.elf)
+    # disassemble_addresses returns (addresses, raw text); the text is only
+    # needed to tell an empty binary from an unparsable disassembly.
+    addrs, text = disassemble_addresses(objdump, args.elf)
+    if not addrs:
+        if text.strip():
+            raise RuntimeError(
+                f"{args.elf}: {objdump} produced {len(text.splitlines())} "
+                f"lines of output but no instruction addresses were parsed "
+                f"from it -- unrecognized disassembly layout")
+        raise RuntimeError(f"{args.elf}: {objdump} disassembled no "
+                           f"executable code at all")
     for norm, line, func, _depth, _addr in iter_covered_lines(
             addr2line, args.elf, addrs, path_options(args)):
         keep_lines.add((norm, line))
         keep_funcs.add((norm, func))
     return keep_lines, keep_funcs
+
+
+def run_genhtml(info, html_dir, source_root, ok_message):
+    """Run genhtml, reporting rather than raising when it cannot be run.
+
+    genhtml is optional (lcov is not installed everywhere): letting the
+    FileNotFoundError escape turned a written, valid .info into a traceback and
+    a non-zero exit, AFTER the real output had already been produced. Shared
+    with `gap`, which offers the same --html option.
+    """
+    cwd = source_root or "/"
+    try:
+        rc = subprocess.run(
+            ["genhtml", os.path.abspath(info),
+             "--output-directory", os.path.abspath(html_dir),
+             "--quiet", "--ignore-errors", "source"],
+            cwd=cwd).returncode
+    except OSError as e:
+        print(f"warning: --html requested but genhtml could not be run "
+              f"({e}); the .info was written to {info}", file=sys.stderr)
+        return
+    if rc != 0:
+        print(f"warning: genhtml exited {rc}", file=sys.stderr)
+    else:
+        print(ok_message, file=sys.stderr)
 
 
 def add_arguments(parser):
@@ -88,6 +130,16 @@ def run(args):
         print(f"error: {e}", file=sys.stderr)
         return 1
 
+    if not keep_lines:
+        # Everything would be filtered out, and the resulting empty .info
+        # reads as a successful "0 covered of 0 lines" run.
+        src = args.coverable or args.elf
+        print(f"error: {src}: the target inventory has no source lines, so "
+              f"the restricted report would be empty. Check the target was "
+              f"built with debug info and that the inventory is non-empty.",
+              file=sys.stderr)
+        return 1
+
     coverable = defaultdict(set)
     line_hits = defaultdict(dict)
     func_line = defaultdict(dict)
@@ -101,12 +153,33 @@ def run(args):
         return 1
 
     in_lf = sum(len(v) for v in coverable.values())
-    out_lf = out_lh = 0
+    if not in_lf:
+        print(f"error: {args.aggregate}: no DA records -- the aggregate is "
+              f"empty, so restricting it can only produce an empty report. "
+              f"Check the aggregate was written by `tcgcov merge`.",
+              file=sys.stderr)
+        return 1
+
+    # Filter first, write second: an empty result must not leave a plausible
+    # 0-line .info behind for genhtml (or a reader) to call a clean run.
+    kept = []
+    for sf in sorted(coverable):
+        cab = {ln for ln in coverable[sf] if (sf, ln) in keep_lines}
+        if cab:
+            kept.append((sf, cab))
+    if not kept:
+        print(f"error: none of the {in_lf} aggregate line(s) are in the "
+              f"target inventory, so the restricted report would be empty. "
+              f"Either the campaign never touched this binary's code, or -- "
+              f"far more likely -- the two sides were normalized differently "
+              f"(same --source-root/--preset/--keep flags on both?). "
+              f"Refusing to write an empty report to {args.out}.",
+              file=sys.stderr)
+        return 1
+
+    out_lf = out_lh = out_brf = out_brh = 0
     with open(args.out, "w") as out:
-        for sf in sorted(coverable):
-            cab = {ln for ln in coverable[sf] if (sf, ln) in keep_lines}
-            if not cab:
-                continue
+        for sf, cab in kept:
             lh = line_hits.get(sf, {})
             funcs = {fn: ln for fn, ln in func_line.get(sf, {}).items()
                      if (sf, fn) in keep_funcs}
@@ -127,7 +200,9 @@ def run(args):
             bd = {k: v for k, v in branch_data.get(sf, {}).items()
                   if k[0] in cab}
             if bd:
-                emit_branches(out, bd)
+                brf, brh = emit_branches(out, bd)
+                out_brf += brf
+                out_brh += brh
             covered = 0
             for ln in sorted(cab):
                 hits = lh.get(ln, 0)
@@ -141,20 +216,16 @@ def run(args):
             out_lh += covered
 
     pct = (100.0 * out_lh / out_lf) if out_lf else 0.0
-    print(f"restrict: {in_lf} -> {out_lf} coverable lines kept, "
-          f"{out_lh} covered ({pct:.1f}%) -> {args.out}", file=sys.stderr)
+    summary = (f"restrict: {in_lf} -> {out_lf} coverable lines kept, "
+               f"{out_lh} covered ({pct:.1f}%)")
+    if out_brf:
+        bpct = 100.0 * out_brh / out_brf
+        summary += f", {out_brh}/{out_brf} branches ({bpct:.1f}%)"
+    print(f"{summary} -> {args.out}", file=sys.stderr)
 
     if args.html:
-        cwd = args.source_root or "/"
-        rc = subprocess.run(
-            ["genhtml", os.path.abspath(args.out),
-             "--output-directory", os.path.abspath(args.html),
-             "--quiet", "--ignore-errors", "source"],
-            cwd=cwd).returncode
-        if rc != 0:
-            print(f"warning: genhtml exited {rc}", file=sys.stderr)
-        else:
-            print(f"restrict: HTML -> {args.html}/index.html", file=sys.stderr)
+        run_genhtml(args.out, args.html, args.source_root,
+                    f"restrict: HTML -> {args.html}/index.html")
     return 0
 
 
