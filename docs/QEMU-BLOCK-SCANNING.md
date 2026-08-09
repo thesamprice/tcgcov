@@ -14,7 +14,7 @@
 > line numbers in `tcgcov/` as approximate: that file is under concurrent edit,
 > so symbol names are given alongside and the symbol name is authoritative.
 
-**Source versions used throughout.** QEMU is `/Users/sprice5/src/qemu-upstream`,
+**Source versions used throughout.** QEMU is `<qemu-source>`,
 whose `VERSION` file reads **10.2.4** (`build/config-host.h:494`). That
 checkout has no `.git`, so no commit hash, tag or `git log` evidence is
 available anywhere in this document — see §10. tcgcov is this repository at the
@@ -1423,7 +1423,7 @@ reporting success you have not earned.
 
 | Claim | Status |
 |---|---|
-| QEMU version / provenance | `/Users/sprice5/src/qemu-upstream` has **no `.git`**. `VERSION` reads `10.2.4` and `build/config-host.h:494` agrees, but there is no commit hash, no tag, and no way to confirm the tree matches a released 10.2.4 |
+| QEMU version / provenance | `<qemu-source>` has **no `.git`**. `VERSION` reads `10.2.4` and `build/config-host.h:494` agrees, but there is no commit hash, no tag, and no way to confirm the tree matches a released 10.2.4 |
 | Which QEMU release added the discontinuity API | **Not established.** `git log -S` was impossible (no `.git`). What is verified: it is present and exported in this tree, absent from the version-history block (`qemu-plugin.h:45-75`), and `QEMU_PLUGIN_VERSION` is still 5. The release number is unknown |
 | Decode-time side effects across all targets | Only microblaze, riscv, i386, s390x and (partially) arm were examined. **14 targets unchecked** (§10 q2) |
 | Cost of decode-and-discard | Unmeasured (§10 q3) |
