@@ -8,6 +8,14 @@
 **Source-line and branch coverage for binaries running under QEMU — no guest
 instrumentation, no `--coverage` rebuild, no instruction trace.**
 
+*tcgcov* = **TCG** + **cov**erage. TCG is QEMU's [Tiny Code
+Generator](https://www.qemu.org/docs/master/devel/tcg.html), the just-in-time
+translator that turns guest instructions into host code. It is also the layer
+QEMU's plugin API hooks into, and it is how this tool observes execution: a
+callback per translated block. That is the whole reason nothing has to be
+rebuilt or instrumented — the coverage comes from the emulator's own
+translation step, not from the program.
+
 A small QEMU TCG plugin records which guest code addresses execute and writes
 one compact binary artifact per run. Host-side Python (pure standard library,
 no third-party dependencies) then symbolizes those addresses against DWARF,
