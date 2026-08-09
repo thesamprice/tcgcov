@@ -45,16 +45,21 @@
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
 /*
- * Feature gate. The plugin is built against whichever qemu-plugin.h matches the
- * QEMU it will be loaded into, and that header defines QEMU_PLUGIN_VERSION.
- * Discontinuity callbacks (interrupt/exception notifications) arrived in API
- * version 5; on older APIs the plugin still works, it just cannot invalidate a
- * pending edge source when an asynchronous event steals control between two
- * translation blocks.
+ * Feature gate for discontinuity callbacks (interrupt/exception notification),
+ * which let the plugin invalidate a pending edge source when an asynchronous
+ * event steals control between two translation blocks.
+ *
+ * This CANNOT be gated on QEMU_PLUGIN_VERSION. The API was added part-way
+ * through version 5 without a version bump: QEMU v10.1.0 declares
+ * QEMU_PLUGIN_VERSION 5 and has no qemu_plugin_register_vcpu_discon_cb, while
+ * later version-5 headers do. Gating on the macro therefore breaks the build
+ * against any v10.1.0-era header.
+ *
+ * The Makefile probes the actual header and passes -DTCGCOV_HAVE_DISCON=0/1.
+ * When it is built some other way the default is 0 -- losing a refinement is
+ * acceptable, failing to compile is not.
  */
-#if defined(QEMU_PLUGIN_VERSION) && QEMU_PLUGIN_VERSION >= 5
-#define TCGCOV_HAVE_DISCON 1
-#else
+#ifndef TCGCOV_HAVE_DISCON
 #define TCGCOV_HAVE_DISCON 0
 #endif
 

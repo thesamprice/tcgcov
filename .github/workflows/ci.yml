@@ -82,13 +82,17 @@ jobs:
           curl -fsSL -o .ci/include/qemu/qemu-plugin.h \
             https://raw.githubusercontent.com/qemu/qemu/v10.1.0/include/qemu/qemu-plugin.h
       - name: Compile
+        # Go through the Makefile rather than a bare gcc line: it carries the
+        # header feature probe (discontinuity callbacks were added mid-version-5
+        # with no version bump, so the API macro cannot gate them) and the
+        # include-path handling. A raw compile here would silently diverge from
+        # what users actually build.
+        run: make -C plugin check-header QEMU_INCLUDE="$PWD/.ci/include"
+
+      - name: Link the shared object
         run: |
-          # qemu-plugin.h is included as <qemu-plugin.h>, so both the include
-          # root and the qemu/ subdirectory are needed, as QEMU's own
-          # contrib/plugins build does.
-          gcc -fsyntax-only -std=gnu11 -Wall -Wextra \
-              -I.ci/include -I.ci/include/qemu $(pkg-config --cflags glib-2.0) \
-              plugin/tcgcov.c
+          make -C plugin QEMU_INCLUDE="$PWD/.ci/include"
+          test -f plugin/libtcgcov.so
 
   shellcheck:
     name: shellcheck
