@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.so
+*.o
+*.cov
+*.cov.tmp
+*.jsonl
+*.info
+build/
+dist/
+*.egg-info/
+htmlcov/
+.venv/

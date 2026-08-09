@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tcgcov"
+description = "Host-side tooling for tcgcov QEMU code-coverage artifacts"
+readme = "README.tcgcov.md"
+requires-python = ">=3.8"
+dynamic = ["version"]
+dependencies = []
+
+[project.scripts]
+tcgcov = "tcgcov.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = ["tcgcov"]
+
+[tool.setuptools.dynamic]
+version = {attr = "tcgcov.__version__"}
