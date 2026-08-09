@@ -17,7 +17,7 @@
 #   tcgcov-report.sh --raw-dir DIR --out-dir DIR \
 #       [--source-root SRC] [--toolchain-prefix PREFIX] [--arch ARCH] \
 #       [--all-paths] [--keep MARKER ...] [--exclude GLOB ...] \
-#       [--preset NAME] [--no-branches]
+#       [--preset NAME] [--arch-profile FILE] [--no-branches]
 #
 # Example (cross target):
 #   tcgcov-report.sh --raw-dir coverage/raw --out-dir coverage \
@@ -45,6 +45,7 @@ ALL_PATHS=()
 KEEP_ARGS=()
 EXCLUDE_ARGS=()
 PRESET=""
+ARCH_PROFILE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -57,6 +58,7 @@ while [[ $# -gt 0 ]]; do
     --keep)             KEEP_ARGS+=(--keep "$2"); shift 2 ;;
     --exclude)          EXCLUDE_ARGS+=(--exclude "$2"); shift 2 ;;
     --preset)           PRESET="$2"; shift 2 ;;
+    --arch-profile)     ARCH_PROFILE="$2"; shift 2 ;;
     --no-branches)      BRANCHES=0; shift ;;
     -h|--help)          sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -67,7 +69,7 @@ done
   echo "usage: tcgcov-report.sh --raw-dir DIR --out-dir DIR [--source-root SRC]" >&2
   echo "       [--toolchain-prefix PREFIX] [--arch ARCH] [--all-paths]" >&2
   echo "       [--keep MARKER ...] [--exclude GLOB ...] [--preset NAME]" >&2
-  echo "       [--no-branches]" >&2
+  echo "       [--arch-profile FILE] [--no-branches]" >&2
   exit 2
 }
 
@@ -164,9 +166,11 @@ process_one() {  # process_one <cov>
   if [[ "$BRANCHES" == 1 ]]; then
     br="$OUT_DIR/branches/$base.jsonl"
     set +e
+    local -a PROFILE_OPT=()
+    [[ -n "$ARCH_PROFILE" ]] && PROFILE_OPT=(--arch-profile "$ARCH_PROFILE")
     "${TCGCOV[@]}" branches --cov "$cov" --elf "$elf" --disasm "$dis" \
       "${PREFIX_OPT[@]}" ${PATH_OPTS[@]+"${PATH_OPTS[@]}"} --arch "$ARCH" \
-      --out "$br" 2>"$br.log"
+      ${PROFILE_OPT[@]+"${PROFILE_OPT[@]}"} --out "$br" 2>"$br.log"
     br_rc=$?
     set -e
     # Exit 2 means this architecture has no branch profile -- an expected,

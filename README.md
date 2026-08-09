@@ -431,6 +431,14 @@ can supply a profile from a file without modifying the package; see
 `tcgcov branches --help`. Contributing a profile for your ISA is the single
 most useful patch you can send.
 
+**Bringing tcgcov up on a new processor:**
+[`docs/ARCHITECTURES.md`](docs/ARCHITECTURES.md) is the reference for that
+work — the per-architecture status of the eight shipped profiles and how much
+evidence stands behind each (they are *not* equally confident), the known gaps
+per ISA, a porting checklist in which every item is a bug this project shipped
+and fixed, the `--arch-profile` JSON schema with a worked example, and a
+procedure for telling whether your profile is actually right.
+
 ---
 
 ## Limitations
