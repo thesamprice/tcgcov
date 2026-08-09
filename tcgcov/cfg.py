@@ -369,37 +369,116 @@ _p("riscv",
 # zero). All four are genuine conditional branches with a printed target.
 # 'dls'/'dlstp' (arm-dis.c:4420-4422) are NOT branches -- they only initialize
 # LR -- and are deliberately left as OTHER.
+#
+# CONDITIONALITY IS UNIFORM AND OUTSIDE THE INSTRUCTION. QEMU applies the A32
+# condition field once, before dispatch (arm_skip_unless, target/arm/tcg/
+# translate.c:2247-2250, called from disas_arm_insn :6062-6106; Thumb does the
+# same from the IT state at :6647-6663), and emits the condition-failed path as
+# a SECOND gen_goto_tb at TB end (arm_tr_tb_stop :6821-6828). So every
+# predicated transfer is a genuine two-outcome branch, and the condition suffix
+# must be spelled out on EVERY transfer pattern here, not just on 'b'/'bl'.
+# Two rules follow, and both used to be broken:
+#
+#   * a predicated register transfer ('bxeq r3', 'tbbeq [r0, r1]') must still
+#     TERMINATE its block. When it did not, `indirect` reported True while
+#     `classify` said OTHER -- the profile contradicting itself -- and for
+#     tbb/tbh the inline jump-table bytes that follow were spliced into the
+#     surviving block as if they were instructions.
+#   * a predicated PC-write ('moveq pc, lr', 'popeq {r3, pc}', 'bxeq lr',
+#     'ldreq pc, [sp], #4') is COND, not RET/UNCOND: only COND builds a
+#     BranchPoint, so classifying them RET counted the taken side and silently
+#     dropped QEMU's second exit. This is the same fix 'bl<cc>' already has,
+#     and it matches PowerPC's conditional returns ('beqlr', 'bdnzlr'), which
+#     are COND with no static target and are therefore EXCLUDED from branch
+#     coverage rather than reported half-covered.
+#
+# WRITES TO PC. A transfer on this ISA is often just an ordinary instruction
+# with r15 as its destination, and QEMU funnels all of them through one
+# dispatcher: store_reg_kind (translate.c:2422-2450), selected per data-
+# processing opcode at :2604-2673. STREG_NORMAL -> store_reg_bx/gen_bx ->
+# DISAS_JUMP; STREG_EXC_RET (the 'subs pc, lr' / 'movs pc, lr' exception-return
+# family, ARM ARM B9.3.9) -> gen_exception_return :1694 -> DISAS_EXIT. Modelling
+# only 'mov'/'ldr' left the two most common A32 idioms invisible: 'subs pc, lr,
+# #4' (IRQ return) and 'add pc, pc, rN' (jump-table dispatch). _ARM_PCW is that
+# opcode set; the shift mnemonics are in it because A32 prints the shift FORM of
+# MOV as its own mnemonic ("mov pc, r3, lsl #2" disassembles as "lsl pc, r3,
+# #2", arm-dis.c:4012-4020). Every PC-write pattern is anchored on the
+# DESTINATION operand ("<op> pc,"), which is what keeps 'adds r0, r1, r2',
+# 'movs r0, r1' and 'add r0, pc, #8' out of it.
+#
+# Spellings below were pinned against real disassembly (llvm-objdump of
+# assembled A32/T32, both objdumps agreeing with the format strings): the S bit
+# prints BEFORE the condition ("and%20's%c" arm-dis.c:3910 -> 'ands', 'andseq',
+# 'subseq pc, lr, #4'), while an LDM addressing mode prints before it too
+# ("ldm%23?id%24?ba%c" :4133 -> 'ldmdb', 'ldmiaeq'), and the Thumb .n/.w width
+# prints after it ('popeq.w {r4, pc}').
 _ARM_CC = r"(eq|ne|cs|hs|cc|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le)"
+# Data-processing opcodes that can take pc as their destination register: the
+# opcodes store_reg_kind (translate.c:2422-2450) has a case for, plus the A32
+# shift aliases of MOV (see above), minus the ones that cannot actually be
+# spelled with pc as their destination -- 'orn' is T32-only and T32 ORN cannot
+# encode Rd=PC, so 'orn pc, r0, r1' does not assemble and no disassembler can
+# print it. The trailing s? is the S bit.
+_ARM_PCW = (r"(adc|add|and|asr|bic|eor|lsl|lsr|mov|mvn|orr|ror|rrx|rsb"
+            r"|rsc|sbc|sub)s?")
+# LDM/LDMIA/LDMFD... -- the addressing-mode suffix precedes the condition.
+_ARM_LDM = r"ldm(ia|ib|da|db|fd|fa|ed|ea)?"
 _ARM_KW = dict(
    conditional=r"^(b" + _ARM_CC + r"|bl" + _ARM_CC + r"|blx" + _ARM_CC +
-               r"|cbn?z|letp|le|wlstp|wls)(\.[nw])?\b",
+               r"|cbn?z|letp|le|wlstp|wls)(\.[nw])?\b"
+               # predicated register transfers: block terminators AND branch
+               # points (bxeq, bxjne, bxnseq, blxnsne, tbbeq, tbhne)
+               r"|^(bx|bxj|bxns|blxns|tbb|tbh)" + _ARM_CC + r"(\.[nw])?\b"
+               # predicated writes to pc, in all four spellings
+               r"|^" + _ARM_PCW + _ARM_CC + r"(\.[nw])?\s+pc\s*,"
+               r"|^ldr" + _ARM_CC + r"(\.[nw])?\s+pc\s*,"
+               r"|^pop" + _ARM_CC + r"(\.[nw])?\s*\{[^}]*\bpc\b"
+               r"|^" + _ARM_LDM + _ARM_CC +
+               r"(\.[nw])?\s+\w+!?,\s*\{[^}]*\bpc\b",
    # tbb/tbh (arm-dis.c:4563-4565) are Thumb table branches: unconditional
    # register-indirect jumps. They MUST terminate the block -- the inline jump
    # table sits in the bytes right after them, and objdump happily disassembles
    # those bytes as instructions, so a tbb that does not end its block splices
    # table data into the block map.
    unconditional=r"^(bal|b|bx|bxj|bxns|tbb|tbh)(\.[nw])?\b"
-                 r"|^movs?" + _ARM_CC + r"?(\.[nw])?\s+pc\s*,",
+                 r"|^" + _ARM_PCW + r"(\.[nw])?\s+pc\s*,",
    call=r"^(bl|blx|blxns)(\.[nw])?\b",
    # ARM has no return instruction: returning is 'bx lr', a pop/ldm that writes
-   # pc, or a move to pc. Missing one only merges two blocks, but function
-   # symbols are block leaders as well, which limits the damage.
-   ret=r"^(bx" + _ARM_CC + r"?(\.[nw])?\s+lr\b"
-       r"|pop" + _ARM_CC + r"?(\.[nw])?\s*\{[^}]*\bpc\b"
-       r"|ldm[\w.]*\s+\w+!?,\s*\{[^}]*\bpc\b"
-       r"|movs?" + _ARM_CC + r"?(\.[nw])?\s+pc,\s*lr\b"
-       r"|ldr" + _ARM_CC + r"?(\.[nw])?\s+pc,)",
+   # pc, a move to pc, or the 'subs pc, lr, #N' exception return. Missing one
+   # only merges two blocks, but function symbols are block leaders as well,
+   # which limits the damage. These are the UNPREDICATED spellings only -- the
+   # predicated ones are branch points and are matched by `conditional` above,
+   # which `classify` reaches only if this pattern does not fire first.
+   ret=r"^(bx(\.[nw])?\s+lr\b"
+       r"|pop(\.[nw])?\s*\{[^}]*\bpc\b"
+       r"|" + _ARM_LDM + r"(\.[nw])?\s+\w+!?,\s*\{[^}]*\bpc\b"
+       r"|movs?(\.[nw])?\s+pc,\s*lr\b"
+       r"|subs(\.[nw])?\s+pc,\s*lr\b"
+       r"|ldr(\.[nw])?\s+pc,)",
    # Register-target transfers, whose operands are never an address. 'blx'
    # splits on the first operand character: objdump prints a register for the
    # indirect form ("blx r3") and a digit for the direct one ("blx 8010 <f>").
+   # Everything that writes pc belongs here too: the value comes from a
+   # register or from memory, so there is no static target to parse and the
+   # branch point is EXCLUDED from coverage instead of being invented.
    indirect=r"^(bx|bxj|bxns|tbb|tbh)" + _ARM_CC + r"?(\.[nw])?\b"
-            r"|^blx" + _ARM_CC + r"?(\.[nw])?\s+[a-z]"
-            r"|^(movs?|ldr)[\w.]*\s+pc\s*,",
+            r"|^blx(ns)?" + _ARM_CC + r"?(\.[nw])?\s+[a-z]"
+            r"|^" + _ARM_PCW + _ARM_CC + r"?(\.[nw])?\s+pc\s*,"
+            r"|^ldr" + _ARM_CC + r"?(\.[nw])?\s+pc\s*,"
+            r"|^pop" + _ARM_CC + r"?(\.[nw])?\s*\{[^}]*\bpc\b"
+            r"|^" + _ARM_LDM + _ARM_CC +
+            r"?(\.[nw])?\s+\w+!?,\s*\{[^}]*\bpc\b",
    notes="'ble/blt/bls' are conditional branches; 'bleq/blne/...' are "
          "CONDITIONAL CALLS and are classified COND so they are branch points "
-         "as well as block terminators (same as PowerPC 'bltl'). v8.1-M "
-         "'le/letp/wls/wlstp' are conditional branches; 'bf/bfl/bfx/bfcsel' "
-         "(arm-dis.c:4425-4433) are not modeled.")
+         "as well as block terminators (same as PowerPC 'bltl'). Every "
+         "predicated transfer is COND for the same reason, including the "
+         "register forms ('bxeq r3', 'tbbeq [r0, r1]') and the writes to pc "
+         "('moveq pc, lr', 'popeq {r3, pc}', 'ldreq pc, [sp], #4'); the "
+         "unpredicated writes to pc are UNCOND, or RET for 'movs pc, lr' and "
+         "'subs pc, lr, #N' (the exception-return forms, QEMU STREG_EXC_RET). "
+         "v8.1-M 'le/letp/wls/wlstp' are conditional branches; "
+         "'bf/bfl/bfx/bfcsel' (arm-dis.c:4425-4433) and 'bxaut' "
+         "(arm-dis.c:4397) are not modeled -- QEMU implements neither.")
 
 # A32 is a fixed 4-byte encoding. The alias list is deliberately all A32-or-
 # either names: 'armv7' is an architecture VERSION (which supports both

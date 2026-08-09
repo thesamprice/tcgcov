@@ -13,7 +13,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tcgcov import cfg  # noqa: E402
+from tcgcov import branches, cfg  # noqa: E402
 
 
 def objdump(lines, fmt="elf32-microblazeel", section=".text"):
@@ -654,6 +654,106 @@ class TestThumbInstructionSize(unittest.TestCase):
         self.assertFalse(bp.indirect)
         arm_bp = cfg.analyze(text, cfg.get_profile("arm")).branch_points[0]
         self.assertEqual(arm_bp.fallthrough, 0x800a)
+
+
+class TestArmPredicatedTransfersInTheCfg(unittest.TestCase):
+    """The three ARM defects, at the level where they actually cost something.
+
+    A32/T32 applies the condition outside the instruction (QEMU
+    target/arm/tcg/translate.c:2247-2250 and :6062-6106, second exit at
+    :6821-6828), so a predicated transfer both ENDS a block and has two
+    outcomes. Missing the first corrupts the block map; missing the second
+    silently shrinks the branch denominator.
+    """
+
+    def test_predicated_tbb_ends_the_block_before_its_jump_table(self):
+        """The worst case of the missing condition suffix.
+
+        A tbb/tbh is immediately followed by its jump table, and a disassembler
+        with no mapping symbols renders those bytes as instructions -- here the
+        table bytes 04 06 08 0a really do disassemble as 'lsls r4, r0, #24' /
+        'lsrs r0, r1, #8' (checked with llvm-mc --disassemble --triple=thumbv7).
+        While 'tbbeq' classified OTHER the table was spliced into the branch's
+        own block, so the block map claimed the table bytes execute whenever the
+        tbb does.
+        """
+        text = objdump([
+            "00008000 <f>:",
+            (0x8000, "2801", "cmp\tr0, #1"),
+            (0x8002, "bf08", "it\teq"),
+            (0x8004, "e8df f001", "tbbeq\t[pc, r1]"),
+            (0x8008, "0604", "lsls\tr4, r0, #24"),   # jump table byte 0/1
+            (0x800a, "0a08", "lsrs\tr0, r1, #8"),    # jump table byte 2/3
+            (0x800c, "2001", "movs\tr0, #1"),
+            (0x800e, "4770", "bx\tlr"),
+        ], fmt="elf32-littlearm")
+        graph = cfg.analyze(text, cfg.get_profile("thumb"))
+        self.assertEqual([(b.start, b.end) for b in graph.blocks],
+                         [(0x8000, 0x8004), (0x8008, 0x800e)])
+        # It is a branch point, but its target comes from the table: no static
+        # outcome, so it is EXCLUDED rather than counted half-covered.
+        bp, = graph.branch_points
+        self.assertEqual((bp.addr, bp.mnemonic), (0x8004, "tbbeq"))
+        self.assertIsNone(bp.taken)
+        self.assertTrue(bp.indirect)
+
+    def test_alu_writes_to_pc_terminate_their_blocks(self):
+        """'add pc, pc, rN' (jump table) and 'subs pc, lr, #4' (IRQ return).
+
+        QEMU routes both through store_reg_kind (translate.c:2422-2450);
+        neither used to end a block, so this whole handler was one straight run
+        and the four table entries appeared to execute in sequence.
+        """
+        text = objdump([
+            "00008000 <handler>:",
+            (0x8000, "e3500003", "cmp\tr0, #3"),
+            (0x8004, "e08ff100", "add\tpc, pc, r0, lsl #2"),
+            (0x8008, "ea000002", "b\t8018 <handler+0x18>"),
+            (0x800c, "ea000001", "b\t8018 <handler+0x18>"),
+            (0x8010, "e3a00001", "mov\tr0, #1"),
+            (0x8014, "e25ef004", "subs\tpc, lr, #4"),
+            (0x8018, "e3a00002", "mov\tr0, #2"),
+        ], fmt="elf32-littlearm")
+        graph = cfg.analyze(text, cfg.get_profile("arm"))
+        self.assertEqual([(b.start, b.end) for b in graph.blocks],
+                         [(0x8000, 0x8004), (0x8008, 0x8008),
+                          (0x800c, 0x800c), (0x8010, 0x8014),
+                          (0x8018, 0x8018)])
+        # 'add pc, pc, rN' is a transfer with no static target: UNCOND, and the
+        # "0x2" of "lsl #2" must never be read as an address.
+        jump = [i for i in graph.insns if i.addr == 0x8004][0]
+        self.assertEqual(jump.kind, cfg.UNCOND)
+        self.assertIsNone(jump.target)
+        self.assertEqual(graph.branch_points, [])
+
+    def test_predicated_return_is_a_branch_point_and_is_excluded_cleanly(self):
+        """'popeq {r3, pc}' classified RET: block ended, branch never counted.
+
+        As COND it becomes a real branch point with a fall-through and no
+        knowable taken target, which build_records drops outright -- the same
+        treatment PowerPC's conditional returns ('beqlr', 'bdnzlr') get. The
+        point of the assertion on build_records is that the fix does NOT
+        introduce a permanently half-covered branch into the denominator.
+        """
+        text = objdump([
+            "00008000 <f>:",
+            (0x8000, "e3500000", "cmp\tr0, #0"),
+            (0x8004, "08bd8008", "popeq\t{r3, pc}"),
+            (0x8008, "e3a00001", "mov\tr0, #1"),
+            (0x800c, "e8bd8008", "pop\t{r3, pc}"),
+        ], fmt="elf32-littlearm")
+        graph = cfg.analyze(text, cfg.get_profile("arm"))
+        self.assertEqual([(b.start, b.end) for b in graph.blocks],
+                         [(0x8000, 0x8004), (0x8008, 0x800c)])
+        bp, = graph.branch_points
+        self.assertEqual((bp.addr, bp.mnemonic), (0x8004, "popeq"))
+        self.assertIsNone(bp.taken)          # loaded from the stack
+        self.assertEqual(bp.fallthrough, 0x8008)
+        self.assertTrue(bp.indirect)
+        self.assertEqual(graph.indirect_branches, graph.branch_points)
+        locations = {0x8004: ("f.c", 10, "f"), 0x8008: ("f.c", 11, "f")}
+        self.assertEqual(
+            branches.build_records(graph.branch_points, {}, locations, {}), [])
 
 
 class TestEdgeMatching(unittest.TestCase):

@@ -14,9 +14,12 @@ Trees checked, and the versions the line numbers belong to:
 
 | Tree | Version | Path |
 |---|---|---|
-| QEMU | 10.2.4 | `/Users/sprice5/src/qemu-upstream` |
-| binutils-gdb | 2.46.50 | `/Users/sprice5/src/claude-mb/binutils-gdb` |
+| QEMU | 10.2.4 | `<qemu-source>` |
+| binutils-gdb | 2.46.50 | `<binutils-source>` |
 | tcgcov | `872d44e` | this repo |
+
+**Status.** The three ARM findings (F1, F2, F4) are **FIXED**; see the marked
+sections below. The rest stand as recorded.
 
 ---
 
@@ -149,7 +152,7 @@ An independent sweep of every `riscv-opc.c` row carrying `INSN_BRANCH` or
 `INSN_JSR` (excluding `INSN_MACRO`) found **0 of 27** classified OTHER — the
 non-Zc core is complete.
 
-### 2.3 ARM A32/T32 — two real gaps, both CFG-corrupting
+### 2.3 ARM A32/T32 — two real gaps, both CFG-corrupting (both now FIXED)
 
 The mechanism that matters: **A32/T32 conditionality is applied uniformly,
 outside the instruction's own translator.** `disas_arm_insn`
@@ -173,14 +176,14 @@ is mapped to the empty string via `COND_UNCOND` (`arm-dis.c:7949-7951`).
 | `bl` / `bl<cc>` | `trans_BL` `translate.c:5349-5353`, no cond logic; cond from `:6104-6106` + `:6821` | CALL / **COND** | agree — the deliberate design at `cfg.py:315-326` is correct |
 | `blx` imm/reg | `trans_BLX_i` `:5355`, `trans_BLX_r` `:3468-3479` → `gen_bx` | CALL (+ind for the register form) | agree |
 | `bx r3` / `bxj r3` | `trans_BX` `:3441` → `gen_bx_excret`, `DISAS_JUMP`; `trans_BXJ` `:3450-3467` | UNCOND+ind | agree |
-| **`bx<cc> r3` / `bxj<cc> r3`** | same trans function; conditionality from `:6104-6106`, second exit at `:6821` | **OTHER** (+ind) | **DIFFER — F1** |
+| **`bx<cc> r3` / `bxj<cc> r3`** | same trans function; conditionality from `:6104-6106`, second exit at `:6821` | ~~OTHER (+ind)~~ → **COND+ind** | **F1 — FIXED** |
 | `tbb` / `tbh` | `op_tbranch` `translate.c:5708-5734` → `store_reg(s,15,…)`, `DISAS_JUMP` | UNCOND+ind | agree |
-| **`tbb<cc>` / `tbh<cc>`** | same | **OTHER** (+ind) | **DIFFER — F1, worst case** |
+| **`tbb<cc>` / `tbh<cc>`** | same | ~~OTHER (+ind)~~ → **COND+ind** | **F1 — FIXED** |
 | `bxns` / `blxns` | `trans_BXNS` `:3495-3502`, `trans_BLXNS` `:3503-3510` → `DISAS_EXIT` | UNCOND+ind / CALL | agree |
 | `cbz` / `cbnz` | `trans_CBZ` `:5738-5745` | COND | agree |
 | `mov pc,` / `ldr pc,` / `ldm…{pc}` / `pop {pc}` | `store_reg_from_load` `:878-884` → `gen_bx_excret`; `do_ldm` `:5161-5224` | UNCOND / RET | agree |
-| **`mov<cc> pc,` / `ldr<cc> pc,` / `pop<cc> {pc}` / `bx<cc> lr`** | two-way (`:6821-6828`) | UNCOND / RET — **never COND** | **DIFFER — F4** |
-| **`sub`/`subs`/`add`/`and`/`orr`/`bic`/`eor`/`rsb`/`rsc`/`adc`/`sbc`/`orn`/`mvn` writing `pc`** | `store_reg_kind` `translate.c:2422-2450` (per-opcode selection `:2604-2673`): `STREG_NORMAL` → `store_reg_bx`/`gen_bx` → `DISAS_JUMP`; `STREG_EXC_RET` → `gen_exception_return` `:1694` → `DISAS_EXIT` | **OTHER** | **DIFFER — F2** |
+| **`mov<cc> pc,` / `ldr<cc> pc,` / `pop<cc> {pc}` / `ldm<cc> {pc}` / `bx<cc> lr`** | two-way (`:6821-6828`) | ~~UNCOND / RET~~ → **COND+ind** (no static target → EXCLUDED) | **F4 — FIXED** |
+| **`sub`/`subs`/`add`/`and`/`orr`/`bic`/`eor`/`rsb`/`rsc`/`adc`/`sbc`/`orn`/`mvn` writing `pc`** | `store_reg_kind` `translate.c:2422-2450` (per-opcode selection `:2604-2673`): `STREG_NORMAL` → `store_reg_bx`/`gen_bx` → `DISAS_JUMP`; `STREG_EXC_RET` → `gen_exception_return` `:1694` → `DISAS_EXIT` | ~~OTHER~~ → **UNCOND+ind**, or **RET** for the `STREG_EXC_RET` spellings `subs pc, lr, #N` / `movs pc, lr`, or **COND+ind** when predicated | **F2 — FIXED** |
 | `wls` / `wlstp` / `le` / `letp` | `trans_WLS` `:5466-5537`, `trans_LE` `:5538-5652` — both genuinely two-way | COND | agree |
 | `dls` / `dlstp` / `lctp` | `trans_DLS` `:5428-5465` — not a branch | OTHER | agree, deliberately |
 | `bf` / `bfx` / `bfl` / `bflx` / `bfcsel` | `trans_BF` `translate.c:5408-5426` — **implemented as a NOP**, "we take that IMPDEF option" | OTHER | agree; QEMU confirms the profile note |
@@ -325,7 +328,30 @@ with no gaps and no shadowing, and correctly leaves bare `cb`/`cba` in
 
 ## 3. Findings that matter, ranked
 
-### 3.1 F1 — ARM conditional `bx`/`bxj`/`tbb`/`tbh` are invisible (CFG-corrupting)
+### 3.1 F1 — ARM conditional `bx`/`bxj`/`tbb`/`tbh` are invisible (CFG-corrupting) — FIXED
+
+> **FIXED.** The predicated register transfers now classify **COND**, which
+> gives them both properties they need (terminator *and* branch point), exactly
+> as A1 recommended. `bxns<cc>` and `blxns<cc>` were folded in at the same time
+> — real spellings, verified below. Executed after the fix:
+>
+> ```
+> bx r3      -> uncond (ind)     bxeq r3     -> cond (ind)
+> bxj r3     -> uncond (ind)     bxjne r3    -> cond (ind)
+> bxns r3    -> uncond (ind)     bxnseq r3   -> cond (ind)
+> tbb  [r0, r1] -> uncond (ind)  tbbeq [r0, r1]         -> cond (ind)
+> tbh  [r0, r1, lsl #1] -> uncond (ind)
+>                                tbhne [r0, r1, lsl #1] -> cond (ind)
+> blxns r3   -> call   (ind)     blxnsne r3  -> cond (ind)
+> ```
+>
+> The diagnostic A1 asked for is now a test: no row of the ARM table may be
+> `is_indirect` while classifying OTHER
+> (`tests/test_arch_profiles.py`, `TestArmPredicatedTransfers`). It is scoped to
+> ARM/Thumb because the RISC-V Zcmt rows (F3) are a known live instance of the
+> same shape. A CFG-level test pins the jump-table hazard directly: a `tbbeq`
+> followed by table bytes that disassemble as instructions must end its block
+> (`tests/test_cfg.py`, `TestArmPredicatedTransfersInTheCfg`).
 
 **`cfg.py:343`'s `unconditional` pattern has no condition-suffix group**, while
 the sibling `ret` (`:349-353`) and `indirect` (`:357-359`) patterns both do. The
@@ -360,7 +386,48 @@ Conditional `bx`/`tbb` are not exotic: A32 `bxeq lr`-style tails are ordinary
 compiler output, and any Thumb `bx`/`tbb` inside an IT block prints with a
 suffix.
 
-### 3.2 F2 — ARM ALU-writes-PC is entirely unmodelled (CFG-corrupting)
+### 3.2 F2 — ARM ALU-writes-PC is entirely unmodelled (CFG-corrupting) — FIXED
+
+> **FIXED**, and **U4 is resolved**: the operand text was pinned against real
+> disassembly instead of being guessed. The rows below were assembled with
+> `clang --target=armv7-linux-gnueabi -c` (`armv8m.main` for the `*ns` forms)
+> and read back with `llvm-objdump -d`; the binutils format strings agree
+> (`arm-dis.c:3910` etc. put the S bit **before** the condition,
+> `:4133` puts the LDM addressing mode before it, `:8201-8204` glues `%c` on
+> with no separator). Actual output, verbatim:
+>
+> ```
+>    0: e25ef004   subs   pc, lr, #4        14: e08ff003   add   pc, pc, r3
+>    4: e25ef008   subs   pc, lr, #8        18: 008ff003   addeq pc, pc, r3
+>    8: 025ef004   subseq pc, lr, #4        1c: e08ff103   add   pc, pc, r3, lsl #2
+>    c: e1b0f00e   movs   pc, lr            24: e180f001   orr   pc, r0, r1
+>   10: 01b0f00e   movseq pc, lr            28: 1180f001   orrne pc, r0, r1
+>   38: e1a0f103   lsl    pc, r3, #2   <- "mov pc, r3, lsl #2" prints as this
+> ```
+>
+> Two things that would have been wrong if guessed: the S bit precedes the
+> condition (`subseq`, not `subeqs`), and the **shift form of A32 `MOV` prints
+> as its own mnemonic** — `mov pc, r3, lsl #2` disassembles as `lsl pc, r3, #2`
+> (`arm-dis.c:4012-4020`), so `lsl`/`lsr`/`asr`/`ror`/`rrx` are in the opcode
+> set too.
+>
+> Classification after the fix: `STREG_EXC_RET` spellings (`subs pc, lr, #N`,
+> `movs pc, lr`) → RET; every other write to `pc` → UNCOND, or COND when
+> predicated; all of them `indirect`, since none has a static target. Every
+> pattern is anchored on the **destination** operand, and the table carries
+> guards for the near misses — `adds r0, r1, r2`, `movs r0, r1`, `ldr r0, [sp]`,
+> `pop {r3, r4}`, `add r0, pc, #8`, `orrs r0, r1, r2`, `lsls r0, r1, #2`,
+> `stmfd sp!, {r4, lr}` and `andeq r0, r0, r0` (the disassembly of a zero word,
+> so it appears in every padded A32 image) all stay OTHER.
+>
+> One opcode named in the §2.3 row was **not** produced and is therefore **not**
+> in the pattern: `orn` is T32-only and T32 ORN cannot encode Rd=PC —
+> `orn pc, r0, r1` is rejected by the assembler ("operand must be a register in
+> range [r0, r12] or r14"), so no disassembler can print it. Leaving it out is
+> deliberate; a pattern for a form that cannot exist is untestable and can only
+> ever fire on garbage. The other four shift aliases were produced and are in:
+> `lsr pc, r3, #2`, `asr pc, r3, #2`, `ror pc, r3, #2`, `rrx pc, r3` (plus
+> `lsrs pc, r3, #2` and `asreq pc, r3, #2`).
 
 Only `mov`/`movs` and `ldr` are recognised as PC writers (`cfg.py:344`, `:353`,
 `:359`). Executed:
@@ -405,7 +472,35 @@ Impact scales with how much RV32 embedded code enables Zcmp/Zcmt — where it is
 enabled, `cm.popret` replaces the epilogue of nearly every function, so nearly
 every function-end block boundary disappears.
 
-### 3.4 F4 — ARM conditional returns/jumps vanish from the branch denominator
+### 3.4 F4 — ARM conditional returns/jumps vanish from the branch denominator — FIXED
+
+> **FIXED.** All of these now classify **COND**, so each produces a
+> `BranchPoint`. Executed after the fix, with the real spellings (all assembled
+> and disassembled, including the Thumb wide form `popeq.w {r4, pc}` and the
+> LDM addressing-mode-then-condition order `ldmiaeq`):
+>
+> ```
+> moveq pc, r3          -> cond (ind)      bxeq lr               -> cond (ind)
+> moveq pc, lr          -> cond (ind)      ldreq pc, [sp], #4    -> cond (ind)
+> popeq {r3, pc}        -> cond (ind)      ldrne pc, [r4, r5]    -> cond (ind)
+> popeq.w {r4, pc}      -> cond (ind)      ldmiaeq sp!, {r4, pc} -> cond (ind)
+> movseq pc, lr         -> cond (ind)      ldmeq   sp!, {r4, pc} -> cond (ind)
+> ```
+>
+> The unpredicated spellings keep their old buckets (`bx lr`, `mov pc, lr`,
+> `pop {r4, pc}`, `ldmia sp!, {r4, pc}`, `ldr pc, [sp], #4` are still RET), and
+> a test pins that so the `ret` pattern cannot be narrowed into uselessness.
+>
+> **A targetless COND is excluded cleanly — verified, not assumed.** The taken
+> target of every one of these comes from a register or from memory, so
+> `_parse_target` returns None, `BranchPoint.indirect` is True
+> (`cfg.py:1441-1448`), and `build_records` skips the branch outright
+> (`branches.py:116-117`); the `direct` list used for the summary filters the
+> same way (`branches.py:225`). It is counted only in the "N indirect/unknown
+> target -> EXCLUDED" figure (`branches.py:254-266`). So no new
+> permanently-half-covered branch enters the denominator — this is the same
+> handling PowerPC's `beqlr`/`bdnzlr` already get. A CFG-level test asserts
+> `build_records(...) == []` for a `popeq {r3, pc}`.
 
 Executed:
 
@@ -646,7 +741,7 @@ Ordered by impact. **A QEMU-derived claim is not yet a regex** — QEMU proves
 *that* the instruction transfers, binutils proves *what string* tcgcov will see.
 Each item records whether the spelling was confirmed.
 
-**A1 — ARM: give `unconditional` a condition-suffix group.** Highest impact:
+**A1 — DONE.** **ARM: give `unconditional` a condition-suffix group.** Highest impact:
 `bx<cc>`/`bxj<cc>`/`tbb<cc>`/`tbh<cc>` currently do not terminate a block, and
 `tbb<cc>` additionally splices jump-table bytes into the block map.
 Justification: `target/arm/tcg/translate.c:3441`, `:3450-3467`, `:5708-5734`
@@ -657,16 +752,25 @@ Prefer classifying the conditional spellings **COND** rather than UNCOND — tha
 gives both properties, exactly as `bl<cc>` already does (`cfg.py:315-326`).
 Diagnostic to add to the test suite: `is_indirect(t)` must never be true while
 `classify(t) == OTHER`.
+**Done as recommended**: COND, with the diagnostic added as an ARM-scoped test
+(see §3.1). `bxns<cc>` and `blxns<cc>` were included — both spellings were
+assembled and disassembled.
 
-**A2 — ARM: model ALU writes to PC.** Justification:
+**A2 — DONE.** **ARM: model ALU writes to PC.** Justification:
 `target/arm/tcg/translate.c:2422-2450` (`store_reg_kind` dispatcher) with
 per-opcode selection at `:2604-2673`; `STREG_EXC_RET` → `gen_exception_return`
 `:1694`. Spelling **CONFIRMED** from the A32 data-processing rows
 (`arm-dis.c:3914`, `:3921`, `:3924-3928`). Suggested shape:
 `^(add|adc|and|bic|eor|mvn|orn|orr|rsb|rsc|sbc|sub)s?<CC>?(\.[nw])?\s+pc\s*,` —
 route `subs pc, lr, #N` / `movs pc, lr` to RET (exception return) and the rest to
-UNCOND + `indirect`. **Not confirmed:** the exact operand spacing in real output;
-generate a sample disassembly before finalising the pattern.
+UNCOND + `indirect`. ~~**Not confirmed:** the exact operand spacing in real
+output; generate a sample disassembly before finalising the pattern.~~
+**The disassembly was generated** (see §3.2), which changed the pattern in three
+ways the suggested shape got wrong: the S bit prints **before** the condition;
+the A32 shift form of `MOV` prints as `lsl`/`lsr`/`asr`/`ror`/`rrx` with `pc` as
+its destination and so belongs in the opcode set; and `orn` does **not** belong
+in it, because T32 ORN cannot encode Rd=PC and the form cannot be assembled at
+all. Predicated writes are COND rather than UNCOND, per A4.
 
 **A3 — RISC-V: add the Zcmt/Zcmp transfers.** `cm.jt` → UNCOND + indirect,
 `cm.jalt` → CALL + indirect, `cm.popret`/`cm.popretz` → RET. Justification:
@@ -676,11 +780,15 @@ generate a sample disassembly before finalising the pattern.
 (really disassembled, not macro or alias). Guard the pattern so `cm.push` and
 `cm.pop` are excluded — they are not transfers.
 
-**A4 — ARM: promote conditional return/jump idioms to COND.** `mov<cc> pc,`,
-`ldr<cc> pc,`, `ldm<cc>`/`pop<cc> {…pc}`, `bx<cc> lr`. Justification:
-`target/arm/tcg/translate.c:6821-6828`. Spelling **CONFIRMED** (same `%c`
-mechanics as A1). Denominator-only fix; no CFG risk. Same precedent as
-`bl<cc>`.
+**A4 — DONE.** **ARM: promote conditional return/jump idioms to COND.**
+`mov<cc> pc,`, `ldr<cc> pc,`, `ldm<cc>`/`pop<cc> {…pc}`, `bx<cc> lr`.
+Justification: `target/arm/tcg/translate.c:6821-6828`. Spelling **CONFIRMED**
+(same `%c` mechanics as A1). Denominator-only fix; no CFG risk. Same precedent
+as `bl<cc>`. One mechanical consequence worth recording: the `ret` pattern had
+to be narrowed to the **unpredicated** spellings, and its `ldm[\w.]*` wildcard
+replaced by the explicit addressing-mode list `ldm(ia|ib|da|db|fd|fa|ed|ea)?`,
+because that wildcard was what swallowed `ldmiaeq` into RET. Every resulting
+branch point is targetless and therefore EXCLUDED, not half-covered (see §3.4).
 
 **A5 — MIPS: add `bc1any2f|bc1any2t|bc1any4f|bc1any4t` to `conditional`.**
 Justification: `target/mips/tcg/translate.c:8695-8794`. Spelling **CONFIRMED**:
@@ -733,5 +841,13 @@ Cheap insurance would be to accept both spellings.
 were not checked against `micromips-opc.c`. `cfg.py:525-527` already declares
 them unmodelled; that remains accurate and unquantified.
 
-**U4 — exact ARM ALU-writes-PC operand text.** See A2. No sample disassembly was
-generated, so the proposed regex is unvalidated against real output.
+**U4 — RESOLVED. Exact ARM ALU-writes-PC operand text.** See A2. Sample
+disassembly was generated (`clang --target=armv7-linux-gnueabi -c` +
+`llvm-objdump -d`, `armv8m.main` for the `*ns` forms) and every predicated
+spelling now in the profile is a string a disassembler actually printed; the
+listing is in §3.2. Caveat on the caveat: the generated output is
+**llvm-objdump's**. No GNU objdump configured for ARM was available in this
+tree, so the GNU side rests on the `arm-dis.c` format strings (`:3910`,
+`:4012-4020`, `:4133`, `:8201-8204`), which agree with it on every point that
+matters — S bit before the condition, addressing mode before the condition,
+width suffix after it, no separator anywhere.

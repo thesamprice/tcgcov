@@ -42,6 +42,17 @@ GOLDEN = {
                         "xorl %eax, %eax", "retq", cfg.RET),
     "llvm-aarch64.txt": ("aarch64", 4, 0,
                          "mov w8, #0x1                // =1", "ret", cfg.RET),
+    # The fixture above contains ZERO conditional branches -- the compiler
+    # folded them into csel -- so it proves the parser handles llvm-objdump
+    # layout but proves nothing about branch classification. This one is built
+    # at -O0 specifically to emit real branches, and pins the spelling:
+    # llvm-objdump prints the DOTTED form b.<cc>, never the no-dot assembler
+    # alias. GNU objdump cannot print the no-dot form either -- beq/bne/blt/bgt
+    # are F_ALIAS|F_PSEUDO in aarch64-tbl.h:5251-5265, and F_PSEUDO is defined
+    # (include/opcode/aarch64.h:1470-1473) as assembly-only, "thus will not
+    # show up in the disassembly". So matching only b.<cc> is correct.
+    "llvm-aarch64-branches.txt": ("aarch64", 53, 5,
+                                  "sub sp, sp, #0x10", "ret", cfg.RET),
     "llvm-riscv64.txt": ("riscv", 3, 0,
                          "slti a0, a0, 0x6", "ret", cfg.RET),
     "llvm-armv7.txt": ("arm", 5, 0,
@@ -111,6 +122,27 @@ class TestGoldenDisassembly(unittest.TestCase):
         self.assertEqual(sorted(graph.symbols.values()),
                          ["_start", "main", "never_called", "taken_both",
                           "taken_one"])
+
+    def test_aarch64_conditional_branches_use_the_dotted_spelling(self):
+        """Every AArch64 conditional branch prints as b.<cc>, never as the
+        no-dot assembler alias.
+
+        This is the whole reason the profile matches only the dotted form. If a
+        disassembler ever emitted `beq` instead of `b.eq`, every AArch64
+        conditional branch would classify OTHER and vanish from the branch
+        denominator -- silently, with the report still exiting 0.
+        """
+        text = read_golden("llvm-aarch64-branches.txt")
+        profile = cfg.get_profile("aarch64")
+        conds = {i.text.split()[0]
+                 for i in cfg.parse_objdump(text, profile) if i.kind == cfg.COND}
+        self.assertTrue(conds, "fixture has no conditional branches to check")
+        for mnemonic in conds:
+            if mnemonic.startswith("b") and not mnemonic.startswith(("cb", "tb")):
+                self.assertTrue(
+                    mnemonic.startswith("b."),
+                    f"{mnemonic!r} is a no-dot alias; if a real disassembler "
+                    f"emits this, the aarch64 profile needs to accept it")
 
     def test_x86_sizes_come_from_address_deltas(self):
         """llvm-objdump x86 lines: variable-length insns at 0,2,5,8,a."""

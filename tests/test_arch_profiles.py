@@ -129,6 +129,15 @@ INDIRECT_MICROBLAZE = [
 # --- ARM A32/T32 ------------------------------------------------------------
 # Condition suffixes from arm-dis.c:4919; the v8.1-M low-overhead-loop and
 # Thumb table-branch entries are cited inline.
+#
+# Every predicated spelling below was pinned against REAL disassembly rather
+# than guessed: the rows were assembled with `clang --target=armv7-linux-gnueabi
+# -c` (armv8m.main for the *ns forms) and read back with `llvm-objdump -d`, so
+# the operand text, the S-bit/condition order ('subseq', not 'subeqs') and the
+# .n/.w placement ('popeq.w') are the strings a disassembler actually emits.
+# The binutils format strings agree: "and%20's%c" (arm-dis.c:3910) puts S before
+# the condition, "ldm%23?id%24?ba%c" (:4133) puts the addressing mode before it,
+# and "%c" glues the suffix on with no separator (:8201-8204).
 ARM = [
     ("b 8010 <x>", UNCOND, False),
     ("bal 8010 <x>", UNCOND, False),
@@ -162,6 +171,7 @@ ARM = [
     ("bllt 8010 <x>", COND, False),
     ("blgt 8010 <x>", COND, False),
     ("blxeq r3", COND, False),
+    ("blxnsne r3", COND, False),
     # v8.1-M low-overhead loops (arm-dis.c:4410-4422)
     ("le lr, 8000 <l>", COND, False),
     ("le 8000 <l>", COND, False),
@@ -172,29 +182,129 @@ ARM = [
     ("lctp", OTHER, False),
     # Thumb table branches (arm-dis.c:4563-4565): indirect, but they MUST end
     # the block -- the jump table bytes follow inline and objdump disassembles
-    # them as if they were instructions.
+    # them as if they were instructions. The PREDICATED spelling (inside an IT
+    # block) has exactly the same hazard and used to classify OTHER, i.e. not a
+    # terminator at all, while is_indirect said True: the profile contradicting
+    # itself, and the table bytes spliced into the surviving block.
     ("tbb [r0, r1]", UNCOND, False),
     ("tbh [r0, r1, lsl #1]", UNCOND, False),
-    # returns / indirect transfers through pc
-    ("bx lr", RET, False),
+    ("tbbeq [r0, r1]", COND, False),
+    ("tbhne [r0, r1, lsl #1]", COND, False),
+    # register-indirect branches, predicated and not. QEMU applies the
+    # condition outside the instruction (translate.c:6104-6106) and emits the
+    # condition-failed path as a second exit (:6821-6828), so the predicated
+    # forms are two-way branch points, not plain jumps.
     ("bx r3", UNCOND, False),
+    ("bxeq r3", COND, False),
+    ("bxj r3", UNCOND, False),
+    ("bxjne r3", COND, False),
+    ("bxns r3", UNCOND, False),
+    ("bxnseq r3", COND, False),
+    # returns / transfers through pc
+    ("bx lr", RET, False),
+    ("bxeq lr", COND, False),
     ("mov pc, lr", RET, False),
+    ("moveq pc, lr", COND, False),
     ("mov pc, r3", UNCOND, False),
+    ("moveq pc, r3", COND, False),
     ("pop {r4, pc}", RET, False),
+    ("popeq {r3, pc}", COND, False),
+    ("popeq.w {r4, pc}", COND, False),
+    ("ldmia sp!, {r4, pc}", RET, False),
+    ("ldmdb r4, {r5, pc}", RET, False),
+    ("ldmfd sp!, {r4, pc}", RET, False),
+    ("ldmiaeq sp!, {r4, pc}", COND, False),
+    ("ldmeq sp!, {r4, pc}", COND, False),
     ("ldr pc, [sp], #4", RET, False),
-    # not branches
+    ("ldreq pc, [sp], #4", COND, False),
+    ("ldrne pc, [r4, r5]", COND, False),
+    # A32 data-processing writes to pc (QEMU store_reg_kind,
+    # translate.c:2422-2450). 'subs pc, lr, #N' and 'movs pc, lr' are the
+    # exception-return forms (STREG_EXC_RET) and read as returns; every other
+    # write to pc is an ordinary indirect jump, and the classic A32 jump-table
+    # dispatch is 'add pc, pc, rN'.
+    ("subs pc, lr, #4", RET, False),
+    ("subs pc, lr, #8", RET, False),
+    ("subseq pc, lr, #4", COND, False),
+    ("movs pc, lr", RET, False),
+    ("movseq pc, lr", COND, False),
+    ("movs pc, r3", UNCOND, False),
+    ("add pc, pc, r3", UNCOND, False),
+    ("add pc, pc, r3, lsl #2", UNCOND, False),
+    ("addeq pc, pc, r3", COND, False),
+    ("add pc, r3", UNCOND, False),          # Thumb 2-operand form
+    ("addeq pc, r3", COND, False),
+    ("sub pc, r0, #4", UNCOND, False),
+    ("and pc, r0, r1", UNCOND, False),
+    ("orr pc, r0, r1", UNCOND, False),
+    ("orrne pc, r0, r1", COND, False),
+    ("eor pc, r0, r1", UNCOND, False),
+    ("bic pc, r0, r1", UNCOND, False),
+    ("mvn pc, r0", UNCOND, False),
+    ("rsb pc, r0, r1", UNCOND, False),
+    ("rsbs pc, r0, r1", UNCOND, False),
+    ("adc pc, r0, r1", UNCOND, False),
+    ("sbc pc, r0, r1", UNCOND, False),
+    ("rsc pc, r0, r1", UNCOND, False),
+    # A32 prints the shift FORM of MOV as its own mnemonic: "mov pc, r3, lsl #2"
+    # disassembles as this (arm-dis.c:4012-4020), verified with llvm-objdump --
+    # as were 'lsr pc', 'asr pc', 'ror pc' and 'rrx pc, r3'.
+    ("lsl pc, r3, #2", UNCOND, False),
+    ("lsr pc, r3, #2", UNCOND, False),
+    ("lsrs pc, r3, #2", UNCOND, False),
+    ("rrx pc, r3", UNCOND, False),
+    ("asreq pc, r3, #2", COND, False),
+    # not branches. Everything here is one token away from a pattern above: the
+    # PC-write patterns key off the DESTINATION operand, so an ALU op with an
+    # ordinary destination -- including 'andeq r0, r0, r0', which is how a zero
+    # word disassembles and therefore appears in every padded A32 image -- must
+    # stay straight-line code.
     ("mov r1, #2", OTHER, False),
     ("ldr r0, [r1]", OTHER, False),
+    ("adds r0, r1, r2", OTHER, False),
+    ("movs r0, r1", OTHER, False),
+    ("ldr r0, [sp]", OTHER, False),
+    ("pop {r3, r4}", OTHER, False),
+    ("popne {r3, r4}", OTHER, False),
+    ("ldmia sp!, {r4, r5}", OTHER, False),
+    ("stmfd sp!, {r4, lr}", OTHER, False),
+    ("add r0, pc, #8", OTHER, False),
+    ("andeq r0, r0, r0", OTHER, False),
+    ("orrs r0, r1, r2", OTHER, False),
+    ("lsls r0, r1, #2", OTHER, False),
+    ("subs r0, r1, #4", OTHER, False),
 ]
 
 # 'blx' splits on the first operand character: objdump prints a register for the
 # indirect form and a digit for the direct one, which is why "blx 8010 <x>" is
-# absent here and "blx r3" is present.
+# absent here and "blx r3" is present. 'blxns' has no immediate form at all.
+#
+# Every write to pc is here too, whatever bucket it classifies into: the value
+# comes from a register or from memory, so there is no static target. That is
+# what makes a predicated write to pc a branch point with taken=None, which is
+# EXCLUDED from branch coverage -- the same treatment PowerPC's conditional
+# returns ('beqlr') already get -- rather than a permanently half-covered
+# branch.
 INDIRECT_ARM = [
-    "blx r3", "blxeq r3",
+    "blx r3", "blxeq r3", "blxns r3", "blxnsne r3",
     "tbb [r0, r1]", "tbh [r0, r1, lsl #1]",
-    "bx lr", "bx r3",
-    "mov pc, lr", "mov pc, r3", "ldr pc, [sp], #4",
+    "tbbeq [r0, r1]", "tbhne [r0, r1, lsl #1]",
+    "bx lr", "bxeq lr", "bx r3", "bxeq r3",
+    "bxj r3", "bxjne r3", "bxns r3", "bxnseq r3",
+    "mov pc, lr", "moveq pc, lr", "mov pc, r3", "moveq pc, r3",
+    "pop {r4, pc}", "popeq {r3, pc}", "popeq.w {r4, pc}",
+    "ldmia sp!, {r4, pc}", "ldmdb r4, {r5, pc}", "ldmfd sp!, {r4, pc}",
+    "ldmiaeq sp!, {r4, pc}", "ldmeq sp!, {r4, pc}",
+    "ldr pc, [sp], #4", "ldreq pc, [sp], #4", "ldrne pc, [r4, r5]",
+    "subs pc, lr, #4", "subs pc, lr, #8", "subseq pc, lr, #4",
+    "movs pc, lr", "movseq pc, lr", "movs pc, r3",
+    "add pc, pc, r3", "add pc, pc, r3, lsl #2", "addeq pc, pc, r3",
+    "add pc, r3", "addeq pc, r3",
+    "sub pc, r0, #4", "and pc, r0, r1", "orr pc, r0, r1",
+    "orrne pc, r0, r1", "eor pc, r0, r1", "bic pc, r0, r1", "mvn pc, r0",
+    "rsb pc, r0, r1", "rsbs pc, r0, r1", "adc pc, r0, r1", "sbc pc, r0, r1",
+    "rsc pc, r0, r1", "lsl pc, r3, #2", "lsr pc, r3, #2", "lsrs pc, r3, #2",
+    "rrx pc, r3", "asreq pc, r3, #2",
 ]
 
 
@@ -848,6 +958,135 @@ class TestIndirectTransfers(unittest.TestCase):
                 self.assertTrue(cfg.get_profile(arch)._indirect is not None,
                                 "%s has no indirect pattern" % arch)
                 self.assertGreaterEqual(len(indirect), 4)
+
+
+class TestArmPredicatedTransfers(unittest.TestCase):
+    """A32/T32 applies the condition OUTSIDE the instruction, so every
+    predicated transfer is a two-outcome branch.
+
+    QEMU proves it: `arm_skip_unless` runs before dispatch
+    (target/arm/tcg/translate.c:2247-2250, from disas_arm_insn :6062-6106, and
+    from the IT state for Thumb at :6647-6663) and the condition-failed path is
+    emitted once at TB end as a second gen_goto_tb (:6821-6828). No trans_*
+    function contains condition logic of its own, which is why the suffix has to
+    be spelled out on every pattern in the profile rather than on 'b'/'bl'
+    alone.
+
+    Three separate defects lived in that gap, and each has its own test below.
+    """
+
+    def setUp(self):
+        self.profiles = [cfg.get_profile("arm"), cfg.get_profile("thumb")]
+
+    def test_predicated_register_transfers_terminate_their_block(self):
+        """Defect 1: 'bx<cc>'/'bxj<cc>'/'tbb<cc>'/'tbh<cc>' were OTHER.
+
+        OTHER is not in TERMINATORS, so the block did not end -- while
+        is_indirect() simultaneously said True. For tbb/tbh that is worse than a
+        merge: the inline jump table sits in the bytes immediately after, and
+        objdump disassembles those bytes as instructions, so they were spliced
+        into the surviving block.
+        """
+        for p in self.profiles:
+            for text in ("bxeq r3", "bxne r3", "bxjne r3", "bxnseq r3",
+                         "tbbeq [r0, r1]", "tbhne [r0, r1, lsl #1]",
+                         "blxnsne r3"):
+                with self.subTest(arch=p.name, insn=text):
+                    self.assertIn(p.classify(text), cfg.TERMINATORS)
+
+    def test_writes_to_pc_are_transfers(self):
+        """Defect 2: only 'mov'/'ldr' into pc were recognised.
+
+        QEMU routes every data-processing opcode that can write r15 through one
+        dispatcher, store_reg_kind (translate.c:2422-2450, per-opcode selection
+        at :2604-2673). 'subs pc, lr, #4' is the classic A32 exception return
+        and 'add pc, pc, rN' the classic A32 jump-table dispatch; neither
+        terminated a block.
+        """
+        for p in self.profiles:
+            for text in ("subs pc, lr, #4", "add pc, pc, r3", "add pc, r3",
+                         "sub pc, r0, #4", "and pc, r0, r1", "orr pc, r0, r1",
+                         "eor pc, r0, r1", "bic pc, r0, r1", "mvn pc, r0",
+                         "rsb pc, r0, r1", "adc pc, r0, r1", "sbc pc, r0, r1",
+                         "rsc pc, r0, r1", "lsl pc, r3, #2"):
+                with self.subTest(arch=p.name, insn=text):
+                    self.assertIn(p.classify(text), cfg.TERMINATORS)
+                    self.assertNotEqual(p.classify(text), OTHER)
+
+    def test_the_exception_return_forms_read_as_returns(self):
+        """'subs pc, lr, #N' / 'movs pc, lr' are STREG_EXC_RET, not jumps."""
+        for p in self.profiles:
+            for text in ("subs pc, lr, #4", "subs pc, lr, #8", "movs pc, lr"):
+                with self.subTest(arch=p.name, insn=text):
+                    self.assertEqual(p.classify(text), RET)
+
+    def test_predicated_writes_to_pc_are_branch_points(self):
+        """Defect 3: 'moveq pc, lr' & friends classified RET.
+
+        RET terminates the block but builds no BranchPoint, so QEMU's second
+        exit -- the fall-through taken when the condition fails -- was never
+        counted. COND supplies both properties, which is the fix 'bl<cc>'
+        already had.
+        """
+        for p in self.profiles:
+            for text in ("moveq pc, lr", "popeq {r3, pc}", "bxeq lr",
+                         "ldreq pc, [sp], #4", "ldmiaeq sp!, {r4, pc}",
+                         "popeq.w {r4, pc}", "movseq pc, lr",
+                         "subseq pc, lr, #4", "addeq pc, pc, r3",
+                         "orrne pc, r0, r1"):
+                with self.subTest(arch=p.name, insn=text):
+                    self.assertEqual(p.classify(text), COND)
+
+    def test_unpredicated_forms_are_not_dragged_along(self):
+        """The unpredicated spellings must keep their old buckets."""
+        for p in self.profiles:
+            for text, kind in (("bx lr", RET), ("bx r3", UNCOND),
+                               ("mov pc, lr", RET), ("mov pc, r3", UNCOND),
+                               ("pop {r4, pc}", RET),
+                               ("ldmia sp!, {r4, pc}", RET),
+                               ("ldr pc, [sp], #4", RET),
+                               ("tbb [r0, r1]", UNCOND),
+                               ("bl 8010 <x>", CALL),
+                               ("b 8010 <x>", UNCOND)):
+                with self.subTest(arch=p.name, insn=text):
+                    self.assertEqual(p.classify(text), kind)
+
+    def test_ordinary_alu_and_load_ops_stay_straight_line_code(self):
+        """The false-positive direction: a swallowed non-branch is as bad.
+
+        The PC-write patterns key off the DESTINATION operand, which is the only
+        thing separating them from the most common instructions on the ISA.
+        'andeq r0, r0, r0' matters most: it is how a zero word disassembles, so
+        it appears in every padded A32 image.
+        """
+        for p in self.profiles:
+            for text in ("movs r0, r1", "adds r0, r1, r2", "ldr r0, [sp]",
+                         "pop {r3, r4}", "popne {r3, r4}",
+                         "ldmia sp!, {r4, r5}", "stmfd sp!, {r4, lr}",
+                         "add r0, pc, #8", "andeq r0, r0, r0",
+                         "orrs r0, r1, r2", "lsls r0, r1, #2",
+                         "subs r0, r1, #4", "dls lr, r0", "lctp",
+                         "mov r1, #2", "adr r0, 8010 <x>",
+                         "ldrb r0, [r1]", "str pc, [sp]"):
+                with self.subTest(arch=p.name, insn=text):
+                    self.assertEqual(p.classify(text), OTHER)
+                    self.assertFalse(p.is_indirect(text))
+
+    def test_no_arm_row_is_indirect_while_classifying_as_other(self):
+        """The self-contradiction diagnostic, over the whole ARM table.
+
+        is_indirect() true means "this is a transfer whose target comes from a
+        register"; OTHER means "this does not transfer at all". A profile
+        asserting both about one string has a hole in exactly one of its two
+        patterns -- which is how Defect 1 presented. Scoped to ARM because the
+        RISC-V Zcmt rows (cm.jt/cm.jalt) are a known, separately tracked
+        instance of the same shape.
+        """
+        for p in self.profiles:
+            for text, _, _ in ARM:
+                with self.subTest(arch=p.name, insn=text):
+                    if p.is_indirect(text):
+                        self.assertNotEqual(p.classify(text), OTHER)
 
 
 class TestConditionalCallsAreBranchPoints(unittest.TestCase):

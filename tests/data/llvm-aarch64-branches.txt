@@ -1,0 +1,59 @@
+
+a64b.o:	file format elf64-littleaarch64
+
+Disassembly of section .text:
+
+0000000000000000 <cond_forms>:
+       0: d10043ff     	sub	sp, sp, #0x10
+       4: b9000fe0     	str	w0, [sp, #0xc]
+       8: b9000be1     	str	w1, [sp, #0x8]
+       c: b9400fe8     	ldr	w8, [sp, #0xc]
+      10: 71001508     	subs	w8, w8, #0x5
+      14: 5400004c     	b.gt	0x1c <cond_forms+0x1c>
+      18: 14000005     	b	0x2c <cond_forms+0x2c>
+      1c: 90000009     	adrp	x9, 0x0 <cond_forms>
+      20: 52800028     	mov	w8, #0x1                // =1
+      24: b9000128     	str	w8, [x9]
+      28: 14000001     	b	0x2c <cond_forms+0x2c>
+      2c: b9400fe8     	ldr	w8, [sp, #0xc]
+      30: 37f80048     	tbnz	w8, #0x1f, 0x38 <cond_forms+0x38>
+      34: 14000005     	b	0x48 <cond_forms+0x48>
+      38: 52800048     	mov	w8, #0x2                // =2
+      3c: 90000009     	adrp	x9, 0x0 <cond_forms>
+      40: b9000128     	str	w8, [x9]
+      44: 14000001     	b	0x48 <cond_forms+0x48>
+      48: b9400fe8     	ldr	w8, [sp, #0xc]
+      4c: b9400be9     	ldr	w9, [sp, #0x8]
+      50: 6b090108     	subs	w8, w8, w9
+      54: 54000040     	b.eq	0x5c <cond_forms+0x5c>
+      58: 14000005     	b	0x6c <cond_forms+0x6c>
+      5c: 52800068     	mov	w8, #0x3                // =3
+      60: 90000009     	adrp	x9, 0x0 <cond_forms>
+      64: b9000128     	str	w8, [x9]
+      68: 14000001     	b	0x6c <cond_forms+0x6c>
+      6c: b9400fe8     	ldr	w8, [sp, #0xc]
+      70: b9400be9     	ldr	w9, [sp, #0x8]
+      74: 6b090108     	subs	w8, w8, w9
+      78: 54000041     	b.ne	0x80 <cond_forms+0x80>
+      7c: 14000005     	b	0x90 <cond_forms+0x90>
+      80: 52800088     	mov	w8, #0x4                // =4
+      84: 90000009     	adrp	x9, 0x0 <cond_forms>
+      88: b9000128     	str	w8, [x9]
+      8c: 14000001     	b	0x90 <cond_forms+0x90>
+      90: 14000001     	b	0x94 <cond_forms+0x94>
+      94: b9400fe8     	ldr	w8, [sp, #0xc]
+      98: 71000509     	subs	w9, w8, #0x1
+      9c: b9000fe9     	str	w9, [sp, #0xc]
+      a0: 71000108     	subs	w8, w8, #0x0
+      a4: 5400004c     	b.gt	0xac <cond_forms+0xac>
+      a8: 14000007     	b	0xc4 <cond_forms+0xc4>
+      ac: b9400fea     	ldr	w10, [sp, #0xc]
+      b0: 90000009     	adrp	x9, 0x0 <cond_forms>
+      b4: b9400128     	ldr	w8, [x9]
+      b8: 0b0a0108     	add	w8, w8, w10
+      bc: b9000128     	str	w8, [x9]
+      c0: 17fffff5     	b	0x94 <cond_forms+0x94>
+      c4: 90000008     	adrp	x8, 0x0 <cond_forms>
+      c8: b9400100     	ldr	w0, [x8]
+      cc: 910043ff     	add	sp, sp, #0x10
+      d0: d65f03c0     	ret

@@ -72,7 +72,7 @@ most profiles have only the first:
 | Profile | `cfg.py` lines | Table rows | Opcode-table citations | Real tool output | Ran under QEMU |
 |---|---|---|---|---|---|
 | **microblaze** | 239-266 | 50 (24 cond, 8 non-branch guards) | **exhaustive** — `microblaze-opc.h:195-241`, every immediate form's `INST_PC_OFFSET`/`INST_NO_OFFSET` flag and every `DELAY_SLOT` flag (`:223-241` cited inline) | `tests/data/gnu-microblaze.txt` — genuine GNU `objdump -d`, 111 insns, 4 conditional branches with **verified targets and fall-throughs** (`tests/test_golden_disasm.py:93-113`) | **yes** — `qemu-system-microblazeel`, `petalogix-s3adsp1800`, `examples/branch-coverage/README.md:5-6` |
-| **arm** (A32/T32) | 335-366 | 46 | partial — `arm-dis.c:4410-4422` (low-overhead loops), `:4425-4433` (branch-future), `:4563-4565` (`tbb`/`tbh`), `:4919` (condition suffixes) | `tests/data/llvm-armv7.txt` — 5 insns, **0 conditional branches**; proves layout parsing only | no |
+| **arm** (A32/T32) | 348-510 | 106 (47 cond, 16 non-branch guards) | partial — `arm-dis.c:3910` (S bit before the condition), `:4012-4020` (the shift aliases of `mov`), `:4133` (LDM addressing mode before the condition), `:4410-4422` (low-overhead loops), `:4425-4433` (branch-future), `:4563-4565` (`tbb`/`tbh`), `:4919` (condition suffixes), `:8201-8204` (`%c` glues with no separator); the write-to-`pc` opcode set is taken from QEMU `store_reg_kind` (`<qemu-source>/target/arm/tcg/translate.c:2422-2450`) | `tests/data/llvm-armv7.txt` — 5 insns, **0 conditional branches**; proves layout parsing only. Separately, **every predicated spelling in the table was assembled and disassembled** (`clang --target=armv7-linux-gnueabi -c` + `llvm-objdump -d`) so the operand text is real, not guessed | no |
 | **aarch64** | 371-404 | 32 | the register-indirect family only — `aarch64-tbl.h:4413-4430`, `aarch64-opc.c:4096-4099`, `:5201-5211`; the conditional-branch rows in the test table carry none | `tests/data/llvm-aarch64.txt` — 4 insns, **0 conditional branches** | no |
 | **x86 / x86_64** | 406-432 | 37 | one — `i386-dis.c:14640` (APX `jmpabs`); the 16 Jcc spellings are asserted but not line-cited | `tests/data/llvm-x86_64.txt` — 5 insns, **0 conditional branches**; does prove variable-length sizing from address deltas (`test_golden_disasm.py:115-120`) | no |
 | **mips** (+ microMIPS) | 533-693 | 89 (12 non-branch guards) | good — `mips-opc.c:223-228` (CBD/UBD/CBL/NODS), plus `:718-723`, `:729`, `:734`, `:2146-2148`, `:3366`, `:3371`; microMIPS per-row from `micromips-opc.c:322-453`, `:732-780`, with the `16`-suffixed spellings cited to LLVM's `MicroMipsInstrInfo.td` / `MicroMips32r6InstrInfo.td` | **none** | no |
@@ -168,26 +168,61 @@ listed here is not a claim of completeness — it is the absence of a note.
 
 ### ARM
 
+* **The condition suffix is applied outside the instruction, so it appears on
+  every transfer pattern.** QEMU predicates uniformly — `arm_skip_unless`
+  before dispatch (`<qemu-source>/target/arm/tcg/translate.c:2247-2250`, from
+  `disas_arm_insn` `:6062-6106`, and from the IT state for Thumb at
+  `:6647-6663`), with the condition-failed path emitted once at TB end as a
+  second `gen_goto_tb` (`:6821-6828`). Every predicated transfer is therefore a
+  two-outcome branch and is classified `COND`: the register forms (`bxeq`,
+  `bxjne`, `bxnseq`, `blxnsne`, `tbbeq`, `tbhne`) and the writes to `pc`
+  (`moveq pc, lr`, `popeq {r3, pc}`, `bxeq lr`, `ldreq pc, [sp], #4`,
+  `ldmiaeq sp!, {r4, pc}`) alike (`cfg.py:373-393`, `:427-437`). This is the
+  same treatment `bl<cc>` gets, and it matches PowerPC's conditional returns.
+* **A predicated return has no static taken target, so it is EXCLUDED from
+  branch coverage**, not reported half-covered — the target is in `lr` or on
+  the stack. It does raise the "indirect/unknown target → EXCLUDED" count in
+  the summary line, exactly as `beqlr` does on PowerPC.
+* **Writes to `pc` are transfers on this ISA, whatever the mnemonic.** QEMU
+  funnels every data-processing opcode that can write r15 through one
+  dispatcher, `store_reg_kind`
+  (`<qemu-source>/target/arm/tcg/translate.c:2422-2450`, per-opcode selection
+  at `:2604-2673`). The profile models that opcode set (`cfg.py:395-423`), so
+  `add pc, pc, rN` (the classic A32 jump-table dispatch) is `UNCOND`, and the
+  `STREG_EXC_RET` forms `subs pc, lr, #N` and `movs pc, lr` (the classic A32
+  exception return) are `RET`. All of them are `indirect`: there is no static
+  target to parse. Every one of these patterns keys off the **destination**
+  operand, which is what keeps `adds r0, r1, r2`, `movs r0, r1` and
+  `andeq r0, r0, r0` (how a zero word disassembles, so it is in every padded
+  A32 image) out of them.
 * **Branch-future (`bf` / `bfl` / `bfx` / `bfcsel`) is not modelled**
-  (`arm-dis.c:4425-4433`, stated in the profile note at `cfg.py:365-366`). If
+  (`arm-dis.c:4425-4433`, stated in the profile note at `cfg.py:479-481`). If
   your Armv8.1-M code uses it, those transfers are invisible to the block map.
+  QEMU implements them as a NOP (`trans_BF`,
+  `<qemu-source>/target/arm/tcg/translate.c:5408-5426`), so nothing observable
+  is lost under QEMU.
+* **`bxaut` (`arm-dis.c:4397`, Armv8.1-M PACBTI) is not modelled** — a
+  register-indirect branch that classifies `OTHER`. QEMU does not implement it
+  either, so it cannot be exercised under QEMU today.
 * **`le <label>` — the LR-less form — is classified `COND`, but that specific
   spelling is not confirmed from an opcode table.** The profile cites
   `arm-dis.c:4410-4418` for the `le`/`letp`/`wls`/`wlstp` family as a whole
-  (`cfg.py:328-333`); the LR-less row exists in the table
-  (`tests/test_arch_profiles.py:146`) with no separate citation. Treat it as an
-  informed guess.
+  (`cfg.py:366-371`); the LR-less row exists in the table with no separate
+  citation. Treat it as an informed guess.
 * **`tbb`/`tbh` are followed by inline jump-table bytes that objdump
-  disassembles as instructions.** They are therefore classified `UNCOND` — not
-  because they are unconditional in any interesting sense, but because they
-  MUST terminate their block; a `tbb` that does not end its block splices table
-  data into the block map (`cfg.py:339-344`).
+  disassembles as instructions.** The unpredicated spelling is therefore
+  classified `UNCOND` — not because it is unconditional in any interesting
+  sense, but because it MUST terminate its block; a `tbb` that does not end its
+  block splices table data into the block map (`cfg.py:438-442`). `tbb<cc>` /
+  `tbh<cc>` carry the same hazard and are `COND` for the same reason.
 * **ARM has no return instruction.** The `ret` pattern is a set of idioms —
-  `bx lr`, `pop {…, pc}`, `ldm …{…, pc}`, `mov pc, lr`, `ldr pc, …`
-  (`cfg.py:349-354`). A missed idiom merges two blocks; function symbols are
-  also block leaders (`cfg.py:1131-1142`), which limits the damage.
+  `bx lr`, `pop {…, pc}`, `ldm{ia,ib,da,db,fd,fa,ed,ea} …{…, pc}`,
+  `mov pc, lr`, `subs pc, lr, #N`, `ldr pc, …` (`cfg.py:446-457`), in their
+  **unpredicated** spellings only; the predicated ones are branch points and
+  are matched earlier. A missed idiom merges two blocks; function symbols are
+  also block leaders (`cfg.py:1476-1487`), which limits the damage.
 * `dls`/`dlstp` only initialize LR and are deliberately `OTHER`
-  (`cfg.py:332-333`).
+  (`cfg.py:370-371`).
 
 ### PowerPC
 
@@ -428,10 +463,10 @@ Without an `indirect` pattern, an indirect transfer's operands are read as a
 target: x86 `jmp *0x10(%rax)` parses as `0x10`
 (`tests/test_cfg.py:192-199`). AT&T marks every indirect transfer with a
 leading `*`, which is the whole x86 rule (`cfg.py:426-429`). ARM had **no**
-`indirect` pattern at all until `63fbeaf`; it now needs three alternatives,
-including one that splits `blx` on the first operand character because objdump
-prints a register for the indirect form and a digit for the direct one
-(`cfg.py:356-360`). The same hazard exists wherever a register operand carries
+`indirect` pattern at all until `63fbeaf`; it now needs six alternatives —
+one per PC-writing idiom, plus one that splits `blx` on the first operand
+character because objdump prints a register for the indirect form and a digit
+for the direct one (`cfg.py:459-474`). The same hazard exists wherever a register operand carries
 a displacement — RISC-V `jalr 16(a0)`, SPARC `jmpl %g1+0x10, %o7`.
 
 A bogus target is partly caught downstream — `CFG.__init__` nulls a COND target
@@ -462,7 +497,10 @@ disassembler *emits*, not what the assembler accepts:
   appears only with `-M suffix` or from llvm-objdump (`cfg.py:406-412`).
 * ARM: objdump maps the `al` condition to the empty string, so a bare `b` is
   unconditional; Thumb adds `.n`/`.w` width suffixes; objdump prints `cs`/`cc`,
-  never `hs`/`lo` (`cfg.py:310-315`, `:334`).
+  never `hs`/`lo` (`cfg.py:348-351`, `:415-418`). The suffix is glued on with no
+  separator and lands in a different place per idiom: **after** the S bit
+  (`subseq`) and after an LDM addressing mode (`ldmiaeq`), but **before** the
+  Thumb width suffix (`popeq.w`) — `arm-dis.c:3910`, `:4133`, `:8201-8204`.
 
 **Do not work from the ISA manual alone.** Generate real disassembly of a real
 binary for your target and read what actually comes out. The manual tells you
