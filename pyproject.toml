@@ -4,11 +4,29 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tcgcov"
-description = "Host-side tooling for tcgcov QEMU code-coverage artifacts"
-readme = "README.tcgcov.md"
+description = "Non-intrusive code coverage for binaries under QEMU, via a TCG plugin"
+readme = "README.md"
 requires-python = ">=3.8"
 dynamic = ["version"]
 dependencies = []
+license = "GPL-2.0-or-later"
+license-files = ["LICENSE"]
+keywords = ["qemu", "coverage", "lcov", "tcg", "embedded", "cross-compilation"]
+authors = [{ name = "Samuel Price", email = "thesamprice@gmail.com" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Software Development :: Embedded Systems",
+    "Operating System :: POSIX",
+]
+
+[project.urls]
+Homepage = "https://github.com/thesamprice/tcgcov"
+Source = "https://github.com/thesamprice/tcgcov"
+Issues = "https://github.com/thesamprice/tcgcov/issues"
 
 [project.scripts]
 tcgcov = "tcgcov.cli:main"
@@ -20,4 +38,4 @@ dev = ["pytest"]
 packages = ["tcgcov"]
 
 [tool.setuptools.dynamic]
-version = {attr = "tcgcov.__version__"}
+version = { attr = "tcgcov.__version__" }
