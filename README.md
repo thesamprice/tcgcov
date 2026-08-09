@@ -294,6 +294,23 @@ actually the question you have.
 Both require that the two sides share normalization: symbolize with the same
 path flags and the same source root, or the keys will not line up.
 
+A few behaviours worth knowing:
+
+- **`gap --app` detects its input by content, not by filename.** It accepts
+  either a symbolized `.jsonl` or an LCOV `.info` whatever the file is called;
+  an unrecognizable file is an error rather than a silent empty report.
+- **`gap` reports branch outcomes too** when the app side is an `.info`
+  carrying `BRDA` records. The branch universe is the outcomes the app took,
+  and an outcome counts as covered only if the baseline took it as well — the
+  same rule as lines, so red still means gap. Outcomes the app never evaluated
+  stay out of the denominator.
+- **Neither command will write an empty report.** An empty aggregate, an empty
+  target inventory, an empty baseline, or zero overlap between the two sides is
+  a hard error. All of those used to exit 0 with a plausible-looking `0.0%` or
+  `0 GAP lines` — which reads as "nothing to worry about" when it actually
+  means the two sides' paths never matched. When it is a normalization
+  mismatch, the error says so.
+
 ### Path selection
 
 Every producer must be given the *same* path options, or the covered and
