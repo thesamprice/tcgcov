@@ -1,0 +1,11 @@
+
+q.o:	file format elf64-x86-64
+
+Disassembly of section .text:
+
+0000000000000000 <f>:
+       0: 31 c0                        	xorl	%eax, %eax
+       2: 83 ff 06                     	cmpl	$0x6, %edi
+       5: 0f 9c c0                     	setl	%al
+       8: ff c0                        	incl	%eax
+       a: c3                           	retq

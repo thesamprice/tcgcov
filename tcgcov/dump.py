@@ -6,17 +6,15 @@ import json
 import sys
 
 from .format import (parse_header, unpack_records, unpack_edges, REC_TYPE,
-                     FLAG_HAS_COUNTS, FLAG_HAS_EDGES, FLAG_EDGE_COUNTS,
-                     HEADER_SIZE_V1)
+                     FLAG_HAS_COUNTS, FLAG_HAS_EDGES, FLAG_EDGE_COUNTS)
 
 
 def load(path):
     with open(path, "rb") as f:
         data = f.read()
 
-    if len(data) < HEADER_SIZE_V1:
-        raise ValueError(f"file too small ({len(data)} bytes) to be tcgcov")
-
+    # parse_header validates size, magic, version, endianness, every section's
+    # bounds and the record strides, and raises ValueError on any of them.
     hdr = parse_header(data, path)
     flags = hdr["flags"]
     meta_raw = data[hdr["metadata_offset"]:

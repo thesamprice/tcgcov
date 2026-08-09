@@ -1,5 +1,8 @@
 """Tests for aggregate merge-by-source (tcgcov.merge)."""
 
+import contextlib
+import io
+import itertools
 import os
 import sys
 import tempfile
@@ -114,6 +117,95 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(merge_main([a, b, "--out", out]), 0)
         got = [l.strip() for l in open(out) if l.startswith("BRDA:")]
         self.assertEqual(got, ["BRDA:5,0,0,7", "BRDA:5,0,1,0"])
+
+
+# A third input, overlapping A and B on cpukit/x.c and adding a second file, so
+# ordering has something to disturb: file order, line order and branch order.
+INFO_C = """\
+TN:c
+SF:bsps/y.c
+FN:1,bar
+FNDA:9,bar
+BRDA:1,0,0,4
+BRDA:1,0,1,-
+DA:1,9
+DA:2,0
+end_of_record
+TN:c
+SF:cpukit/x.c
+FN:10,foo
+FNDA:1,foo
+BRDA:11,0,0,6
+BRDA:11,0,1,0
+DA:10,1
+DA:13,4
+end_of_record
+"""
+
+
+class TestMergeDeterminism(unittest.TestCase):
+    """Merging is set/sum arithmetic, so input order must not show up in the
+    output. A regression guard: this holds today and quietly stops holding the
+    moment an accumulator becomes order-sensitive (last-wins, first-wins, or a
+    dict iterated instead of sorted)."""
+
+    def test_output_is_byte_identical_under_every_permutation(self):
+        d = tempfile.mkdtemp()
+        names = []
+        for name, body in (("a.info", INFO_A), ("b.info", INFO_B),
+                           ("c.info", INFO_C)):
+            p = os.path.join(d, name)
+            with open(p, "w") as f:
+                f.write(body)
+            names.append(p)
+
+        outputs = {}
+        for i, order in enumerate(itertools.permutations(names)):
+            out = os.path.join(d, "agg%d.info" % i)
+            self.assertEqual(
+                merge_main(list(order) + ["--out", out, "--name", "agg"]), 0)
+            with open(out, "rb") as f:
+                outputs[tuple(os.path.basename(p) for p in order)] = f.read()
+
+        self.assertEqual(len(outputs), 6)
+        distinct = set(outputs.values())
+        self.assertEqual(
+            len(distinct), 1,
+            "merge output depends on input order: %s" % sorted(outputs))
+        # And the merge really did aggregate something.
+        text = distinct.pop().decode()
+        self.assertIn("SF:bsps/y.c", text)
+        self.assertIn("SF:cpukit/x.c", text)
+        self.assertIn("DA:10,6\n", text)     # 3 + 2 + 1
+
+
+class TestMergeInputFailures(unittest.TestCase):
+    def test_all_inputs_unreadable_exits_nonzero(self):
+        """Warn-and-continue on every input used to write an empty aggregate
+        and exit 0 -- a CI-green '0.0% of 0 lines'."""
+        d = tempfile.mkdtemp()
+        out = os.path.join(d, "agg.info")
+        missing = [os.path.join(d, "nope1.info"), os.path.join(d, "nope2.info")]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = merge_main(missing + ["--out", out])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("none of the", err.getvalue())
+        self.assertFalse(os.path.exists(out))
+
+    def test_one_readable_input_still_succeeds(self):
+        d = tempfile.mkdtemp()
+        good = os.path.join(d, "a.info")
+        with open(good, "w") as f:
+            f.write(INFO_A)
+        out = os.path.join(d, "agg.info")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = merge_main([good, os.path.join(d, "nope.info"),
+                             "--out", out])
+        self.assertEqual(rc, 0)
+        self.assertIn("warning: skipping", err.getvalue())
+        self.assertTrue(os.path.exists(out))
 
 
 if __name__ == "__main__":

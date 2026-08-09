@@ -48,8 +48,18 @@ import subprocess
 
 # --- objdump text shapes ----------------------------------------------------
 
+# A disassembly line, in BOTH layouts the two objdumps emit. The separator
+# after the colon differs and that difference is load-bearing:
+#
+#   GNU objdump : "90000000:\tb00097ff \timm\t-26625"      <- TAB
+#   llvm-objdump: "       0: 52800028     \tmov\tw8, #0x1" <- SPACE
+#
+# Accepting only the tab silently drops every llvm-objdump instruction, which
+# makes branch coverage vanish while line coverage still works. This regex is
+# the single definition used by cfg.py AND coverable.py (via match_insn_line)
+# so the two producers cannot disagree about what an instruction line is.
 # "  4000d3:\t74 05                \tje     4000da <foo+0x1a>"
-INSN_RE = re.compile(r"^[ ]*([0-9a-fA-F]+):\t(.*)$")
+INSN_RE = re.compile(r"^[ ]*([0-9a-fA-F]+):[ \t](.*)$")
 # "0000000000400470 <main>:"
 SYMBOL_RE = re.compile(r"^([0-9a-fA-F]+)\s+<([^>]+)>:\s*$")
 # "foo.elf:     file format elf32-microblazeel"
@@ -57,6 +67,11 @@ FILE_FORMAT_RE = re.compile(r"file format\s+(\S+)")
 SECTION_RE = re.compile(r"^Disassembly of section (\S+):")
 # Raw-bytes column: "74 05" / "b0000000" / "0000 1234".
 RAW_BYTES_RE = re.compile(r"^(?:[0-9a-fA-F]{2,8} ?)+$")
+# A raw-byte continuation line: GNU objdump wraps an over-long instruction's
+# bytes onto extra address-prefixed lines that carry no mnemonic. Those bytes
+# always print as 2-hex-digit groups, which is what tells them apart from a
+# lone operand-less mnemonic.
+RAW_CONT_RE = re.compile(r"^(?:[0-9a-fA-F]{2} ?)+$")
 # A resolved branch target: hex address immediately followed by <sym+0xoff>.
 SYMBOLIC_TARGET_RE = re.compile(r"(?:0x)?([0-9a-fA-F]+)\s*<[^>\n]*>")
 # MicroBlaze prints the raw displacement as the operand and the resolved target
@@ -470,6 +485,34 @@ def load_profile_file(path):
 
 # --- disassembly parsing ----------------------------------------------------
 
+class DisassemblyParseError(ValueError):
+    """Disassembly text that yielded no instructions at all.
+
+    A total parse failure must never look like "this binary has no branches":
+    that reports a wrong number with exit status 0. It is a ValueError so the
+    (OSError, ValueError) handlers callers already use catch it.
+    """
+
+
+def match_insn_line(line):
+    """Return (address:int, rest:str) for one disassembly line, else None.
+
+    THE shared definition of "this line is an instruction", used by both the
+    branch inventory (cfg.parse_objdump) and the coverable-line inventory
+    (coverable.disassemble_addresses). Keeping one implementation is the point:
+    when these two disagreed, line coverage kept working while branch coverage
+    silently produced an empty result.
+    """
+    # "beef.elf:\tfile format elf32-..." would otherwise parse as an
+    # instruction at 0xbeef, because objdump prints the file name the same way.
+    if FILE_FORMAT_RE.search(line):
+        return None
+    m = INSN_RE.match(line)
+    if m is None:
+        return None
+    return int(m.group(1), 16), m.group(2)
+
+
 class Insn(object):
     """One disassembled instruction."""
 
@@ -490,19 +533,48 @@ class Insn(object):
         return "<Insn 0x%x %s %s>" % (self.addr, self.kind, self.text)
 
 
-def _instruction_text(rest):
-    """Extract "<mnemonic> <operands>" from the part after 'addr:\\t'.
+def _is_raw_bytes_field(field):
+    """True if `field` is objdump's raw-bytes column, not a mnemonic.
 
-    objdump normally prints "<raw bytes>\\t<mnemonic>\\t<operands>", but the raw
-    column is absent with --no-show-raw-insn and the operand column is absent
-    for operand-less instructions, so pick the first field that is not raw hex.
+    Content alone is not enough: 'add', 'bad', 'dec' and PowerPC 'bc' are all
+    spellable in hex, so with --no-show-raw-insn a purely textual test eats the
+    mnemonic and leaves the operands behind as the "instruction". Two extra
+    structural facts settle it:
+
+      * raw bytes are WHOLE bytes, so every group has an even digit count
+        ('add' and 'dec' are three);
+      * every objdump pads the raw column -- binutils prints an explicit extra
+        space after it, llvm-objdump pads to a fixed width -- so the field
+        always ends in whitespace, whereas a mnemonic is followed directly by
+        the tab that separates it from its operands.
     """
-    fields = [f for f in rest.split("\t")]
+    stripped = field.strip()
+    if not stripped or not RAW_BYTES_RE.match(stripped):
+        return False
+    if any(len(group) % 2 for group in stripped.split()):
+        return False
+    return field != field.rstrip()
+
+
+def _instruction_text(rest):
+    """Extract "<mnemonic> <operands>" from the part after 'addr:<sep>'.
+
+    Both disassembly layouts are handled (see INSN_RE): GNU objdump puts the
+    raw-bytes column between two tabs, llvm-objdump puts it after the space
+    that follows the colon and before a tab, and --no-show-raw-insn omits it
+    (GNU) or leaves it as blank padding (llvm-objdump). In every case the raw
+    column, if present, is the FIRST tab-separated field.
+
+    Returns "" for a raw-byte continuation line, which is not an instruction.
+    """
+    fields = rest.split("\t")
+    if len(fields) == 1 and RAW_CONT_RE.match(fields[0].strip()):
+        return ""  # continuation of the previous instruction's raw bytes
     for i, field in enumerate(fields):
         stripped = field.strip()
         if not stripped:
             continue
-        if RAW_BYTES_RE.match(stripped) and i == 0 and len(fields) > 1:
+        if i == 0 and len(fields) > 1 and _is_raw_bytes_field(field):
             continue  # raw-bytes column
         return " ".join(f.strip() for f in fields[i:] if f.strip())
     return ""
@@ -556,6 +628,11 @@ def parse_objdump(text, profile):
     Instruction sizes come from the address deltas of consecutive instructions
     in the same section (objdump prints them in address order); the last
     instruction of a section falls back to the profile's insn_size.
+
+    Raises DisassemblyParseError when non-blank text produces no instructions
+    at all: that is a parse failure (an unrecognized objdump layout, a
+    non-disassembly file passed to --disasm), and returning an empty list makes
+    it indistinguishable from "this binary genuinely has no code".
     """
     insns = []
     section = ""
@@ -564,18 +641,25 @@ def parse_objdump(text, profile):
         if m:
             section = m.group(1)
             continue
-        m = INSN_RE.match(line)
-        if not m:
+        matched = match_insn_line(line)
+        if matched is None:
             continue
-        itext = _instruction_text(m.group(2))
+        addr, rest = matched
+        itext = _instruction_text(rest)
         if not itext:
             continue  # continuation line of a long instruction's raw bytes
-        addr = int(m.group(1), 16)
         mnemonic = itext.split(None, 1)[0]
         kind = profile.classify(itext)
         insn = Insn(addr, itext, mnemonic, kind, section)
         insn.delay = profile.delays(kind, itext)
         insns.append(insn)
+
+    if not insns and text.strip():
+        raise DisassemblyParseError(
+            "no instructions found in %d lines of disassembly: the input is "
+            "not `objdump -d` output, or its layout is unrecognized "
+            "(expected lines like '  4000d3:\\t74 05\\tje  4000da')"
+            % len(text.splitlines()))
 
     insns.sort(key=lambda i: i.addr)
     for i, insn in enumerate(insns):
@@ -592,8 +676,15 @@ def parse_objdump(text, profile):
 
 
 def disassemble(objdump, elf):
-    """Return the stdout of `objdump -d ELF` (raises on failure)."""
-    proc = subprocess.run([objdump, "-d", elf], capture_output=True, text=True)
+    """Return the stdout of `objdump -d ELF` (raises on failure).
+
+    Decoding is pinned to UTF-8 with surrogateescape rather than left to the
+    locale: under LC_ALL=C (the default in most containers) Python would decode
+    as ASCII and a single non-ASCII byte in a source path or symbol name would
+    abort the whole run with UnicodeDecodeError.
+    """
+    proc = subprocess.run([objdump, "-d", elf], capture_output=True,
+                          encoding="utf-8", errors="surrogateescape")
     if proc.returncode != 0:
         raise RuntimeError(f"{objdump} failed: {proc.stderr.strip()}")
     return proc.stdout

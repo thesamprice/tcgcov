@@ -137,12 +137,25 @@ for cov in "${covs[@]}"; do
   if [[ "$BRANCHES" == 1 ]]; then
     br="$OUT_DIR/branches/$base.jsonl"
     mkdir -p "$OUT_DIR/branches"
-    if "${TCGCOV[@]}" branches --cov "$cov" --elf "$elf" \
-         "${PREFIX_OPT[@]}" ${PATH_OPTS[@]+"${PATH_OPTS[@]}"} --arch "$ARCH" \
-         --out "$br" 2>"$br.log"; then
+    set +e
+    "${TCGCOV[@]}" branches --cov "$cov" --elf "$elf" \
+      "${PREFIX_OPT[@]}" ${PATH_OPTS[@]+"${PATH_OPTS[@]}"} --arch "$ARCH" \
+      --out "$br" 2>"$br.log"
+    br_rc=$?
+    set -e
+    # Exit 2 means this architecture has no branch profile -- an expected,
+    # benign gap, so carry on with line coverage only. Anything else is a real
+    # failure (an unparseable disassembly, a corrupt .cov) and must not be
+    # downgraded to a note: silently dropping branch data looks exactly like a
+    # genuine coverage regression.
+    if [[ $br_rc -eq 0 ]]; then
       BR_OPT=(--branches "$br")
+    elif [[ $br_rc -eq 2 ]]; then
+      echo "note: no branch profile for arch '$ARCH'; line coverage only" >&2
     else
-      echo "note: no branch data for $base (see $br.log)" >&2
+      echo "error: branch analysis failed for $base (rc=$br_rc):" >&2
+      sed 's/^/  /' "$br.log" >&2
+      exit 1
     fi
   fi
 

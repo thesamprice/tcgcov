@@ -13,30 +13,44 @@ Output JSONL fields: file, line, function, arch, address.
 
 import argparse
 import json
-import re
 import subprocess
 import sys
 
+from .cfg import match_insn_line
 from .symbolize import iter_covered_lines
 from .cliargs import add_symbolize_args
 from .paths import path_options
 
-# objdump disassembly line: optional leading space, hex address, ':', tab/space.
-OBJDUMP_ADDR_RE = re.compile(r"^[ ]*([0-9a-fA-F]+):[ \t]")
+
+def parse_addresses(text):
+    """Return a sorted list of unique instruction addresses in `text`.
+
+    Uses cfg.match_insn_line -- the SAME line matcher as the branch inventory,
+    so the coverable denominator and the branch denominator can never be
+    computed from different ideas of what a disassembly line looks like.
+    """
+    addrs = set()
+    for line in text.splitlines():
+        matched = match_insn_line(line)
+        if matched is not None:
+            addrs.add(matched[0])
+    return sorted(addrs)
 
 
 def disassemble_addresses(objdump, elf):
-    """Return a sorted list of unique instruction addresses in exec sections."""
-    proc = subprocess.run([objdump, "-d", elf],
-                          capture_output=True, text=True)
+    """Return (addresses, raw objdump text) for the ELF's executable sections.
+
+    The text comes back so the caller can tell "objdump printed nothing" (an
+    empty binary) from "objdump printed plenty and we understood none of it"
+    (a parse failure, which must not be reported as an empty inventory).
+    Decoding is pinned to UTF-8/surrogateescape so a non-UTF-8 byte in a path
+    or symbol name cannot abort the run under LC_ALL=C.
+    """
+    proc = subprocess.run([objdump, "-d", elf], capture_output=True,
+                          encoding="utf-8", errors="surrogateescape")
     if proc.returncode != 0:
         raise RuntimeError(f"{objdump} failed: {proc.stderr.strip()}")
-    addrs = set()
-    for line in proc.stdout.splitlines():
-        m = OBJDUMP_ADDR_RE.match(line)
-        if m:
-            addrs.add(int(m.group(1), 16))
-    return sorted(addrs)
+    return parse_addresses(proc.stdout), proc.stdout
 
 
 def add_arguments(parser):
@@ -51,15 +65,26 @@ def run(args):
     addr2line = args.addr2line or (args.toolchain_prefix + "addr2line")
 
     try:
-        addrs = disassemble_addresses(objdump, args.elf)
+        addrs, text = disassemble_addresses(objdump, args.elf)
     except (OSError, RuntimeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
     if not addrs:
-        open(args.out, "w").close()
-        print(f"{args.elf}: no instruction addresses", file=sys.stderr)
-        return 0
+        # An empty coverable inventory is not a benign result: `lcov` then uses
+        # the covered lines as their own denominator and reports 100%. Fail
+        # loudly instead, and distinguish the two ways of getting here.
+        if text.strip():
+            print(f"error: {args.elf}: {objdump} produced "
+                  f"{len(text.splitlines())} lines of output but no "
+                  f"instruction addresses were parsed from it -- unrecognized "
+                  f"disassembly layout. Refusing to write an empty coverable "
+                  f"inventory, which would make every report read 100%.",
+                  file=sys.stderr)
+        else:
+            print(f"error: {args.elf}: {objdump} disassembled no executable "
+                  f"code at all", file=sys.stderr)
+        return 1
 
     # (file, line, function) -> representative address. A line is coverable if
     # ANY executable address maps to it.

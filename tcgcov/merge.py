@@ -117,12 +117,23 @@ def run(args):
     func_line = defaultdict(dict)
     func_hits = defaultdict(dict)     # sf -> {name: summed count}
     branch_data = defaultdict(dict)   # sf -> {(line,block,branch): taken|None}
+    parsed = 0
     for p in paths:
         try:
             parse_info(p, coverable, line_hits, func_line, func_hits,
                        branch_data)
         except OSError as e:
             print(f"warning: skipping {p}: {e}", file=sys.stderr)
+        else:
+            parsed += 1
+
+    if not parsed:
+        # Skipping every input used to leave an empty aggregate and exit 0,
+        # i.e. a CI-green "0.0% of 0 lines". No input read is a hard error.
+        print(f"error: none of the {len(paths)} input file(s) could be read; "
+              f"refusing to write an empty aggregate to {args.out}",
+              file=sys.stderr)
+        return 1
 
     total_lf = total_lh = total_brf = total_brh = 0
     with open(args.out, "w") as out:

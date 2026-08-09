@@ -1,0 +1,9 @@
+
+q.o:	file format elf64-littleriscv
+
+Disassembly of section .text:
+
+0000000000000000 <f>:
+       0: 00652513     	slti	a0, a0, 0x6
+       4: 0505         	addi	a0, a0, 0x1
+       6: 8082         	ret

@@ -158,12 +158,21 @@ def _normalize_uncached(raw, source_root, markers, roots, excludes, all_paths):
 
 
 def _strip_marker(real, markers):
-    """Return `real` kept from the first matching marker on, or None."""
+    """Return `real` kept from the first matching marker on, or None.
+
+    Both spellings of a marker mean the same thing and must give the same
+    answer: '--keep /cpukit/' and '--keep cpukit/' both turn
+    '/w/rtems/cpukit/score/x.c' into 'cpukit/score/x.c'. Only the leading-slash
+    spelling has a separator to skip past -- dropping a character
+    unconditionally turned the other one into 'pukit/score/x.c'.
+    """
     slashed = real if real.startswith("/") else "/" + real
     for marker in markers:
         idx = slashed.find(marker)
         if idx != -1:
-            return slashed[idx + 1:]
+            if marker.startswith("/"):
+                idx += 1        # keep from AFTER the separator
+            return slashed[idx:]
     return None
 
 

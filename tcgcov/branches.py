@@ -164,7 +164,13 @@ def run(args):
               file=sys.stderr)
         return 2
 
-    graph = cfg.analyze(text, profile)
+    try:
+        graph = cfg.analyze(text, profile)
+    except cfg.DisassemblyParseError as e:
+        # An empty branch inventory and exit 0 would read downstream as "this
+        # binary has no branches", i.e. a wrong number reported as success.
+        print(f"error: {args.disasm or args.elf}: {e}", file=sys.stderr)
+        return 1
     counts, stats = cfg.match_edges(graph, edges)
 
     locations = {}

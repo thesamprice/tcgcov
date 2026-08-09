@@ -30,9 +30,9 @@ architectures (MicroBlaze, MIPS, SPARC) the branch is not the last instruction
 of the block, so recording the last instruction is the only way the host side
 can tell which block the transfer left from.
 
-Older artifacts used a 56-byte header with no edge fields; the reader accepts
-both (the header_size field selects the layout), so existing .cov files keep
-working.
+Every file whose magic is "TCGCOV1\\0" has an 88-byte header containing the edge
+fields (FORMAT.md section 7): the magic changed in the same release that added
+them, so a short header is a corrupt file, not an old one.
 """
 
 import json
@@ -41,8 +41,11 @@ import struct
 MAGIC = b"TCGCOV1\0"
 HEADER_FMT = "<8sHHIIIQQQQQQQQ"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)          # 88
-HEADER_FMT_V1 = "<8sHHIIIQQQQQ"                    # pre-edges layout
-HEADER_SIZE_V1 = struct.calcsize(HEADER_FMT_V1)    # 56
+
+# Address-record and edge-record strides, selected by the flags. records_size
+# and edges_size must be whole multiples of these.
+REC_STRIDE = {False: 8, True: 16}
+EDGE_STRIDE = {False: 16, True: 24}
 
 FLAG_HAS_COUNTS = 0x1
 FLAG_HAS_EDGES = 0x2
@@ -58,29 +61,82 @@ HEADER_FIELDS = (
 
 
 def parse_header(data, path="<data>"):
-    """Return the header as a dict, accepting the 56- and 88-byte layouts.
+    """Return the validated header as a dict, or raise ValueError.
 
-    The short (pre-edges) layout is reported with zeroed edge fields, so callers
-    can treat every artifact uniformly.
+    Everything the format guarantees is checked HERE, up front, because the
+    only alternative is a struct.error thrown from somewhere deep in the
+    unpackers -- and struct.error is not a ValueError, so it escapes the
+    (OSError, ValueError) handlers every caller uses and surfaces as an
+    uncaught traceback. Checked, in FORMAT.md section 7 order:
+
+      * magic, endian (1 or 2), version (1), header_size (>= 88);
+      * every (offset, size) section lies inside the file and after the header;
+      * records_size / edges_size are whole multiples of their record stride.
+
+    After this returns, the unpackers below cannot read out of bounds.
     """
-    if len(data) < HEADER_SIZE_V1 or data[:8] != MAGIC:
-        raise ValueError(f"{path}: not an TCGCOV1 file")
-    # header_size is the uint32 at offset 12; it selects the layout.
-    declared = struct.unpack_from("<I", data, 12)[0]
-    if declared >= HEADER_SIZE and len(data) >= HEADER_SIZE:
-        values = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
-    else:
-        values = struct.unpack(HEADER_FMT_V1, data[:HEADER_SIZE_V1]) + (0, 0, 0)
-    return dict(zip(HEADER_FIELDS, values))
+    if len(data) < 8 or data[:8] != MAGIC:
+        raise ValueError(f"{path}: not a TCGCOV1 file (bad magic)")
+    if len(data) < HEADER_SIZE:
+        raise ValueError(f"{path}: truncated TCGCOV1 header: {len(data)} "
+                         f"bytes, need {HEADER_SIZE}")
+
+    version, endian = struct.unpack_from("<HH", data, 8)
+    if endian == 2:
+        raise ValueError(f"{path}: big-endian artifacts are not supported by "
+                         f"this reader (endian=2); every field would have to "
+                         f"be byte-swapped and the writer only emits endian=1")
+    if endian != 1:
+        raise ValueError(f"{path}: bad endian field {endian} "
+                         f"(expected 1=little or 2=big)")
+    if version != 1:
+        raise ValueError(f"{path}: unsupported format version {version} "
+                         f"(this reader knows version 1)")
+
+    hdr = dict(zip(HEADER_FIELDS, struct.unpack(HEADER_FMT,
+                                                data[:HEADER_SIZE])))
+    declared = hdr["header_size"]
+    if declared < HEADER_SIZE:
+        raise ValueError(f"{path}: header_size {declared} is smaller than the "
+                         f"{HEADER_SIZE}-byte TCGCOV1 header")
+
+    size = len(data)
+    for name in ("metadata", "records", "edges"):
+        off, sz = hdr[name + "_offset"], hdr[name + "_size"]
+        if not sz:
+            continue                       # absent section; offset is unused
+        if off < declared:
+            raise ValueError(f"{path}: {name}_offset {off} overlaps the "
+                             f"{declared}-byte header")
+        if off > size or sz > size - off:
+            raise ValueError(f"{path}: {name} section [{off}, {off + sz}) "
+                             f"runs past the end of the {size}-byte file")
+
+    flags = hdr["flags"]
+    stride = REC_STRIDE[bool(flags & FLAG_HAS_COUNTS)]
+    if hdr["records_size"] % stride:
+        raise ValueError(f"{path}: records_size {hdr['records_size']} is not "
+                         f"a multiple of the {stride}-byte record stride")
+    if flags & FLAG_HAS_EDGES:
+        stride = EDGE_STRIDE[bool(flags & FLAG_EDGE_COUNTS)]
+        if hdr["edges_size"] % stride:
+            raise ValueError(f"{path}: edges_size {hdr['edges_size']} is not "
+                             f"a multiple of the {stride}-byte edge stride")
+    return hdr
 
 
 def unpack_records(data, off, size, has_counts):
-    """Decode the address record array -> ([addr], {addr: count} or None)."""
+    """Decode the address record array -> ([addr], {addr: count} or None).
+
+    Safe to call only on a header parse_header() has already validated: the
+    bounds and stride checks there are what keep struct.unpack_from from
+    raising struct.error, which no caller catches.
+    """
     if has_counts:
-        n = size // 16
+        n = size // REC_STRIDE[True]
         flat = struct.unpack_from("<%dQ" % (2 * n), data, off) if n else ()
         return list(flat[0::2]), dict(zip(flat[0::2], flat[1::2]))
-    n = size // 8
+    n = size // REC_STRIDE[False]
     addrs = list(struct.unpack_from("<%dQ" % n, data, off)) if n else []
     return addrs, None
 
@@ -91,8 +147,7 @@ def unpack_edges(data, off, size, has_counts):
     Without EDGE_COUNTS the plugin only records that an edge was taken; count is
     reported as 1 so callers do not have to special-case the two modes.
     """
-    stride = 24 if has_counts else 16
-    n = size // stride
+    n = size // EDGE_STRIDE[bool(has_counts)]
     if not n:
         return []
     words = 3 if has_counts else 2

@@ -138,10 +138,17 @@ def run(args):
     all_files = set(cab_lines) | set(cov_lines) | set(branches)
 
     total_lf = total_lh = total_brf = total_brh = 0
+    # Lines the coverable inventory contributes that are not already covered.
+    # The union below has no floor: with an empty/mismatched --coverable file
+    # every covered line becomes its own denominator and the report reads
+    # 100.0%. Counting the surplus is what makes that detectable.
+    coverable_surplus = 0
     with open(args.out, "w") as out:
         for sf in sorted(all_files):
             covered = cov_lines.get(sf, set())
-            coverable = cab_lines.get(sf, set()) | covered  # never lose a hit
+            declared = cab_lines.get(sf, set())
+            coverable = declared | covered  # never lose a hit
+            coverable_surplus += len(declared - covered)
             # Functions: union; declaration line preferred from coverable.
             funcs = dict(cab_funcs.get(sf, {}))
             for fn, ln in cov_funcs.get(sf, {}).items():
@@ -178,6 +185,15 @@ def run(args):
             out.write("end_of_record\n")
             total_lf += len(coverable)
             total_lh += len(covered)
+
+    if args.coverable and not coverable_surplus:
+        print(f"warning: {args.coverable} adds no lines beyond the covered "
+              f"set, so the denominator is missing and every percentage below "
+              f"is 100% by construction. Either the coverable inventory is "
+              f"empty/was produced for a different binary, or (implausibly) "
+              f"every coverable line really was executed. Re-run "
+              f"`tcgcov coverable` and check it is non-empty.",
+              file=sys.stderr)
 
     pct = (100.0 * total_lh / total_lf) if total_lf else 0.0
     summary = (f"{args.jsonl}: {len(all_files)} files, "

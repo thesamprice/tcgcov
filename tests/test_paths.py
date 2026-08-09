@@ -129,6 +129,24 @@ class TestMarkers(unittest.TestCase):
         o = opts(keep=["/b/", "/a/"])
         self.assertEqual(norm("/root/a/b/c.c", o), "b/c.c")
 
+    def test_marker_without_a_leading_slash(self):
+        """'--keep cpukit/' must mean the same as '--keep /cpukit/'.
+
+        Only the slashed spelling has a separator to skip past; skipping one
+        character unconditionally turned the bare spelling into 'pukit/...',
+        which then silently fails to merge with anything.
+        """
+        self.assertEqual(
+            norm("/work/navcube/src/app.c", opts(keep=["navcube/"])),
+            "navcube/src/app.c")
+
+    def test_both_marker_spellings_agree(self):
+        for path in ("/work/navcube/src/app.c", "/navcube/src/app.c",
+                     "/a/b/navcube/deep/x.c"):
+            with self.subTest(path=path):
+                self.assertEqual(norm(path, opts(keep=["/navcube/"])),
+                                 norm(path, opts(keep=["navcube/"])))
+
     def test_unmatched_path_dropped_when_markers_given(self):
         self.assertIsNone(
             norm("/opt/toolchain/newlib/libc/foo.c", opts(keep=["/navcube/"])))

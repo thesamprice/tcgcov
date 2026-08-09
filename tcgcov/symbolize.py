@@ -15,10 +15,16 @@ def run_addr2line(addr2line, elf, addrs):
     queried address (0x...) as a group delimiter; -i emits inlined frames
     (innermost first). '??'/missing frames are passed through for the caller
     to filter.
+
+    Decoding is pinned to UTF-8 with surrogateescape instead of the locale
+    encoding: source paths and demangled symbol names are arbitrary bytes, and
+    under LC_ALL=C (the default in most containers) `text=True` decodes as
+    ASCII, so one non-ASCII byte would abort symbolization entirely.
     """
     cmd = [addr2line, "-a", "-f", "-C", "-i", "-e", elf]
     stdin = "".join("0x%x\n" % a for a in addrs)
-    proc = subprocess.run(cmd, input=stdin, capture_output=True, text=True)
+    proc = subprocess.run(cmd, input=stdin, capture_output=True,
+                          encoding="utf-8", errors="surrogateescape")
     if proc.returncode != 0:
         raise RuntimeError(f"{addr2line} failed: {proc.stderr.strip()}")
 
