@@ -466,6 +466,22 @@ procedure for telling whether your profile is actually right.
 
 ---
 
+## Documentation
+
+| Document | What it is |
+|---|---|
+| [`docs/FORMAT.md`](docs/FORMAT.md) | The `TCGCOV1` on-disk format: byte-exact header, record layouts, flag semantics, metadata schema, and a worked hexdump. Enough to write an independent reader. |
+| [`docs/ARCHITECTURES.md`](docs/ARCHITECTURES.md) | **Read this before bringing tcgcov up on a new processor.** Per-profile status with the evidence behind each, known gaps per ISA, a porting checklist where every item is a bug this project shipped, and the `--arch-profile` schema. |
+| [`examples/branch-coverage/`](examples/branch-coverage/) | A worked example whose four conditionals have hand-checkable outcomes, so you can verify a report rather than just read it. Explains the `-` vs `0` BRDA distinction and why machine-level "taken" is not source-level "the `if` was true". |
+| [`docs/QEMU-CROSSCHECK.md`](docs/QEMU-CROSSCHECK.md) | The architecture profiles checked against QEMU's own target translators — a second, independent authority on what transfers control. Found ARM defects the binutils opcode tables did not. |
+| [`docs/QEMU-BLOCK-SCANNING.md`](docs/QEMU-BLOCK-SCANNING.md) | **Design proposal, not implemented.** How QEMU could be taught to decode without executing, so the code inventory came from its decoders instead of from per-architecture regexes. |
+| [`docs/DYNAMIC-OBJECTS.md`](docs/DYNAMIC-OBJECTS.md) | **Design proposal, not implemented.** Coverage of `dlopen`'d objects, and why the debugger handshake RTEMS already ships is inert. |
+
+The two proposals are marked as such at the top of each file. Everything else
+describes shipped behaviour.
+
+---
+
 ## Limitations
 
 Read these before trusting a number.
