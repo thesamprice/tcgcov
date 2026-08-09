@@ -77,6 +77,7 @@ done
 SRC_OPT=()
 [[ -n "$SOURCE_ROOT" ]] && SRC_OPT=(--source-root "$SOURCE_ROOT")
 PREFIX_OPT=(--toolchain-prefix "$PREFIX")
+OBJDUMP="${PREFIX}objdump"
 
 # Path-selection options passed through to every producer, so the covered and
 # coverable sides derive identical keys. They must agree or the merge is wrong.
@@ -110,12 +111,41 @@ AGG="$OUT_DIR/lcov/aggregate-$ARCH.info"
 HTML_DIR="$OUT_DIR/html"
 mkdir -p "$SYM_DIR" "$CAB_DIR" "$PT_DIR" "$HTML_DIR"
 
-for cov in "${covs[@]}"; do
+DIS_DIR="$OUT_DIR/disasm"
+mkdir -p "$DIS_DIR" "$OUT_DIR/branches"
+
+# Cache keys must include the path options: the coverable inventory is keyed by
+# NORMALIZED source path, so the same ELF analysed with a different
+# --source-root/--keep/--exclude yields a different, incompatible denominator.
+# Keying on the ELF path alone silently reused the wrong one across runs.
+opt_sig="$(printf '%s\0' "$ARCH" ${PATH_OPTS[@]+"${PATH_OPTS[@]}"} \
+           | cksum | cut -d' ' -f1)"
+
+# One artifact at a time was the whole pipeline's wall clock, and the per-.cov
+# work is independent. Default to the CPU count; JOBS=1 restores serial order.
+if [[ -z "${JOBS:-}" ]]; then
+  JOBS="$( { nproc || sysctl -n hw.ncpu; } 2>/dev/null || echo 4)"
+fi
+
+process_one() {  # process_one <cov>
+  local cov="$1" base elf safe dis cab br br_rc
+  local -a BR_OPT=()
   base="$(basename "$cov" .cov)"
   elf="$(read_meta "$cov" elf)"
   if [[ ! -f "$elf" ]]; then
     echo "WARNING: ELF not found for $base ($elf); skipping" >&2
-    continue
+    return 0
+  fi
+  safe="${elf//\//_}"; safe="${safe//./_}"
+  dis="$DIS_DIR/$safe.txt"
+  cab="$CAB_DIR/$safe.$opt_sig.jsonl"
+
+  # Disassemble each ELF ONCE. Both the coverable inventory and the branch
+  # inventory parse the same `objdump -d` output; running it twice per artifact
+  # was pure duplicated work, and doubly so across a suite that links the same
+  # ELF into many tests.
+  if [[ ! -s "$dis" ]]; then
+    "${OBJDUMP}" -d "$elf" > "$dis.$base.tmp" && mv "$dis.$base.tmp" "$dis"
   fi
 
   # Covered lines: what actually ran.
@@ -124,21 +154,17 @@ for cov in "${covs[@]}"; do
     --out "$SYM_DIR/$base.jsonl"
 
   # Coverable lines: the denominator. Test-agnostic, so cache it per ELF.
-  safe="${elf//\//_}"; safe="${safe//./_}"
-  cab="$CAB_DIR/$safe.jsonl"
   if [[ ! -s "$cab" ]]; then
-    "${TCGCOV[@]}" coverable --elf "$elf" \
+    "${TCGCOV[@]}" coverable --elf "$elf" --disasm "$dis" \
       "${PREFIX_OPT[@]}" ${PATH_OPTS[@]+"${PATH_OPTS[@]}"} --arch "$ARCH" \
-      --out "$cab"
+      --out "$cab.$base.tmp" && mv "$cab.$base.tmp" "$cab"
   fi
 
-  # Branch outcomes, when the plugin recorded edges (edges=1).
-  BR_OPT=()
+  # Branch outcomes, when the plugin recorded edges (edges=on).
   if [[ "$BRANCHES" == 1 ]]; then
     br="$OUT_DIR/branches/$base.jsonl"
-    mkdir -p "$OUT_DIR/branches"
     set +e
-    "${TCGCOV[@]}" branches --cov "$cov" --elf "$elf" \
+    "${TCGCOV[@]}" branches --cov "$cov" --elf "$elf" --disasm "$dis" \
       "${PREFIX_OPT[@]}" ${PATH_OPTS[@]+"${PATH_OPTS[@]}"} --arch "$ARCH" \
       --out "$br" 2>"$br.log"
     br_rc=$?
@@ -155,13 +181,49 @@ for cov in "${covs[@]}"; do
     else
       echo "error: branch analysis failed for $base (rc=$br_rc):" >&2
       sed 's/^/  /' "$br.log" >&2
-      exit 1
+      return 1
     fi
   fi
 
   "${TCGCOV[@]}" lcov "$SYM_DIR/$base.jsonl" \
     --coverable "$cab" ${BR_OPT[@]+"${BR_OPT[@]}"} --out "$PT_DIR/$base.info"
+}
+
+# Warm the per-ELF caches serially first. Running cold in parallel would have N
+# jobs disassemble and symbolize the SAME ELF concurrently -- duplicated work,
+# and a torn cache file without the atomic rename above.
+declare -a warmed=()
+for cov in "${covs[@]}"; do
+  elf="$(read_meta "$cov" elf)"
+  [[ -f "$elf" ]] || continue
+  case " ${warmed[*]-} " in *" $elf "*) continue ;; esac
+  warmed+=("$elf")
+  safe="${elf//\//_}"; safe="${safe//./_}"
+  [[ -s "$DIS_DIR/$safe.txt" ]] || \
+    { "${OBJDUMP}" -d "$elf" > "$DIS_DIR/$safe.txt.tmp" && \
+      mv "$DIS_DIR/$safe.txt.tmp" "$DIS_DIR/$safe.txt"; }
 done
+
+have_wait_n=0
+if [[ ${BASH_VERSINFO[0]:-0} -gt 4 ]] || \
+   { [[ ${BASH_VERSINFO[0]:-0} -eq 4 ]] && [[ ${BASH_VERSINFO[1]:-0} -ge 3 ]]; }; then
+  have_wait_n=1
+fi
+if [[ "$JOBS" -gt 1 && ${#covs[@]} -gt 1 && $have_wait_n -eq 1 ]]; then
+  echo "processing ${#covs[@]} artifacts with $JOBS parallel jobs" >&2
+  pids=()
+  for cov in "${covs[@]}"; do
+    while [[ "$(jobs -rp | wc -l)" -ge "$JOBS" ]]; do wait -n 2>/dev/null || break; done
+    process_one "$cov" & pids+=($!)
+  done
+  rc=0
+  for p in "${pids[@]}"; do wait "$p" || rc=1; done
+  [[ $rc -eq 0 ]] || { echo "error: one or more artifacts failed" >&2; exit 1; }
+else
+  [[ "$JOBS" -gt 1 && $have_wait_n -eq 0 ]] && \
+    echo "note: bash ${BASH_VERSION%%(*} lacks 'wait -n'; running serially" >&2
+  for cov in "${covs[@]}"; do process_one "$cov"; done
+fi
 
 "${TCGCOV[@]}" merge "$PT_DIR"/*.info --name "$ARCH" --out "$AGG"
 

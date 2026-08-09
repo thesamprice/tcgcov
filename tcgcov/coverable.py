@@ -57,6 +57,12 @@ def add_arguments(parser):
     parser.add_argument("--elf", required=True, help="ELF to inventory")
     add_symbolize_args(parser)
     parser.add_argument("--objdump", help="explicit objdump path")
+    parser.add_argument("--disasm", metavar="FILE",
+                        help="read pre-captured `objdump -d` output from FILE "
+                             "instead of running objdump. The branch inventory "
+                             "needs the same disassembly, so capturing it once "
+                             "per ELF and passing it to both halves avoids "
+                             "disassembling every binary twice.")
     parser.add_argument("--out", required=True, help="output coverable .jsonl")
 
 
@@ -65,7 +71,13 @@ def run(args):
     addr2line = args.addr2line or (args.toolchain_prefix + "addr2line")
 
     try:
-        addrs, text = disassemble_addresses(objdump, args.elf)
+        if args.disasm:
+            with open(args.disasm, encoding="utf-8",
+                      errors="surrogateescape") as f:
+                text = f.read()
+            addrs = parse_addresses(text)
+        else:
+            addrs, text = disassemble_addresses(objdump, args.elf)
     except (OSError, RuntimeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -74,15 +86,16 @@ def run(args):
         # An empty coverable inventory is not a benign result: `lcov` then uses
         # the covered lines as their own denominator and reports 100%. Fail
         # loudly instead, and distinguish the two ways of getting here.
+        source = args.disasm or objdump
         if text.strip():
-            print(f"error: {args.elf}: {objdump} produced "
+            print(f"error: {args.elf}: {source} produced "
                   f"{len(text.splitlines())} lines of output but no "
                   f"instruction addresses were parsed from it -- unrecognized "
                   f"disassembly layout. Refusing to write an empty coverable "
                   f"inventory, which would make every report read 100%.",
                   file=sys.stderr)
         else:
-            print(f"error: {args.elf}: {objdump} disassembled no executable "
+            print(f"error: {args.elf}: {source} disassembled no executable "
                   f"code at all", file=sys.stderr)
         return 1
 
