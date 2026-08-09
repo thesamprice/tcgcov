@@ -262,6 +262,31 @@ tcgcov coverable --elf image.elf \
 This inventory depends only on the ELF, not on the run, so the driver caches it
 per binary.
 
+**Two sources, selected with `--denominator`.** Disassembly is the most fragile
+part of the tool — a layout the parser does not recognise yields *nothing*, and
+an empty denominator makes every report read 100%. So there is a second,
+architecture-independent source:
+
+| `--denominator` | Source | Notes |
+|---|---|---|
+| `objdump` | `objdump -d` + `addr2line` | The conservative definition above. Identical mechanism to the covered side, so the keys match by construction. |
+| `dwarf` | `.debug_line`, read directly | No objdump, no addr2line, no architecture knowledge. Slightly broader: a line-table row is not proof an instruction was emitted, and it does not see the inlined call sites `addr2line -i` reports. |
+| `auto` *(default)* | objdump, falling back to DWARF | An unrecognised disassembly degrades to a correct, slightly broader denominator instead of no coverage at all. |
+
+The DWARF reader is pure standard library (`tcgcov/dwarfline.py`) and handles
+DWARF 2–5, both endiannesses, ELF32/64, the 64-bit DWARF format and compressed
+debug sections. It is checked row-for-row against `readelf --debug-dump=decodedline`.
+
+Whenever the objdump source is used the DWARF rows are computed anyway and the
+two are compared; a large one-sided difference means one of the parsers is
+producing garbage. That check warns, never fails, and `--no-cross-check` turns
+it off.
+
+> Both sources run every path through the *same* normalizer, because the
+> covered side resolves addresses through `addr2line`: if the two disagreed
+> about a path, `covered ⊆ coverable` would quietly stop holding. On the
+> reference binary they produce a byte-identical `.info`.
+
 ### `lcov` and `merge`
 
 `lcov` emits `DA:line,1` for hit lines and `DA:line,0` for coverable-but-not-hit

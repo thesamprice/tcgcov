@@ -1,5 +1,11 @@
-"""Shared argparse options used by the symbolize (addr2line) and coverable
-(dwarf_lines) subcommands."""
+"""Shared argparse options used by the symbolize and coverable subcommands.
+
+Both sides of the coverage fraction must be normalized identically or the
+merge is wrong, so the path options live here once rather than being spelled
+out per subcommand. This holds however the coverable denominator was produced
+-- objdump + addr2line, or the DWARF line table directly (see
+`coverable --denominator`): both run their paths through this same bundle.
+"""
 
 from .paths import PRESETS
 

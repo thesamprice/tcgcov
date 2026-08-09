@@ -237,8 +237,14 @@ class TestCoverableRefusesEmptyInventory(unittest.TestCase):
     def _run(self, output):
         d, objdump = self._objdump(output)
         out = os.path.join(d, "coverable.jsonl")
+        # --denominator objdump is load-bearing here. Under the default `auto`
+        # this would fall back to DWARF and then fail on the nonexistent fake
+        # ELF instead -- still non-zero, but for the wrong reason, so the test
+        # would pass while no longer testing that an unparsable disassembly is
+        # refused. The `auto` fallback has its own tests in test_dwarfline.py.
         rc = coverable.main(["--elf", os.path.join(d, "a.elf"),
                              "--objdump", objdump, "--all-paths",
+                             "--denominator", "objdump",
                              "--out", out])
         return rc, out
 
