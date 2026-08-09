@@ -11,7 +11,16 @@ Each table below is a list of
 
     (instruction text, expected kind, expected delay-slot flag)
 
-with the mnemonics taken from the binutils opcode tables -- the same tables
+and each has a companion INDIRECT_<ARCH> list naming the rows whose transfer
+target comes from a REGISTER. The two are cross-checked in both directions
+(TestIndirectTransfers): every row not named must classify as NOT indirect, and
+every name must appear in the ISA table so it is kind-pinned as well. That
+second direction is the one that matters most -- `indirect` EXCLUDES an
+instruction from branch coverage, so a pattern greedy enough to swallow the
+direct branches deletes them from the denominator, which is a worse failure than
+the missing patterns it was written to fix.
+
+The mnemonics are taken from the binutils opcode tables -- the same tables
 `objdump` itself dispatches on, so "what objdump prints" and "what we classify"
 have a single shared source of truth:
 
@@ -104,6 +113,18 @@ MICROBLAZE = [
     ("mbar 1", OTHER, False),
 ]
 
+# Register-target forms: the operand is a register number, so "beq r3, r4"
+# branches to whatever r4 holds and the trailing 4 is not a displacement.
+# 'brk' belongs here too (microblaze-opc.h groups it with the register forms);
+# its immediate twin 'brki' does not.
+INDIRECT_MICROBLAZE = [
+    "br r5", "brd r5", "brld r15, r5", "bra r5", "brad r5", "brald r15, r5",
+    "brk r5, r6",
+    "beq r3, r4", "beqd r3, r4", "bne r3, r4", "bned r3, r4",
+    "blt r3, r4", "bltd r3, r4", "ble r3, r4", "bled r3, r4",
+    "bgt r3, r4", "bgtd r3, r4", "bge r3, r4", "bged r3, r4",
+]
+
 
 # --- ARM A32/T32 ------------------------------------------------------------
 # Condition suffixes from arm-dis.c:4919; the v8.1-M low-overhead-loop and
@@ -166,6 +187,16 @@ ARM = [
     ("ldr r0, [r1]", OTHER, False),
 ]
 
+# 'blx' splits on the first operand character: objdump prints a register for the
+# indirect form and a digit for the direct one, which is why "blx 8010 <x>" is
+# absent here and "blx r3" is present.
+INDIRECT_ARM = [
+    "blx r3", "blxeq r3",
+    "tbb [r0, r1]", "tbh [r0, r1, lsl #1]",
+    "bx lr", "bx r3",
+    "mov pc, lr", "mov pc, r3", "ldr pc, [sp], #4",
+]
+
 
 # --- AArch64 ----------------------------------------------------------------
 AARCH64 = [
@@ -187,20 +218,39 @@ AARCH64 = [
     ("cbblt w0, w1, 4008b0 <x>", COND, False),
     ("cbhge w0, w1, 4008b0 <x>", COND, False),
     ("bl 4008b0 <x>", CALL, False),
-    ("blr x8", CALL, False),
-    ("blraa x8, x9", CALL, False),         # PAuth
-    ("blrab x8, x9", CALL, False),
-    ("blraaz x8", CALL, False),
-    ("br x8", UNCOND, False),
-    ("braa x8, x9", UNCOND, False),
-    ("brabz x8", UNCOND, False),
-    ("ret", RET, False),
+    # The complete iclass branch_reg block, aarch64-tbl.h:4413-4430.
+    ("blr x8", CALL, False),               # :4415, OP1 (Rn)
+    ("blraa x8, x9", CALL, False),         # :4421, OP2 (Rn, Rd_SP)
+    ("blrab x8, x9", CALL, False),         # :4422
+    ("blraaz x8", CALL, False),            # :4425, OP1 (Rn)
+    ("blrabz x8", CALL, False),            # :4426
+    ("br x8", UNCOND, False),              # :4414
+    ("braa x8, x9", UNCOND, False),        # :4419
+    ("brab x8, sp", UNCOND, False),        # :4420, Rd_SP prints 'sp' for r31
+    ("braaz x8", UNCOND, False),           # :4423
+    ("brabz x8", UNCOND, False),           # :4424
+    # ret's operand is optional and defaults to x30 (F_OPD0_OPT|F_DEFAULT(30),
+    # suppressed at aarch64-opc.c:4096-4099), so both spellings occur; retaa
+    # and retab take OP0 and never print one (aarch64-tbl.h:4427-4428).
+    ("ret", RET, False),                   # :4416
+    ("ret x8", RET, False),
     ("retaa", RET, False),
     ("retab", RET, False),
-    ("eret", RET, False),
-    ("eretaa", RET, False),
+    ("eret", RET, False),                  # :4417
+    ("eretaa", RET, False),                # :4429
+    ("drps", OTHER, False),                # :4418, not modeled as a transfer
     ("mov w8, #0x1", OTHER, False),
     ("ldr x0, [x1]", OTHER, False),
+]
+
+# The ten branch_reg entries that print a register operand AND classify UNCOND
+# or CALL -- i.e. the ones whose operands _parse_target would otherwise read.
+# ret/retaa/retab/eret* stay out: they classify RET, which is never
+# target-parsed, and the `ret` pattern is tried first so nothing is
+# double-counted.
+INDIRECT_AARCH64 = [
+    "br x8", "braa x8, x9", "brab x8, sp", "braaz x8", "brabz x8",
+    "blr x8", "blraa x8, x9", "blrab x8, x9", "blraaz x8", "blrabz x8",
 ]
 
 
@@ -247,6 +297,13 @@ X86 = [
     ("cmpl $0x0,-0x4(%rbp)", OTHER, False),
 ]
 
+# AT&T marks every indirect transfer with a leading '*'; nothing else is needed.
+# 'jmpabs $0x401000' (i386-dis.c:14640) deliberately has no '*': it is a DIRECT
+# absolute jump, so it must not land here.
+INDIRECT_X86 = [
+    "jmp *%rax", "notrack jmp *%rax", "call *%rax", "lcall *0x10(%rax)",
+]
+
 
 # --- MIPS -------------------------------------------------------------------
 # Delay-slot column is the opcode table's CBD/UBD/CBL flag (mips-opc.c:223-228):
@@ -255,12 +312,30 @@ X86 = [
 MIPS = [
     ("b 400 <x>", UNCOND, True),
     ("bc 400 <x>", UNCOND, False),         # r6 compact, NODS
-    ("j 400 <x>", UNCOND, True),
-    ("jr $t0", UNCOND, True),
-    ("jr $ra", RET, True),
-    ("jal 400 <x>", CALL, True),
-    ("jalr $t0", CALL, True),
+    ("j 400 <x>", UNCOND, True),           # mips-opc.c:1230, "a"
+    ("jal 400 <x>", CALL, True),           # mips-opc.c:1245, "a"
+    ("jalx 400 <x>", CALL, True),          # mips-opc.c:1246, "+i"
     ("balc 400 <x>", CALL, False),
+    # Register jumps. objdump indexes a NAME table (mips-dis.c:1211, tables at
+    # mips-dis.c:61,69), so the default spelling has NO '$'; the '$' forms only
+    # appear under -M gpr-names=numeric ("$8") but are accepted so llvm-objdump
+    # and hand-written listings work too. Both spellings must agree.
+    ("jr $t0", UNCOND, True),
+    ("jr t0", UNCOND, True),               # mips-opc.c:1216, "s"
+    ("jr $ra", RET, True),
+    ("jr ra", RET, True),                  # the return idiom, not a jump
+    ("jr.hb t0", UNCOND, True),            # mips-opc.c:1221
+    ("jalr $t0", CALL, True),
+    ("jalr v1", CALL, True),               # mips-opc.c:1231, "s"
+    ("jalr a0,v1", CALL, True),            # mips-opc.c:1232, "d,s"
+    ("jalr.hb a0,v1", CALL, True),         # mips-opc.c:1236
+    # r6 compact jumps: NODS, so no delay slot. 'jic' is an unconditional
+    # transfer and must end its block (mips-opc.c:3257).
+    ("jrc at", UNCOND, False),             # mips-opc.c:3256, "t"
+    ("jalrc t0", CALL, False),             # mips-opc.c:3260, "t"
+    ("jic v1,-32768", UNCOND, False),      # mips-opc.c:3257, "t,j"
+    ("jic ra,0", RET, False),              # ...through $ra it is a return
+    ("jialc v1,32767", CALL, False),       # mips-opc.c:3261, "t,j"
     ("beq $a0, $a1, 400 <x>", COND, True),
     ("bne $a0, $a1, 400 <x>", COND, True),
     ("beqz $a0, 400 <x>", COND, True),
@@ -297,6 +372,18 @@ MIPS = [
     ("bbit132 $a0, 3, 400 <x>", COND, True),
     ("addiu $sp, $sp, -32", OTHER, False),
     ("lw $a0, 0($sp)", OTHER, False),
+]
+
+# Every jr/jalr/jic/jialc form, in both register spellings. 'jr ra' and
+# 'jic ra,0' are here even though they classify RET: the `ret` pattern is tried
+# first so the RETURN classification still wins, but the target of a return
+# through $ra is a register all the same. j/jal/jalx/bc/balc are PC-relative
+# and must stay out -- swallowing them would delete every MIPS jump target.
+INDIRECT_MIPS = [
+    "jr $t0", "jr t0", "jr $ra", "jr ra", "jr.hb t0",
+    "jalr $t0", "jalr v1", "jalr a0,v1", "jalr.hb a0,v1",
+    "jrc at", "jalrc t0",
+    "jic v1,-32768", "jic ra,0", "jialc v1,32767",
 ]
 
 
@@ -357,11 +444,40 @@ SPARC = [
     ("brz %g1, 10024 <x>", COND, True),
     ("brnz %g1, 10024 <x>", COND, True),
     ("cwbne %g1, %g2, 10024 <x>", COND, False),  # CBcond: no delay slot
-    ("call 10024 <x>", CALL, True),
+    # jmpl and its two rename-by-destination spellings. The printer emits a
+    # space before EVERY operand character on top of the one after the mnemonic
+    # (sparc-dis.c:560-561,:591), so the real text has two spaces after the
+    # mnemonic and spaces around the '+'; immediates print %#x above 9 and %d
+    # below (sparc-dis.c:689-716). Both the real spacing and the compact
+    # spelling other disassemblers use are pinned.
+    ("jmpl  %g1 + 0x10, %o2", UNCOND, True),     # sparc-opc.c:831, "1+i,d"
+    ("jmpl %g1+0x10, %o7", UNCOND, True),
     ("jmpl %o7+8, %g0", UNCOND, True),
+    ("jmp  %g2", UNCOND, True),                  # sparc-opc.c:1716, "1"
+    ("jmp  %g1 + 0x10", UNCOND, True),           # sparc-opc.c:1717, "1+i"
+    # rd == %g0 AND rs1 == %g0: the printed number really is the target, so
+    # this one must stay DIRECT (sparc-opc.c:1719, args "i").
+    ("jmp  0x10", UNCOND, True),
+    ("call 10024 <x>", CALL, True),              # sparc-opc.c:1290, "L"
+    ("call  1000 <foo-0x8>", CALL, True),
+    ("call  %o0", CALL, True),                   # sparc-opc.c:1295, "1"
+    ("call  %g1 + %g2", CALL, True),             # sparc-opc.c:1293, "1+2"
     ("retl", RET, True),
+    ("ret", RET, True),
+    ("rett  %i7 + 8", RET, True),                # sparc-opc.c:811-817
     ("return %i7+8", RET, False),
     ("add %g1, %g2, %g3", OTHER, False),
+]
+
+# The register-target spellings only. The split is on the FIRST operand
+# character, exactly as the ARM profile splits 'blx': '%' means the target came
+# from a register, a digit means the operand IS the address. That is what keeps
+# the PC-relative "call  1000 <foo-0x8>" and the %g0-relative "jmp  0x10" out,
+# both of which have a real, printed target.
+INDIRECT_SPARC = [
+    "jmpl  %g1 + 0x10, %o2", "jmpl %g1+0x10, %o7", "jmpl %o7+8, %g0",
+    "jmp  %g2", "jmp  %g1 + 0x10",
+    "call  %o0", "call  %g1 + %g2",
 ]
 
 
@@ -395,11 +511,44 @@ POWERPC = [
     # conditional returns: branch points with an implicit LR target
     ("blelr", COND, False),
     ("bdnzlr", COND, False),
-    ("blr", RET, False),
-    ("bctr", UNCOND, False),
-    ("bctrl", CALL, False),
+    ("blr", RET, False),                   # ppc-opc.c:6677
+    ("blrl", RET, False),                  # ppc-opc.c:6679
+    ("bclr", RET, False),                  # ppc-opc.c:6884
+    ("bctr", UNCOND, False),               # ppc-opc.c:6940
+    ("bctrl", CALL, False),                # ppc-opc.c:6941
+    ("btar", UNCOND, False),               # ppc-opc.c:7097, POWER8
+    # to-CTR / to-TAR conditionals. The CR and BH operands are optional and
+    # print only when non-default (ppc-dis.c:615-643), which is why the same
+    # mnemonic appears bare, with 'cr2', and with 'cr1,1'.
+    ("bltctr", COND, False),
+    ("bdnzctr", COND, False),
+    ("bnectr  cr2", COND, False),          # gas/testsuite/gas/ppc/476.d:44
+    ("bnectr  cr1,1", COND, False),        # gas/testsuite/gas/ppc/a2.d:61
+    ("blttar", COND, False),               # gas/testsuite/gas/ppc/bcat.d:58
+    ("bdnztar", COND, False),
+    ("bgetar-", COND, False),
+    ("bgetar+", COND, False),
+    ("bdnzftar lt", COND, False),          # raw-BI form, bcat.d:51
+    ("bttar", COND, False),
+    # -Mraw spellings: three operands, the last of which used to be read as a
+    # branch target (gas/testsuite/gas/ppc/raw.d:30-32).
+    ("bclr    20,lt,0", RET, False),
+    ("bcctr   6,lt,0", COND, False),
+    ("bctarl  4,so,0", CALL, False),
     ("addi 1, 1, -32", OTHER, False),
     ("stw 31, 28(1)", OTHER, False),
+]
+
+# Everything that branches to LR, CTR or TAR: the target is in a special
+# register and never printed, but the optional CR/BH operands are, and their
+# trailing small integers were being read as addresses. The direct branches --
+# including 'bl', 'bla', 'bltl' and 'ble', whose spellings come closest -- must
+# all stay out.
+INDIRECT_POWERPC = [
+    "blelr", "bdnzlr", "blr", "blrl", "bclr", "bctr", "bctrl", "btar",
+    "bltctr", "bdnzctr", "bnectr  cr2", "bnectr  cr1,1",
+    "blttar", "bdnztar", "bgetar-", "bgetar+", "bdnzftar lt", "bttar",
+    "bclr    20,lt,0", "bcctr   6,lt,0", "bctarl  4,so,0",
 ]
 
 
@@ -421,13 +570,21 @@ RISCV = [
     ("c.bnez a0, 100b0 <x>", COND, False),
     ("j 100b0 <x>", UNCOND, False),
     ("c.j 100b0 <x>", UNCOND, False),
-    ("jr a0", UNCOND, False),
-    ("c.jr a0", UNCOND, False),
     ("jal 100b0 <x>", CALL, False),
-    ("jalr a0", CALL, False),
-    ("c.jalr a0", CALL, False),
     ("call 100b0 <x>", CALL, False),
     ("tail 100b0 <x>", CALL, False),
+    # jr/jalr, in every shape riscv-opc.c gives them. The offset prints as a
+    # signed DECIMAL (riscv-dis.c:565-566), so the "16(a0)" spellings are what
+    # GNU objdump emits; llvm-objdump writes the same operand as 0x10.
+    ("jr a0", UNCOND, False),              # riscv-opc.c:487, "s"
+    ("jr 16(a0)", UNCOND, False),          # riscv-opc.c:488, "o(s)"
+    ("c.jr a0", UNCOND, False),            # riscv-opc.c:1193, -M no-aliases
+    ("jalr a0", CALL, False),              # riscv-opc.c:491, "s"
+    ("jalr 16(a0)", CALL, False),          # riscv-opc.c:492, "o(s)"
+    ("jalr 0x10(a0)", CALL, False),        # llvm-objdump spelling of the same
+    ("jalr a1,16(a0)", CALL, False),       # riscv-opc.c:495, "d,o(s)"
+    ("jalr a1,a0", CALL, False),           # riscv-opc.c:494, "d,s"
+    ("c.jalr a0", CALL, False),            # riscv-opc.c:1194, -M no-aliases
     ("ret", RET, False),
     ("c.ret", RET, False),
     ("addi sp, sp, -32", OTHER, False),
@@ -435,16 +592,24 @@ RISCV = [
     ("li a0, 0", OTHER, False),
 ]
 
+# jr/jalr are the only register-indirect transfers in riscv_opcodes[]; j/jal
+# (and the call/tail macros) are PC-relative and must stay out.
+INDIRECT_RISCV = [
+    "jr a0", "jr 16(a0)", "c.jr a0",
+    "jalr a0", "jalr 16(a0)", "jalr 0x10(a0)", "jalr a1,16(a0)", "jalr a1,a0",
+    "c.jalr a0",
+]
+
 
 TABLES = (
-    ("microblaze", MICROBLAZE),
-    ("arm", ARM),
-    ("aarch64", AARCH64),
-    ("x86_64", X86),
-    ("mips", MIPS),
-    ("sparc", SPARC),
-    ("powerpc", POWERPC),
-    ("riscv", RISCV),
+    ("microblaze", MICROBLAZE, INDIRECT_MICROBLAZE),
+    ("arm", ARM, INDIRECT_ARM),
+    ("aarch64", AARCH64, INDIRECT_AARCH64),
+    ("x86_64", X86, INDIRECT_X86),
+    ("mips", MIPS, INDIRECT_MIPS),
+    ("sparc", SPARC, INDIRECT_SPARC),
+    ("powerpc", POWERPC, INDIRECT_POWERPC),
+    ("riscv", RISCV, INDIRECT_RISCV),
 )
 
 
@@ -456,7 +621,7 @@ class TestClassificationTables(unittest.TestCase):
     """
 
     def test_kinds_and_delay_slots(self):
-        for arch, table in TABLES:
+        for arch, table, _ in TABLES:
             profile = cfg.get_profile(arch)
             self.assertTrue(profile.supported, arch)
             for text, kind, delay in table:
@@ -467,19 +632,66 @@ class TestClassificationTables(unittest.TestCase):
 
     def test_every_arch_table_is_substantial(self):
         """Guard against a table being gutted rather than fixed."""
-        for arch, table in TABLES:
+        for arch, table, _ in TABLES:
             with self.subTest(arch=arch):
                 self.assertGreaterEqual(len(table), 28)
 
     def test_delay_slot_flag_matches_the_arch(self):
         """Only MicroBlaze, MIPS and SPARC have architectural delay slots."""
         delaying = {"microblaze", "mips", "sparc"}
-        for arch, table in TABLES:
+        for arch, table, _ in TABLES:
             profile = cfg.get_profile(arch)
             with self.subTest(arch=arch):
                 self.assertEqual(profile.has_delay_slot, arch in delaying)
                 if arch not in delaying:
                     self.assertFalse(any(d for _, _, d in table))
+
+
+class TestIndirectTransfers(unittest.TestCase):
+    """Which transfers take their target from a register, per ISA.
+
+    `indirect` is the switch that EXCLUDES an instruction from branch coverage
+    (and from target parsing). Both directions are failures that report a wrong
+    number with exit status 0:
+
+      * a MISSING pattern lets _parse_target read a register displacement as an
+        address, and an unconditional branch with a bogus target injects a false
+        basic-block leader -- the same corruption the MicroBlaze absolute-branch
+        bug caused;
+      * a TOO-GREEDY pattern swallows the direct branches and silently deletes
+        them from the denominator, which is worse.
+
+    So every row of every ISA table is pinned in one direction or the other.
+    """
+
+    def test_indirect_flag_for_every_row(self):
+        for arch, table, indirect in TABLES:
+            profile = cfg.get_profile(arch)
+            expected = set(indirect)
+            for text, _, _ in table:
+                with self.subTest(arch=arch, insn=text):
+                    self.assertEqual(profile.is_indirect(text),
+                                     text in expected)
+
+    def test_every_indirect_form_is_also_kind_pinned(self):
+        """The companion list may only name rows the ISA table also carries."""
+        for arch, table, indirect in TABLES:
+            rows = {text for text, _, _ in table}
+            with self.subTest(arch=arch):
+                self.assertEqual(sorted(set(indirect) - rows), [])
+
+    def test_every_arch_recognizes_indirect_transfers(self):
+        """Every shipped ISA has register-indirect branches; none may lack them.
+
+        aarch64, riscv, mips, sparc and powerpc all shipped with no `indirect`
+        pattern at all, so `jmpl %g1+0x10, %o7` classified UNCOND with a
+        "target" of 0x10.
+        """
+        for arch, _, indirect in TABLES:
+            with self.subTest(arch=arch):
+                self.assertTrue(cfg.get_profile(arch)._indirect is not None,
+                                "%s has no indirect pattern" % arch)
+                self.assertGreaterEqual(len(indirect), 4)
 
 
 class TestConditionalCallsAreBranchPoints(unittest.TestCase):

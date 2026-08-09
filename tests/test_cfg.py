@@ -375,6 +375,188 @@ class TestStrippedBinaryTargets(unittest.TestCase):
                                             {0x1234, 0x90000004}))
 
 
+class TestRegisterDisplacementIsNotATarget(unittest.TestCase):
+    """A register displacement must never be read as a branch target.
+
+    Five of the eight shipped profiles had no `indirect` pattern at all, so
+    _parse_target happily took the number out of a register-relative operand:
+
+        sparc    jmpl %g1+0x10, %o7   ->  kind=uncond  target=0x10
+        riscv64  jalr 0x10(a0)        ->  kind=call    target=0x10
+
+    The SPARC one is the damaging shape. It classifies UNCOND, so it terminates
+    a block AND its "target" becomes a basic-block leader -- exactly the
+    corruption the MicroBlaze absolute-branch bug produced, reported silently
+    with exit status 0.
+    """
+
+    def test_sparc_jmpl_register_displacement(self):
+        p = cfg.get_profile("sparc")
+        for text in ("jmpl %g1+0x10, %o7",           # the reported spelling
+                     "jmpl  %g1 + 0x10, %o2",        # what GNU objdump prints
+                     "jmp  %g1 + 0x10",
+                     "jmp  %o7 + 8",
+                     "call  %g1 + 0x10"):
+            with self.subTest(insn=text):
+                self.assertTrue(p.is_indirect(text))
+                self.assertIsNone(cfg._parse_target(text, 0x1000, p))
+                # ...and still None when 0x10/0x8 IS a real instruction
+                # address, which is the case that corrupts the block map.
+                self.assertIsNone(cfg._parse_target(text, 0x1000, p, None,
+                                                    {0x8, 0x10}))
+
+    def test_riscv_jalr_register_displacement(self):
+        p = cfg.get_profile("riscv")
+        for text in ("jalr 0x10(a0)",                # llvm-objdump spelling
+                     "jalr 16(a0)",                  # GNU objdump spelling
+                     "jr 16(a0)", "jalr a1,16(a0)", "jalr a0", "c.jr a0"):
+            with self.subTest(insn=text):
+                self.assertTrue(p.is_indirect(text))
+                self.assertIsNone(cfg._parse_target(text, 0x1000, p))
+                self.assertIsNone(cfg._parse_target(text, 0x1000, p, None,
+                                                    {0x10, 0x16}))
+
+    def test_sparc_indirect_jump_injects_no_block_leader(self):
+        """The end-to-end shape: a bogus target that names a real instruction.
+
+        Read as 0x10, the jmpl makes the instruction at 0x10 a leader and the
+        second block is split in two. Nothing errors; the branch inventory just
+        comes out wrong.
+        """
+        text = objdump([
+            "00000000 <main>:",
+            (0x00000000, "86 00 40 02", "add  %g1, %g2, %g3"),
+            (0x00000004, "95 c0 60 10", "jmpl  %g1 + 0x10, %o2"),
+            (0x00000008, "01 00 00 00", "nop"),
+            (0x0000000c, "86 00 40 02", "add  %g1, %g2, %g3"),
+            (0x00000010, "86 00 40 02", "add  %g1, %g2, %g3"),
+            (0x00000014, "81 c3 e0 08", "retl"),
+            (0x00000018, "01 00 00 00", "nop"),
+        ], fmt="elf32-sparc")
+        graph = cfg.analyze(text, cfg.get_profile("sparc"))
+        jmpl = [i for i in graph.insns if i.mnemonic == "jmpl"][0]
+        self.assertIsNone(jmpl.target)
+        self.assertEqual([(b.start, b.end) for b in graph.blocks], [
+            (0x00000000, 0x00000008),   # ends with the jmpl's delay slot
+            (0x0000000c, 0x00000018),   # NOT split at 0x10
+        ])
+
+    def test_sparc_absolute_jmp_target_is_still_read(self):
+        """The %g0-relative form really does print its target: keep it.
+
+        sparc-opc.c:1719 ("i") prints "jmp  0x10", where 0x10 IS the address.
+        A pattern greedy enough to call every jmp indirect would delete it.
+        """
+        p = cfg.get_profile("sparc")
+        self.assertFalse(p.is_indirect("jmp  0x10"))
+        self.assertEqual(cfg._parse_target("jmp  0x10", 0x1000, p, None,
+                                           {0x10}), 0x10)
+        self.assertFalse(p.is_indirect("call  1000 <foo-0x8>"))
+        self.assertEqual(cfg._parse_target("call  1000 <foo-0x8>", 0, p),
+                         0x1000)
+
+
+class TestExplicitHexOperandIsValidated(unittest.TestCase):
+    """A leading '0x' says hexadecimal, not "this is an address".
+
+    Validation used to apply only to the BARE-hex reading, so an operand
+    spelled 0x10 was trusted outright even when the caller passed a
+    `valid_addrs` set that did not contain it. The two sources are equally
+    ambiguous -- llvm-objdump writes register displacements with 0x too -- so
+    they are now checked the same way.
+    """
+
+    def test_hex_operand_outside_the_dump_is_refused(self):
+        p = cfg.get_profile("aarch64")
+        self.assertEqual(cfg._parse_target("b.lt 0x4008b0", 0, p, None,
+                                           {0x4008b0}), 0x4008b0)
+        # Not an instruction address: unknown target, so the branch is
+        # EXCLUDED rather than attributed to whatever lives at 0x12.
+        self.assertIsNone(cfg._parse_target("b.lt 0x12", 0, p, None,
+                                            {0x4008b0}))
+
+    def test_hex_operand_is_trusted_when_there_is_nothing_to_check(self):
+        """No address set means no validation is possible; behaviour is kept."""
+        p = cfg.get_profile("aarch64")
+        self.assertEqual(cfg._parse_target("b.lt 0x4008b0", 0, p), 0x4008b0)
+        self.assertEqual(cfg._parse_target("b.lt 0x4008b0", 0, p, None, set()),
+                         0x4008b0)
+
+    def test_a_symbolic_target_is_still_trusted(self):
+        """'<sym+off>' is objdump saying it resolved the target itself."""
+        p = cfg.get_profile("aarch64")
+        self.assertEqual(
+            cfg._parse_target("bl 0x4008b0 <far>", 0, p, None, {0x1000}),
+            0x4008b0)
+
+    def test_a_rejected_hex_falls_through_to_the_comment(self):
+        """Refusing the 0x reading must not discard a better source.
+
+        MicroBlaze prints the resolved target in a trailing "// <hex>" comment;
+        that is a stronger source than any operand and has to survive.
+        """
+        p = cfg.get_profile("microblaze")
+        self.assertEqual(
+            cfg._parse_target("bri 0x1234\t\t// 9000001c", 0x90000000, p, None,
+                              {0x9000001c}),
+            0x9000001c)
+
+
+class TestThumbInstructionSize(unittest.TestCase):
+    """Thumb is a 2-byte encoding; A32 is 4.
+
+    'thumb' used to be an alias of the A32 profile, so it inherited
+    insn_size=4. That value is the fallback for an instruction with no
+    successor to measure against, which makes a section-final Thumb branch
+    fall through two bytes past the real address -- an address no recorded edge
+    can match, leaving the branch permanently half-covered.
+    """
+
+    def test_profile_sizes(self):
+        self.assertEqual(cfg.get_profile("thumb").insn_size, 2)
+        self.assertEqual(cfg.get_profile("arm").insn_size, 4)
+        self.assertEqual(cfg.get_profile("thumb").name, "thumb")
+        self.assertEqual(cfg.get_profile("arm").name, "arm")
+
+    def test_abi_names_stay_on_the_a32_profile(self):
+        """armel/armhf/armv7 name an ABI or an architecture, not an ISA."""
+        for name in ("armv7", "armel", "armhf", "littlearm", "bigarm"):
+            with self.subTest(arch=name):
+                self.assertEqual(cfg.get_profile(name).insn_size, 4)
+        # ...while the Thumb-only M-profile names do select it.
+        for name in ("thumb2", "thumbv8", "armv7m", "armv7-thumb"):
+            with self.subTest(arch=name):
+                self.assertEqual(cfg.get_profile(name).insn_size, 2)
+
+    def test_thumb_classification_matches_arm(self):
+        """The new entry reuses ARM's patterns; only the size differs."""
+        arm, thumb = cfg.get_profile("arm"), cfg.get_profile("thumb")
+        for text in ("beq.n 8010 <x>", "bne.w 8010 <x>", "bl 8010 <x>",
+                     "blx r3", "bx lr", "pop {r4, pc}", "cbz r0, 8010 <x>",
+                     "tbb [r0, r1]", "mov r1, #2"):
+            with self.subTest(insn=text):
+                self.assertEqual(thumb.classify(text), arm.classify(text))
+                self.assertEqual(thumb.is_indirect(text), arm.is_indirect(text))
+
+    def test_section_final_branch_falls_through_two_bytes_later(self):
+        text = objdump([
+            "00008000 <main>:",
+            (0x8000, "01 28", "cmp\tr0, #1"),
+            (0x8002, "70 47", "bx\tlr"),
+            (0x8004, "02 28", "cmp\tr0, #2"),
+            (0x8006, "fd d1", "bne.n\t8000 <main>"),
+        ], fmt="elf32-littlearm")
+        bp = cfg.analyze(text, cfg.get_profile("thumb")).branch_points[0]
+        self.assertEqual(bp.addr, 0x8006)
+        self.assertEqual(bp.taken, 0x8000)
+        # The branch is the last instruction in the dump, so the fall-through
+        # comes from insn_size: 0x8008, not the A32 answer 0x800a.
+        self.assertEqual(bp.fallthrough, 0x8008)
+        self.assertFalse(bp.indirect)
+        arm_bp = cfg.analyze(text, cfg.get_profile("arm")).branch_points[0]
+        self.assertEqual(arm_bp.fallthrough, 0x800a)
+
+
 class TestEdgeMatching(unittest.TestCase):
     def setUp(self):
         self.graph = cfg.analyze(MB_TEXT, cfg.get_profile("microblaze"))

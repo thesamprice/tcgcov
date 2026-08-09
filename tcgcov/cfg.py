@@ -248,9 +248,11 @@ _p("microblaze",
               r"|bgeid|bged|rtsd|rtid|rtbd|rted)\b",
    # The register-target forms (no trailing 'i' before the optional 'd') take
    # their destination from a register: "beq r3, r4" branches to r4, and the
-   # trailing 4 is emphatically not a displacement.
-   indirect=r"^(beqd?|bned?|bltd?|bled?|bgtd?|bged?|brd?|brad?|brld?|brald?)"
-            r"(?=\s|$)",
+   # trailing 4 is emphatically not a displacement. 'brk' belongs here for the
+   # same reason ("brk r5, r6" traps to r5); the lookahead is what keeps it from
+   # swallowing the immediate form 'brki'.
+   indirect=r"^(beqd?|bned?|bltd?|bled?|bgtd?|bged?|brd?|brad?|brld?|brald?"
+            r"|brk)(?=\s|$)",
    # INST_NO_OFFSET immediate forms (microblaze-opc.h:226-229): the operand IS
    # the target address. Everything else on this arch is INST_PC_OFFSET.
    absolute=r"^(bralid|braid|brai|brki)\b",
@@ -276,9 +278,34 @@ _p("riscv",
    unconditional=r"^(c\.)?(jr|j)\b",
    call=r"^(c\.)?(jalr|jal|call|tail)\b",
    ret=r"^(c\.)?ret\b",
+   # jr and jalr are the ISA's ONLY register-indirect transfers (they are the
+   # only riscv_opcodes[] entries with INSN_BRANCH/INSN_JSR that are not
+   # PC-relative -- riscv-opc.c:486-497 for the uncompressed forms, :1193-1194
+   # for c.jr/c.jalr). They print in three shapes, all of which must be refused
+   # a target:
+   #
+   #   riscv-opc.c:487,491  "s"        -> "jr a0"        / "jalr a0"
+   #   riscv-opc.c:488,492  "o(s)"     -> "jr 16(a0)"    / "jalr 16(a0)"
+   #   riscv-opc.c:494,495  "d,s" /
+   #                        "d,o(s)"   -> "jalr a1,16(a0)"
+   #
+   # The offset is printed with "%d" (riscv-dis.c:565-566), so GNU objdump
+   # writes it in DECIMAL; llvm-objdump writes the same operand as 0x10, which
+   # is the spelling that used to parse as a branch target.
+   #
+   # The 'c.' prefix is optional because the disassembler prints the ALIAS by
+   # default: no_aliases starts false (riscv-dis.c:85) and only -M no-aliases
+   # sets it (riscv-dis.c:96-97), and the alias rows precede the c.* rows in the
+   # first-match scan (riscv-dis.c:1074-1095). So a c.jr encoding prints as
+   # "jr a0", and c.jr ra prints as "ret" (riscv-opc.c:484).
+   indirect=r"^(c\.)?(jr|jalr)\b",
    insn_size=4,
    notes="compressed 2-byte forms are handled: instruction sizes come from "
-         "address deltas, so a mixed RVC/RV32I stream is fine.")
+         "address deltas, so a mixed RVC/RV32I stream is fine. call/tail/jump "
+         "are INSN_MACRO (riscv-opc.c:503-507) and are skipped outright by the "
+         "disassembler (riscv-dis.c:1076-1078), so objdump never prints them; "
+         "they are recognized only because llvm-objdump and hand-written .s "
+         "listings do.")
 
 # ARM A32/T32 -- objdump prints the condition suffix on the mnemonic (and maps
 # 'al' to the empty string, so a bare 'b' is unconditional). Thumb adds the
@@ -305,8 +332,7 @@ _p("riscv",
 # 'dls'/'dlstp' (arm-dis.c:4420-4422) are NOT branches -- they only initialize
 # LR -- and are deliberately left as OTHER.
 _ARM_CC = r"(eq|ne|cs|hs|cc|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le)"
-_p("arm",
-   aliases=("armv7", "armel", "armhf", "thumb", "littlearm", "bigarm"),
+_ARM_KW = dict(
    conditional=r"^(b" + _ARM_CC + r"|bl" + _ARM_CC + r"|blx" + _ARM_CC +
                r"|cbn?z|letp|le|wlstp|wls)(\.[nw])?\b",
    # tbb/tbh (arm-dis.c:4563-4565) are Thumb table branches: unconditional
@@ -331,12 +357,40 @@ _p("arm",
    indirect=r"^(bx|bxj|bxns|tbb|tbh)" + _ARM_CC + r"?(\.[nw])?\b"
             r"|^blx" + _ARM_CC + r"?(\.[nw])?\s+[a-z]"
             r"|^(movs?|ldr)[\w.]*\s+pc\s*,",
-   insn_size=4,
    notes="'ble/blt/bls' are conditional branches; 'bleq/blne/...' are "
          "CONDITIONAL CALLS and are classified COND so they are branch points "
          "as well as block terminators (same as PowerPC 'bltl'). v8.1-M "
          "'le/letp/wls/wlstp' are conditional branches; 'bf/bfl/bfx/bfcsel' "
          "(arm-dis.c:4425-4433) are not modeled.")
+
+# A32 is a fixed 4-byte encoding. The alias list is deliberately all A32-or-
+# either names: 'armv7' is an architecture VERSION (which supports both
+# instruction sets), and 'armel'/'armhf' are Debian ABI/port names (EABI
+# soft-float and hard-float respectively) -- none of the three names an
+# instruction set, and an ELF carrying any of them may hold A32 code, T32 code
+# or both, selected per function by the $a/$t mapping symbols that objdump
+# follows. 4 is therefore the right default for them and 'thumb' below is the
+# only name that asserts the 2-byte encoding.
+_p("arm", aliases=("armv7", "armel", "armhf", "littlearm", "bigarm"),
+   insn_size=4, **_ARM_KW)
+
+# Thumb / T32 -- same mnemonics (the classification patterns already carry the
+# (\.[nw]) narrow/wide suffix), 2-byte base encoding.
+#
+# insn_size is consulted in exactly one place: the size of an instruction that
+# has no successor to measure against -- the last one in a section, or one whose
+# neighbour is in another section (see parse_objdump). Inheriting A32's 4 there
+# put the fall-through of a section-final Thumb branch two bytes past the real
+# one, and a fall-through address that matches no recorded edge leaves that
+# branch permanently half-covered: a wrong percentage, no error.
+#
+# There is no BFD name for Thumb -- a T32 binary's "file format" line still
+# reads elf32-littlearm -- so detect_arch cannot reach this profile and it is
+# selected only by an explicit --arch/QEMU target name. That is also why
+# 'littlearm'/'bigarm' stay on the A32 profile above.
+_p("thumb", aliases=("thumbv7", "thumbv8", "thumb2", "armv7m", "armv6m",
+                     "armv8m"),
+   insn_size=2, **_ARM_KW)
 
 # AArch64 -- b.<cond> (and the v8.8 bc.<cond>), cbz/cbnz, tbz/tbnz and the v9.6
 # CMPBR family are the conditional branches; objdump appends a "// b.hs" alias
@@ -348,7 +402,33 @@ _p("aarch64",
    unconditional=r"^(b|br|braa|brab|braaz|brabz)\b",
    call=r"^(bl|blr|blraa|blrab|blraaz|blrabz)\b",
    ret=r"^(ret|retaa|retab|eret\w*)\b",
-   insn_size=4)
+   # Every register-indirect transfer on this ISA. aarch64-tbl.h:4413 opens the
+   # "Unconditional branch (register)" block and it holds exactly 17 entries
+   # (:4414-4430), which is the complete iclass branch_reg set: br, blr, ret,
+   # eret, drps, braa, brab, blraa, blrab, braaz, brabz, blraaz, blrabz, retaa,
+   # retab, eretaa, eretab. The ten named below are the ones that print a
+   # register operand and are classified UNCOND or CALL, i.e. the ones whose
+   # operands _parse_target would otherwise read:
+   #
+   #   aarch64-tbl.h:4414,4415       br / blr            OP1 (Rn)   -> "br x8"
+   #   aarch64-tbl.h:4423-4426       braaz/brabz/
+   #                                 blraaz/blrabz       OP1 (Rn)   -> "braaz x8"
+   #   aarch64-tbl.h:4419-4422       braa/brab/
+   #                                 blraa/blrab         OP2 (Rn, Rd_SP)
+   #                                                     -> "braa x8, x9"
+   #
+   # ret/retaa/retab/eret*/drps are left out on purpose: they classify RET (the
+   # `ret` pattern above still wins, and RET is never target-parsed). retaa and
+   # retab take OP0 (aarch64-tbl.h:4427-4428) so they print no operand at all,
+   # and `ret`'s operand is optional with default x30 (F_OPD0_OPT|F_DEFAULT(30),
+   # suppressed at aarch64-opc.c:4096-4099), so a bare "ret" is the normal form.
+   # Nothing here is double-counted: classify() returns exactly one kind.
+   indirect=r"^(br|blr|braa|brab|braaz|brabz|blraa|blrab|blraaz|blrabz)\b",
+   insn_size=4,
+   notes="the CMPBR (v9.6 cb*/cbb*/cbh*), compbranch (cbz/cbnz) and testbranch "
+         "(tbz/tbnz) families are PC-relative (ADDR_PCREL9/19/14), not "
+         "register-indirect, and the GCS extension (aarch64-tbl.h:5201-5211) "
+         "contains no branches at all.")
 
 # x86 / x86-64, AT&T syntax as objdump prints it. binutils emits exactly 16 Jcc
 # spellings (jo jno jb jae je jne jbe ja js jns jp jnp jl jge jle jg) plus
@@ -407,15 +487,44 @@ _p("mips",
                r"|bc[0-3][tf]l?|bc[12](eqz|nez)"
                r"|bposge(32c?|64)|bbit[01](32)?"
                r"|bn?z\.[bhwvd])\b",
-   unconditional=r"^(bc|b|j|jr|jr\.hb|jrc)\b",
+   # 'jic' (mips-opc.c:3257) was missing: an r6 Jump Indexed Compact is an
+   # unconditional transfer and has to END ITS BLOCK, but it fell through to
+   # OTHER, so the block map ran straight past it. Its sibling 'jialc'
+   # (mips-opc.c:3261) was already in `call`, and the `ret` pattern below
+   # already special-cased "jic ra", which is what gave the omission away.
+   unconditional=r"^(bc|b|j|jr|jr\.hb|jrc|jic)\b",
    call=r"^(jalx?|jalrc?|jalr\.hb|balc?|jialc)\b",
    ret=r"^(jr(\.hb)?\s+\$?(ra|31)\b|jrc\s+\$?ra\b|jic\s+\$?ra\b)",
+   # Register-target jumps. All of them print a register as their FIRST
+   # operand, and several print a second operand that reads as hex:
+   #
+   #   mips-opc.c:1215-1216  jr        "s"     -> "jr\tt0"
+   #   mips-opc.c:1220-1221  jr.hb     "s"
+   #   mips-opc.c:1231-1232  jalr      "s" / "d,s" -> "jalr\ta0,v1"
+   #   mips-opc.c:1235-1236  jalr.hb   "s" / "d,s"
+   #   mips-opc.c:3256,3260  jrc/jalrc "t"     -> "jrc\tat"
+   #   mips-opc.c:3257,3261  jic/jialc "t,j"   -> "jic\tv1,-32768"
+   #
+   # Both extra-operand shapes were being read as targets, because the bare-hex
+   # reader's lookbehind only rejects a number glued to a register/sign prefix
+   # and a comma is neither: "jalr a0,a1" yielded 0xa1 and "jic t0,16" yielded
+   # 0x16. Note objdump prints GPRs WITHOUT a '$' by default (mips-dis.c:1211
+   # indexes the oldabi/newabi NAME tables, mips-dis.c:61,69; the '$' appears
+   # only under -M gpr-names=numeric), so both spellings must classify alike.
+   #
+   # 'jr ra' stays a RETURN: classify() tries `ret` first and that pattern is
+   # keyed on the register, so the RET/UNCOND split is untouched -- is_indirect
+   # is a separate question and the answer for a return through $ra is still
+   # "the target is in a register".
+   indirect=r"^(jalrc|jalr|jialc|jrc|jr|jic)(\.hb)?(?=\s|$)",
    has_delay_slot=True,
    delay_slot=r"^(?!\w+c\b)\w+",
    insn_size=4,
    notes="delay_slot excludes the r6 compact branches (mnemonics ending in "
          "'c'). The 'likely' (*l) forms nullify the delay slot when not taken, "
-         "which does not change the fall-through ADDRESS.")
+         "which does not change the fall-through ADDRESS. The microMIPS and "
+         "MIPS16 register jumps (jrs/jalrs/jraddiusp, micromips-opc.c:734-767) "
+         "are not modeled at all, so they are not listed as indirect either.")
 
 # PowerPC -- objdump prints the extended mnemonics (blt bgt beq bso bge ble bne
 # bns, bdnz/bdz, bt/bf, raw bc) with the suffixes glued on: 'l' (link), 'a'
@@ -431,10 +540,36 @@ _p("powerpc",
    unconditional=r"^(b|ba|bctr|btar)[+-]?\b",
    call=r"^(bl|bla|bctrl|bclrl|bcctrl|btarl|bctarl)\b",
    ret=r"^(blr|bclr)l?[+-]?\b",
+   # Everything that branches to LR, CTR or TAR. The target lives in a special
+   # register and is NEVER printed, but these forms are not operand-less: the
+   # optional CR and BH operands print as "bnectr cr1,1" (gas/testsuite/gas/ppc/
+   # a2.d:61) and the -Mraw spelling as "bcctr 6,lt,0" (gas/testsuite/gas/ppc/
+   # raw.d:31). Both end in a small number after a comma, which the bare-hex
+   # reader accepted, so a to-CTR branch could acquire a "target" of 0x1.
+   #
+   # The mnemonic is built as  b <condition> <lr|ctr|tar> [l] [+|-]  and the
+   # rows are written out longhand in ppc-opc.c -- to-LR at :6665-6889, to-CTR
+   # at :6940-7091, to-TAR (POWER8) at :7093-7210. The '+'/'-' hints select a
+   # different BO constant (ppc-opc.c:5170-5197) rather than adding an operand,
+   # and 'l' is the link bit, which is why both are optional suffixes here.
+   #
+   # This deliberately does NOT match a direct branch that merely ends in those
+   # letters: 'bl', 'bla', 'blt', 'bltl' and 'ble' all fail, because after the
+   # optional condition group the pattern still requires a whole lr/ctr/tar.
+   # Conditional returns (beqlr, bdnzlr, ...) keep their existing meaning --
+   # they classify COND, so they stay branch points, and marking them indirect
+   # is exactly what makes them "no static target -> excluded" rather than
+   # reported with a fabricated one.
+   indirect=r"^b(c|dnz[tf]?|dz[tf]?|" + _PPC_CC + r"|[tf])?"
+            r"(lr|ctr|tar)l?[+-]?(?=\s|,|$)",
    insn_size=4,
    notes="conditional returns (beqlr, bdnzlr, ...) are conditional branches "
          "with an implicit LR target: branch points with no static target, so "
-         "they are excluded from branch coverage rather than reported.")
+         "they are excluded from branch coverage rather than reported. The "
+         "POWER (not PowerPC) spellings br/brl/bcr/bcrl/bcc/bccl "
+         "(ppc-opc.c:6678,6680,6885,6889,7087,7091) and the return-from-"
+         "interrupt group (rfid/rfi/hrfid, ppc-opc.c:6891-6927) are not "
+         "modeled as transfers at all.")
 
 # SPARC -- objdump prints the non-alias spellings only: the unconditional branch
 # is 'b' (never 'ba'), and 'be/bg/bl/...' rather than 'beq/bgt/blt'. Suffixes
@@ -481,6 +616,38 @@ _p("sparc",
    unconditional=r"^(ba|b|fba|fb|cba|cb|jmpl|jmp)" + _SPARC_SUFFIX + r"\b",
    call=r"^call\b",
    ret=r"^(retl|return|rett|ret)\b",
+   # SPARC has no dedicated indirect-jump mnemonic: jmpl IS the jump, and
+   # objdump prints one of three names for it depending only on the destination
+   # register, all with the SAME operand shapes:
+   #
+   #   sparc-opc.c:827-832    jmpl <rs1>+<rs2|imm>, <rd>    (any other rd)
+   #   sparc-opc.c:1293-1304  call <rs1>+<rs2|imm>          (rd == %o7)
+   #   sparc-opc.c:1715-1720  jmp  <rs1>+<rs2|imm>          (rd == %g0)
+   #
+   # So `call` on this ISA is BOTH the PC-relative call (sparc-opc.c:1290, args
+   # "L", printed "call  1000 <foo-0x8>") and a register-indirect one -- which
+   # is why the pattern splits on the first operand character, the same trick
+   # the ARM profile uses for 'blx'. A '%' means the target came out of a
+   # register; a digit means the operand IS the address.
+   #
+   # That split is not cosmetic. Immediates print as "%#x" above 9 and "%d"
+   # below (sparc-dis.c:689-716), so `jmpl %g1 + 0x10, %o2` used to yield a
+   # "target" of 0x10 and `jmp %o7 + 8` a target of 0x8 -- and an UNCOND with a
+   # bogus target makes that address a basic-block leader. The one case where a
+   # printed number really IS the target is the %g0-relative form (args "i",
+   # sparc-opc.c:830/1301/1719, e.g. "jmp  0x10"), and that keeps working
+   # because it does not start with '%'. The mirrored "i+1" spelling is never
+   # disassembled -- the table sort guarantees "1+i" matches first
+   # (sparc-dis.c:702-706) -- so the leading operand is always the register
+   # when a register is involved.
+   #
+   # \s+ rather than a single space on purpose: the printer emits a space
+   # before EVERY operand character on top of the one after the mnemonic
+   # (sparc-dis.c:560-561, :591), so real output is "jmpl  %g1 + 0x10, %o2".
+   #
+   # ret/retl/rett/return are left to the `ret` pattern above: they classify
+   # RET, which is never target-parsed.
+   indirect=r"^(jmpl|jmp|call)\s+%",
    has_delay_slot=True,
    # Everything delays except v9 'return' and the CBcond compare-and-branch
    # family (cwb*/cxb*).
@@ -516,8 +683,11 @@ ARCH_ALIASES = (
     ("rv64", "riscv"),
     ("aarch64", "aarch64"),
     ("arm64", "aarch64"),
+    # 'thumb' before 'arm': these are SUBSTRING tests in order, and a name like
+    # "armv7-thumb" or "thumb2" must reach the 2-byte profile rather than being
+    # claimed by the bare "arm" needle.
+    ("thumb", "thumb"),
     ("arm", "arm"),
-    ("thumb", "arm"),
     ("x86_64", "x86_64"),
     ("x86-64", "x86_64"),
     ("amd64", "x86_64"),
@@ -732,7 +902,10 @@ def _parse_target(text, insn_addr, profile, prev=None, valid_addrs=None):
       1. "<hex> <sym+0xoff>" -- how most targets print a direct target. The LAST
          match wins because some ISAs put other operands first (PowerPC
          `beq cr7,<addr>`).
-      2. An explicit 0x operand (llvm-objdump always prints one).
+      2. An explicit 0x operand (llvm-objdump always prints one). A leading
+         "0x" says the number is hexadecimal, NOT that it is an address: it is
+         equally the displacement of a register-indirect transfer, so this
+         source is validated against `valid_addrs` exactly like source 5.
       3. A trailing "// <hex>" comment -- MicroBlaze prints the raw displacement
          as the operand and the resolved target only as a comment.
       4. Only for profiles that ask for it: a trailing decimal operand read as a
@@ -754,7 +927,24 @@ def _parse_target(text, insn_addr, profile, prev=None, valid_addrs=None):
         return int(matches[-1], 16)
     hexes = HEX_TARGET_RE.findall(text)
     if hexes:
-        return int(hexes[-1], 16)
+        addr = int(hexes[-1], 16)
+        # "0x" marks the BASE, not the meaning. RISC-V prints `jalr 0x10(a0)`
+        # and SPARC `jmpl %g1+0x10, %o7`, where the 0x number is a register
+        # displacement; reading it as a target invents an address, and when the
+        # invented address happens to name a real instruction, build_blocks
+        # splits a block there. The profile's `indirect` pattern is the first
+        # line of defence, but it can only cover the mnemonics we know about,
+        # so the number is checked against the real instruction addresses too --
+        # the same rule the bare-hex source has always used. A target outside
+        # the disassembled range therefore degrades to "unknown, excluded"
+        # rather than being mis-attributed to whatever sits at that address.
+        # With no address set to check against (a direct _parse_target call)
+        # there is nothing to validate, so the operand is taken as before.
+        if not valid_addrs or addr in valid_addrs:
+            return addr
+        # Fall through rather than refuse outright: the later sources are
+        # independent readings of the same instruction (MicroBlaze's resolved
+        # "// <hex>" comment above all) and cannot re-derive this number.
     if profile.comment_target:
         comment = COMMENT_TARGET_RE.search(text)
         if comment:
