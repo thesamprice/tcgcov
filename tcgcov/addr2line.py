@@ -17,6 +17,7 @@ import sys
 from .format import read_cov
 from .symbolize import iter_covered_lines
 from .cliargs import add_symbolize_args
+from .paths import path_options
 
 
 def add_arguments(parser):
@@ -56,8 +57,7 @@ def run(args):
     line_count = {}
     try:
         for norm, line, func, depth, addr in iter_covered_lines(
-                addr2line, args.elf, addrs, args.source_root,
-                args.include_testsuites, tuple(args.keep), args.all_paths):
+                addr2line, args.elf, addrs, path_options(args)):
             key = (norm, line, func)
             if key not in seen or depth < seen[key]:
                 seen[key] = depth

@@ -21,8 +21,10 @@ from collections import defaultdict
 
 from .symbolize import iter_covered_lines
 from .coverable import disassemble_addresses
+from .lcov import emit_branches
 from .merge import parse_info
 from .cliargs import add_symbolize_args
+from .paths import path_options
 
 
 def load_target_inventory(args):
@@ -52,8 +54,7 @@ def load_target_inventory(args):
     addr2line = args.addr2line or (args.toolchain_prefix + "addr2line")
     addrs = disassemble_addresses(objdump, args.elf)
     for norm, line, func, _depth, _addr in iter_covered_lines(
-            addr2line, args.elf, addrs, args.source_root,
-            args.include_testsuites, tuple(args.keep), args.all_paths):
+            addr2line, args.elf, addrs, path_options(args)):
         keep_lines.add((norm, line))
         keep_funcs.add((norm, func))
     return keep_lines, keep_funcs
@@ -91,8 +92,10 @@ def run(args):
     line_hits = defaultdict(dict)
     func_line = defaultdict(dict)
     func_hits = defaultdict(dict)
+    branch_data = defaultdict(dict)
     try:
-        parse_info(args.aggregate, coverable, line_hits, func_line, func_hits)
+        parse_info(args.aggregate, coverable, line_hits, func_line, func_hits,
+                   branch_data)
     except OSError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -119,6 +122,12 @@ def run(args):
             if funcs:
                 out.write(f"FNF:{len(funcs)}\n")
                 out.write(f"FNH:{sum(1 for fn in funcs if fh.get(fn, 0) > 0)}\n")
+            # Branch records follow the same filter as lines: a branch on a
+            # line the target ELF does not contain is not the target's branch.
+            bd = {k: v for k, v in branch_data.get(sf, {}).items()
+                  if k[0] in cab}
+            if bd:
+                emit_branches(out, bd)
             covered = 0
             for ln in sorted(cab):
                 hits = lh.get(ln, 0)

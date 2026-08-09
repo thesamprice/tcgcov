@@ -16,6 +16,10 @@ TN:agg
 SF:cpukit/x.c
 FN:10,foo
 FNDA:5,foo
+BRDA:10,0,0,5
+BRDA:10,0,1,0
+BRDA:12,0,0,-
+BRDA:12,0,1,-
 DA:10,5
 DA:11,3
 DA:12,0
@@ -24,6 +28,8 @@ TN:agg
 SF:cpukit/y.c
 FN:40,bar
 FNDA:2,bar
+BRDA:40,0,0,2
+BRDA:40,0,1,0
 DA:40,2
 DA:41,0
 end_of_record
@@ -56,7 +62,10 @@ class TestRestrict(unittest.TestCase):
         sf = None
         da = {}
         fns = []
-        for line in open(out):
+        brda = []
+        with open(out) as f:
+            lines = f.read().splitlines()
+        for line in lines:
             line = line.strip()
             if line.startswith("SF:"):
                 sf = line[3:]
@@ -65,6 +74,8 @@ class TestRestrict(unittest.TestCase):
                 da[(sf, int(ln))] = int(hits)
             elif line.startswith("FN:"):
                 fns.append(line[3:].partition(",")[2])
+            elif line.startswith("BRDA:"):
+                brda.append((sf, line[5:]))
 
         # bar / cpukit/y.c dropped; foo kept with its counts.
         self.assertEqual(fns, ["foo"])
@@ -73,6 +84,10 @@ class TestRestrict(unittest.TestCase):
         self.assertNotIn(("cpukit/x.c", 12), da)
         # nothing from y.c survives.
         self.assertFalse(any(k[0] == "cpukit/y.c" for k in da))
+        # Branch records follow the same filter: line 10 kept, line 12 (not in
+        # the target) and all of y.c dropped.
+        self.assertEqual(brda, [("cpukit/x.c", "10,0,0,5"),
+                                ("cpukit/x.c", "10,0,1,0")])
 
 
 if __name__ == "__main__":

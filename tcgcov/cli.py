@@ -2,15 +2,17 @@
 
 import argparse
 
-from . import addr2line, coverable, lcov, merge, dump, restrict, gap
+from . import addr2line, branches, coverable, lcov, merge, dump, restrict, gap
 from . import __version__
 
 # (subcommand name, module, short help). The module supplies add_arguments(p)
 # and run(args); `symbolize`/`coverable` are the covered/coverable producers.
 SUBCOMMANDS = [
-    ("dump", dump, "inspect a .cov artifact (header/metadata/addresses)"),
+    ("dump", dump, "inspect a .cov artifact (header/metadata/addresses/edges)"),
     ("symbolize", addr2line, "covered .cov + ELF -> per-source-line JSONL"),
     ("coverable", coverable, "ELF -> coverable-line inventory JSONL"),
+    ("branches", branches,
+     "ELF + .cov edges -> per-branch-outcome JSONL (BRDA input)"),
     ("lcov", lcov, "symbolized JSONL -> per-test LCOV .info"),
     ("merge", merge, "merge per-test .info -> aggregate (by source+line)"),
     ("restrict", restrict,

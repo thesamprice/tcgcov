@@ -27,7 +27,10 @@ LDFLAGS   += -shared
 LIBS      := $(shell pkg-config --libs glib-2.0)
 
 ifneq ($(QEMU_INCLUDE),)
-CFLAGS    += -I$(QEMU_INCLUDE)
+# The header ships as <qemu-source>/include/qemu/qemu-plugin.h but is included
+# as <qemu-plugin.h>, so both directories are needed -- QEMU's own
+# contrib/plugins build does the same.
+CFLAGS    += -I$(QEMU_INCLUDE) -I$(QEMU_INCLUDE)/qemu
 endif
 ifneq ($(QEMU_PLUGIN_H),)
 CFLAGS    += -I$(dir $(QEMU_PLUGIN_H))

@@ -11,3 +11,6 @@ dist/
 *.egg-info/
 htmlcov/
 .venv/
+*.dSYM/
+examples/**/*.elf
+examples/**/*.o

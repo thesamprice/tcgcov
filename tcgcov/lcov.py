@@ -4,6 +4,18 @@ With --coverable, combines the coverable-line inventory with the covered lines
 and emits DA:<line>,<count> for hit lines and DA:<line>,0 for coverable-but-not-
 hit lines, so genhtml reports true percentages (covered / coverable). Without
 it, covered-only (every covered line DA:,1).
+
+With --branches (output of `tcgcov branches`), also emits branch records:
+
+    BRDA:<line>,<block>,<branch>,<taken|->
+    BRF:<branches found>
+    BRH:<branches hit>
+
+The '-' vs '0' distinction is load-bearing and genhtml renders them
+differently: '-' means the branch was never EVALUATED (the code never ran), '0'
+means it ran but that outcome never happened -- an untested else-path, which is
+exactly what branch coverage exists to surface. Branch 0 of each block is the
+taken outcome, branch 1 the fall-through.
 """
 
 import argparse
@@ -46,10 +58,62 @@ def load(path):
     return lines_by_file, funcs_by_file, test_id, arch, line_count
 
 
+_MISSING = object()
+
+
+def load_branches(path):
+    """Parse `tcgcov branches` JSONL -> {sf: {(line, block, branch): taken}}.
+
+    `taken` is None when the branch was never evaluated (LCOV '-') and an
+    integer otherwise. Branch 0 is the taken outcome, branch 1 the fall-through.
+    Records for the same key from several inputs are summed, so a per-test run
+    that saw a branch twice still reports one entry.
+    """
+    by_file = defaultdict(dict)
+    with open(path) as f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            rec = json.loads(raw)
+            sf = rec["file"]
+            key_base = (int(rec["line"]), int(rec.get("block", 0)))
+            evaluated = bool(rec.get("evaluated"))
+            for idx, field in ((0, "taken"), (1, "nottaken")):
+                key = key_base + (idx,)
+                value = int(rec.get(field, 0)) if evaluated else None
+                cur = by_file[sf].get(key, _MISSING)
+                if cur is _MISSING or cur is None:
+                    by_file[sf][key] = value
+                elif value is not None:
+                    by_file[sf][key] = cur + value
+    return by_file
+
+
+def emit_branches(out, branches):
+    """Write the BRDA/BRF/BRH block for one source file; return (found, hit)."""
+    found = hit = 0
+    for key in sorted(branches):
+        line, block, branch = key
+        taken = branches[key]
+        # '-' = never evaluated, '0' = evaluated but this outcome never taken.
+        text = "-" if taken is None else str(taken)
+        out.write(f"BRDA:{line},{block},{branch},{text}\n")
+        found += 1
+        if taken:
+            hit += 1
+    if found:
+        out.write(f"BRF:{found}\n")
+        out.write(f"BRH:{hit}\n")
+    return found, hit
+
+
 def add_arguments(parser):
     parser.add_argument("jsonl", help="covered .jsonl from `tcgcov symbolize`")
     parser.add_argument("--coverable", help="coverable .jsonl from "
                         "`tcgcov coverable` (enables real percentages)")
+    parser.add_argument("--branches", help="branch .jsonl from "
+                        "`tcgcov branches` (adds BRDA/BRF/BRH records)")
     parser.add_argument("--out", required=True, help="output .info file")
     parser.add_argument("--test-name", help="LCOV test name (TN); "
                         "default derived from test_id+arch")
@@ -62,6 +126,7 @@ def run(args):
             cab_lines, cab_funcs, _, _, _ = load(args.coverable)
         else:
             cab_lines, cab_funcs = cov_lines, cov_funcs
+        branches = load_branches(args.branches) if args.branches else {}
     except (OSError, ValueError, KeyError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -70,9 +135,9 @@ def run(args):
 
     # The universe of source files is the coverable set, plus any covered file
     # not present in coverable (shouldn't happen, but never drop a hit).
-    all_files = set(cab_lines) | set(cov_lines)
+    all_files = set(cab_lines) | set(cov_lines) | set(branches)
 
-    total_lf = total_lh = 0
+    total_lf = total_lh = total_brf = total_brh = 0
     with open(args.out, "w") as out:
         for sf in sorted(all_files):
             covered = cov_lines.get(sf, set())
@@ -101,6 +166,10 @@ def run(args):
             if funcs:
                 out.write(f"FNF:{len(funcs)}\n")
                 out.write(f"FNH:{len(covered_fns)}\n")
+            if sf in branches:
+                brf, brh = emit_branches(out, branches[sf])
+                total_brf += brf
+                total_brh += brh
             for ln in sorted(coverable):
                 hits = cov_count.get((sf, ln), 0) if ln in covered else 0
                 out.write(f"DA:{ln},{hits}\n")
@@ -111,9 +180,12 @@ def run(args):
             total_lh += len(covered)
 
     pct = (100.0 * total_lh / total_lf) if total_lf else 0.0
-    print(f"{args.jsonl}: {len(all_files)} files, "
-          f"{total_lh}/{total_lf} lines ({pct:.1f}%) -> {args.out}",
-          file=sys.stderr)
+    summary = (f"{args.jsonl}: {len(all_files)} files, "
+               f"{total_lh}/{total_lf} lines ({pct:.1f}%)")
+    if total_brf:
+        bpct = 100.0 * total_brh / total_brf
+        summary += f", {total_brh}/{total_brf} branches ({bpct:.1f}%)"
+    print(f"{summary} -> {args.out}", file=sys.stderr)
     return 0
 
 

@@ -1,9 +1,12 @@
 /*
- * tcgcov - non-intrusive translation-block coverage for RTEMS tests.
+ * tcgcov - non-intrusive translation-block coverage for QEMU TCG.
  *
  * Observes executed translation blocks, deduplicates covered guest code
  * addresses in memory, and writes one compact "TCGCOV1" binary artifact at
  * QEMU exit. Symbolization (addr2line/LCOV) is done offline by a host tool.
+ *
+ * Optionally (edges=1) it also records the directed control-flow edges taken
+ * between translation blocks, so that branch coverage can be computed offline.
  *
  * This follows the same structure as contrib/plugins/drcov.c: the QEMU
  * translation callback carries no userdata, so plugin state lives in a single
@@ -40,27 +43,53 @@ enum {
 /* Header flags. */
 enum {
     /*
-     * When set, each record is a 16-byte { uint64 addr; uint64 count; } pair
-     * (execution count) instead of a bare 8-byte address. record_type still
-     * indicates the address granularity (TB vs instruction).
+     * When set, each *address* record is a 16-byte { uint64 addr;
+     * uint64 count; } pair (execution count) instead of a bare 8-byte
+     * address. record_type still indicates the address granularity
+     * (TB vs instruction).
      */
-    TCGCOV_FLAG_HAS_COUNTS = 0x1,
+    TCGCOV_FLAG_HAS_COUNTS  = 0x1,
+    /*
+     * When set, an edge section follows the address records: edge_count
+     * records at edges_offset describing the directed control-flow edges
+     * observed between translation blocks.
+     */
+    TCGCOV_FLAG_HAS_EDGES   = 0x2,
+    /*
+     * When set, each edge record is 24 bytes { uint64 src; uint64 dst;
+     * uint64 count; } instead of 16 bytes { uint64 src; uint64 dst; }.
+     * Only meaningful together with TCGCOV_FLAG_HAS_EDGES.
+     */
+    TCGCOV_FLAG_EDGE_COUNTS = 0x4,
 };
 
 /* All multi-byte header fields are little-endian on disk. */
 typedef struct tcgcov_header {
-    char     magic[8];
-    uint16_t version;
+    char     magic[8];             /* "TCGCOV1\0" */
+    uint16_t version;              /* 1 */
     uint16_t endian;               /* 1 = little, 2 = big */
-    uint32_t header_size;
-    uint32_t record_type;
-    uint32_t flags;
+    uint32_t header_size;          /* 88 */
+    uint32_t record_type;          /* 1 = TB_ADDR, 2 = INSN_ADDR */
+    uint32_t flags;                /* bit0 HAS_COUNTS, bit1 HAS_EDGES,
+                                      bit2 EDGE_COUNTS */
     uint64_t record_count;
     uint64_t metadata_offset;
     uint64_t metadata_size;
     uint64_t records_offset;
     uint64_t records_size;
+    uint64_t edge_count;
+    uint64_t edges_offset;
+    uint64_t edges_size;
 } tcgcov_header;
+
+/*
+ * The on-disk header is the wire contract with the offline reader; it must be
+ * exactly 88 bytes with no interior or trailing padding. Every field is
+ * naturally aligned at its declared offset on any LP64 ABI, so no packing
+ * attribute is needed - but assert it so a hostile ABI fails the build rather
+ * than silently emitting an unreadable file.
+ */
+G_STATIC_ASSERT(sizeof(tcgcov_header) == 88);
 
 /* ------------------------------------------------------------------ */
 /* Internal data structures.                                          */
@@ -77,6 +106,19 @@ typedef struct {
     U64Vec insns;                  /* in-range insn vaddrs (tb-insn mode) */
     volatile gint executed;
     uint64_t count;                /* execution count (counts mode), 64-bit */
+
+    /*
+     * Edge support: the vaddr of the LAST instruction of this TB, and whether
+     * that address passes the filter. Using the last instruction rather than
+     * the TB start as the edge source is deliberate - on delay-slot
+     * architectures (MicroBlaze, SPARC, MIPS) the branch is followed by a
+     * delay-slot instruction before control actually transfers, and the last
+     * instruction is the one an offline tool can attribute the branch to.
+     * Both are computed at translation time so the execution fast path never
+     * has to walk the filter ranges.
+     */
+    uint64_t last_insn_vaddr;
+    bool last_insn_in_range;
 } CovTb;
 
 /* { address, execution count } record used when counts mode is enabled. */
@@ -84,6 +126,34 @@ typedef struct {
     uint64_t addr;
     uint64_t count;
 } AddrCount;
+
+/*
+ * A directed control-flow edge. src/dst are written to disk in this order;
+ * count is written only when TCGCOV_FLAG_EDGE_COUNTS is set. The struct is
+ * three uint64_t with no padding on any supported ABI, so the first 16 or 24
+ * bytes can be written directly.
+ */
+typedef struct {
+    uint64_t src;                  /* last insn vaddr of the source TB */
+    uint64_t dst;                  /* start vaddr of the destination TB */
+    uint64_t count;                /* traversals */
+} Edge;
+
+G_STATIC_ASSERT(sizeof(Edge) == 24);
+
+/*
+ * Per-vCPU edge-tracking state: the pending edge source left behind by the
+ * previously executed TB on this vCPU.
+ *
+ * prev_valid is false when there is no usable predecessor, which covers two
+ * cases that both mean "emit nothing": (a) this is the first TB executed on
+ * the vCPU, and (b) the previous TB's last instruction fell outside every
+ * filter range. Collapsing them is intentional - neither produces an edge.
+ */
+typedef struct {
+    uint64_t prev_src;
+    bool prev_valid;
+} VcpuPrev;
 
 typedef struct {
     uint64_t start;
@@ -103,7 +173,25 @@ typedef struct {
 
     bool expand_tb_to_insns;       /* mode=tb-insn */
     bool counts;
+    bool edges;                    /* edges=1 */
     bool verbose;
+
+    /*
+     * Edge state. The per-vCPU array is indexed by cpu_index and grown lazily
+     * rather than sized from a fixed maximum: QEMU can hot-plug vCPUs after
+     * qemu_plugin_install(), so any fixed cap is either wasteful or a silent
+     * correctness hole. Growth is safe without extra synchronisation because
+     * *every* access to vcpu_prev - both the reallocating growth and the
+     * plain reads/writes from the TB execution callback - happens with
+     * ->lock held, so no reader can observe a stale base pointer freed by a
+     * concurrent g_realloc().
+     *
+     * Taking a mutex on each TB execution is a real cost on SMP guests, but
+     * it is only paid when edges=1, which is opt-in and off by default.
+     */
+    VcpuPrev *vcpu_prev;
+    size_t vcpu_cap;
+    GHashTable *edge_set;          /* Edge* -> same Edge*, keyed on (src,dst) */
 
     Range *ranges;
     size_t range_count;
@@ -151,9 +239,97 @@ static gint addrcount_compare(gconstpointer a, gconstpointer b)
     return (av > bv) - (av < bv);
 }
 
+/* Sort edges ascending by (src, dst), as the file format requires. */
+static gint edge_compare(gconstpointer a, gconstpointer b)
+{
+    const Edge *ea = a;
+    const Edge *eb = b;
+
+    if (ea->src != eb->src) {
+        return (ea->src > eb->src) - (ea->src < eb->src);
+    }
+    return (ea->dst > eb->dst) - (ea->dst < eb->dst);
+}
+
+static guint edge_hash(gconstpointer p)
+{
+    const Edge *e = p;
+    uint64_t h = e->src * 0x9E3779B97F4A7C15ULL;
+
+    h ^= e->dst + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+    return (guint)(h ^ (h >> 32));
+}
+
+static gboolean edge_equal(gconstpointer a, gconstpointer b)
+{
+    const Edge *ea = a;
+    const Edge *eb = b;
+
+    return ea->src == eb->src && ea->dst == eb->dst;
+}
+
+/* Size of one on-disk edge record for the current configuration. */
+static size_t edge_record_size(CovState *s)
+{
+    return s->counts ? 24 : 16;
+}
+
+/* Must be called with s->lock held. */
+static VcpuPrev *vcpu_prev_slot(CovState *s, unsigned int cpu_index)
+{
+    if (cpu_index >= s->vcpu_cap) {
+        size_t newcap = s->vcpu_cap ? s->vcpu_cap : 8;
+
+        while (newcap <= (size_t)cpu_index) {
+            newcap *= 2;
+        }
+        s->vcpu_prev = g_realloc(s->vcpu_prev, newcap * sizeof(VcpuPrev));
+        memset(&s->vcpu_prev[s->vcpu_cap], 0,
+               (newcap - s->vcpu_cap) * sizeof(VcpuPrev));
+        s->vcpu_cap = newcap;
+    }
+    return &s->vcpu_prev[cpu_index];
+}
+
 /* ------------------------------------------------------------------ */
 /* TCG callbacks.                                                     */
 /* ------------------------------------------------------------------ */
+
+/*
+ * Record the edge (previous TB's last insn -> this TB's start) on this vCPU,
+ * then remember this TB as the new predecessor.
+ *
+ * Both endpoints already satisfy the filter: dst is a TB start, and TBs whose
+ * start is out of range are never instrumented at all; src was range-checked
+ * at translation time. Note the consequence of that filtering - if execution
+ * passes through an un-instrumented (out-of-range) TB, the next recorded edge
+ * jumps over it rather than being split in two. That is inherent to filtering
+ * and is the same trade-off the address records already make.
+ */
+static void record_edge(CovState *s, unsigned int cpu_index, CovTb *ctb)
+{
+    g_mutex_lock(&s->lock);
+
+    VcpuPrev *p = vcpu_prev_slot(s, cpu_index);
+
+    if (p->prev_valid) {
+        Edge key = { p->prev_src, ctb->tb_vaddr, 0 };
+        Edge *e = g_hash_table_lookup(s->edge_set, &key);
+
+        if (!e) {
+            e = g_new0(Edge, 1);
+            e->src = key.src;
+            e->dst = key.dst;
+            g_hash_table_insert(s->edge_set, e, e);
+        }
+        e->count++;
+    }
+
+    p->prev_src = ctb->last_insn_vaddr;
+    p->prev_valid = ctb->last_insn_in_range;
+
+    g_mutex_unlock(&s->lock);
+}
 
 static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 {
@@ -164,6 +340,10 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     if (g_state.counts) {
         /* 64-bit atomic add (GLib has no portable g_atomic_int64_add). */
         __atomic_fetch_add(&ctb->count, 1, __ATOMIC_RELAXED);
+    }
+
+    if (g_state.edges) {
+        record_edge(&g_state, cpu_index, ctb);
     }
 }
 
@@ -193,6 +373,18 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         }
     }
 
+    if (s->edges) {
+        size_t n = qemu_plugin_tb_n_insns(tb);
+        if (n > 0) {
+            struct qemu_plugin_insn *last = qemu_plugin_tb_get_insn(tb, n - 1);
+            ctb->last_insn_vaddr = qemu_plugin_insn_vaddr(last);
+        } else {
+            /* Defensive: an empty TB should not happen. */
+            ctb->last_insn_vaddr = tb_vaddr;
+        }
+        ctb->last_insn_in_range = range_contains(s, ctb->last_insn_vaddr);
+    }
+
     g_ptr_array_add(s->blocks, ctb);
 
     g_mutex_unlock(&s->lock);
@@ -205,7 +397,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 /* Output.                                                            */
 /* ------------------------------------------------------------------ */
 
-static char *build_metadata_json(CovState *s, uint64_t record_count)
+static char *build_metadata_json(CovState *s, uint64_t record_count,
+                                 uint64_t edge_count)
 {
     GString *m = g_string_new(NULL);
 
@@ -228,6 +421,9 @@ static char *build_metadata_json(CovState *s, uint64_t record_count)
                            s->counts ? "true" : "false");
     g_string_append_printf(m, "  \"record_count\": %" PRIu64 ",\n",
                            record_count);
+    g_string_append_printf(m, "  \"edges_enabled\": %s,\n",
+                           s->edges ? "true" : "false");
+    g_string_append_printf(m, "  \"edge_count\": %" PRIu64 ",\n", edge_count);
 
     g_string_append(m, "  \"filters\": [");
     for (size_t i = 0; i < s->range_count; i++) {
@@ -243,6 +439,66 @@ static char *build_metadata_json(CovState *s, uint64_t record_count)
 }
 
 /*
+ * Snapshot the edge set into a flat array sorted by (src, dst).
+ * Must be called with s->lock held. Returns an empty array when edges are off.
+ */
+static GArray *collect_edges(CovState *s)
+{
+    GArray *out = g_array_new(FALSE, FALSE, sizeof(Edge));
+
+    if (s->edge_set) {
+        GHashTableIter it;
+        gpointer k, v;
+
+        g_hash_table_iter_init(&it, s->edge_set);
+        while (g_hash_table_iter_next(&it, &k, &v)) {
+            Edge e = *(Edge *)v;
+            g_array_append_val(out, e);
+        }
+    }
+
+    g_array_sort(out, edge_compare);
+    return out;
+}
+
+/*
+ * Fill in the edge-section fields of the header. records_offset and
+ * records_size must already be set. When edges are disabled all three edge
+ * fields are zero and flag bit1 stays clear.
+ */
+static void fill_edge_header(CovState *s, tcgcov_header *h, uint64_t n_edges)
+{
+    if (!s->edges) {
+        h->edge_count = 0;
+        h->edges_offset = 0;
+        h->edges_size = 0;
+        return;
+    }
+
+    h->flags |= TCGCOV_FLAG_HAS_EDGES;
+    if (s->counts) {
+        h->flags |= TCGCOV_FLAG_EDGE_COUNTS;
+    }
+    h->edge_count = n_edges;
+    h->edges_offset = h->records_offset + h->records_size;
+    h->edges_size = n_edges * (uint64_t)edge_record_size(s);
+}
+
+static void write_edges(CovState *s, FILE *f, GArray *edges)
+{
+    size_t rec = edge_record_size(s);
+
+    if (!s->edges) {
+        return;
+    }
+    for (guint i = 0; i < edges->len; i++) {
+        const Edge *e = &g_array_index(edges, Edge, i);
+        /* Edge is { src, dst, count }; the first `rec` bytes are the record. */
+        fwrite(e, rec, 1, f);
+    }
+}
+
+/*
  * Counts-mode writer: emit sorted unique { addr, count } records. Each covered
  * address inherits the execution count of every TB it belongs to; counts for
  * the same address (from retranslated/overlapping TBs) are summed.
@@ -250,6 +506,7 @@ static char *build_metadata_json(CovState *s, uint64_t record_count)
 static void plugin_exit_counts(CovState *s)
 {
     GArray *pairs = g_array_new(FALSE, FALSE, sizeof(AddrCount));
+    GArray *edges;
 
     g_mutex_lock(&s->lock);
 
@@ -270,6 +527,8 @@ static void plugin_exit_counts(CovState *s)
         }
     }
 
+    edges = collect_edges(s);
+
     g_mutex_unlock(&s->lock);
 
     g_array_sort(pairs, addrcount_compare);
@@ -287,7 +546,7 @@ static void plugin_exit_counts(CovState *s)
         }
     }
 
-    char *meta = build_metadata_json(s, unique);
+    char *meta = build_metadata_json(s, unique, edges->len);
     size_t meta_size = strlen(meta);
 
     tcgcov_header h;
@@ -304,6 +563,7 @@ static void plugin_exit_counts(CovState *s)
     h.metadata_size = meta_size;
     h.records_offset = sizeof(h) + meta_size;
     h.records_size = (uint64_t)unique * sizeof(AddrCount);
+    fill_edge_header(s, &h, edges->len);
 
     char *tmp = g_strdup_printf("%s.tmp", s->out_path);
     FILE *f = fopen(tmp, "wb");
@@ -318,20 +578,22 @@ static void plugin_exit_counts(CovState *s)
         AddrCount ac = g_array_index(pairs, AddrCount, i);
         fwrite(&ac, sizeof(ac), 1, f);
     }
+    write_edges(s, f, edges);
     fclose(f);
 
     if (rename(tmp, s->out_path) != 0) {
         g_printerr("tcgcov: failed to rename %s -> %s\n",
                    tmp, s->out_path);
     } else if (s->verbose) {
-        g_printerr("tcgcov: wrote %u count records to %s\n",
-                   unique, s->out_path);
+        g_printerr("tcgcov: wrote %u count records, %u edges to %s\n",
+                   unique, s->edges ? edges->len : 0, s->out_path);
     }
 
 out:
     g_free(tmp);
     g_free(meta);
     g_array_free(pairs, TRUE);
+    g_array_free(edges, TRUE);
 }
 
 static void plugin_exit(qemu_plugin_id_t id, void *userdata)
@@ -344,6 +606,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
     }
 
     GArray *covered = g_array_new(FALSE, FALSE, sizeof(uint64_t));
+    GArray *edges;
 
     g_mutex_lock(&s->lock);
 
@@ -361,6 +624,8 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
         }
     }
 
+    edges = collect_edges(s);
+
     g_mutex_unlock(&s->lock);
 
     g_array_sort(covered, u64_compare);
@@ -375,7 +640,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
         }
     }
 
-    char *meta = build_metadata_json(s, unique);
+    char *meta = build_metadata_json(s, unique, edges->len);
     size_t meta_size = strlen(meta);
 
     tcgcov_header h;
@@ -392,6 +657,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
     h.metadata_size = meta_size;
     h.records_offset = sizeof(h) + meta_size;
     h.records_size = (uint64_t)unique * sizeof(uint64_t);
+    fill_edge_header(s, &h, edges->len);
 
     char *tmp = g_strdup_printf("%s.tmp", s->out_path);
     FILE *f = fopen(tmp, "wb");
@@ -406,20 +672,22 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
         uint64_t a = g_array_index(covered, uint64_t, i);
         fwrite(&a, sizeof(a), 1, f);
     }
+    write_edges(s, f, edges);
     fclose(f);
 
     if (rename(tmp, s->out_path) != 0) {
         g_printerr("tcgcov: failed to rename %s -> %s\n",
                    tmp, s->out_path);
     } else if (s->verbose) {
-        g_printerr("tcgcov: wrote %u records to %s\n",
-                   unique, s->out_path);
+        g_printerr("tcgcov: wrote %u records, %u edges to %s\n",
+                   unique, s->edges ? edges->len : 0, s->out_path);
     }
 
 out:
     g_free(tmp);
     g_free(meta);
     g_array_free(covered, TRUE);
+    g_array_free(edges, TRUE);
 }
 
 /* ------------------------------------------------------------------ */
@@ -458,8 +726,10 @@ static void parse_arg(CovState *s, const char *arg)
         g_free(s->out_path);
         s->out_path = g_strdup(v);
     } else if (g_strcmp0(k, "test_id") == 0) {
+        /* Free-form metadata string, copied verbatim into the JSON. */
         s->test_id = g_strdup(v);
     } else if (g_strcmp0(k, "bsp") == 0) {
+        /* Free-form metadata string, copied verbatim into the JSON. */
         s->bsp = g_strdup(v);
     } else if (g_strcmp0(k, "elf") == 0) {
         s->elf_path = g_strdup(v);
@@ -475,6 +745,8 @@ static void parse_arg(CovState *s, const char *arg)
         parse_filter(s, v);
     } else if (g_strcmp0(k, "counts") == 0) {
         s->counts = (g_strcmp0(v, "1") == 0);
+    } else if (g_strcmp0(k, "edges") == 0) {
+        s->edges = (g_strcmp0(v, "1") == 0);
     } else if (g_strcmp0(k, "verbose") == 0) {
         s->verbose = (g_strcmp0(v, "1") == 0);
     } else {
@@ -491,7 +763,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     memset(s, 0, sizeof(*s));
     g_mutex_init(&s->lock);
     s->blocks = g_ptr_array_new();
-    s->out_path = g_strdup("qemu-rtems.cov");
+    s->out_path = g_strdup("tcgcov.cov");
     s->target_name = g_strdup(info->target_name);
     s->system_emulation = info->system_emulation;
     s->expand_tb_to_insns = true;  /* default mode=tb-insn */
@@ -500,12 +772,22 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         parse_arg(s, argv[i]);
     }
 
+    if (s->edges) {
+        /*
+         * Keyed and valued by the same Edge*; the table owns the allocation
+         * and frees it on destroy. Edge count is bounded by the size of the
+         * executed CFG, so no eviction policy is needed.
+         */
+        s->edge_set = g_hash_table_new_full(edge_hash, edge_equal, g_free,
+                                            NULL);
+    }
+
     if (s->verbose) {
         g_printerr("tcgcov: target=%s system=%d mode=%s out=%s "
-                   "filters=%zu\n",
+                   "counts=%d edges=%d filters=%zu\n",
                    s->target_name, s->system_emulation,
                    s->expand_tb_to_insns ? "tb-insn" : "tb",
-                   s->out_path, s->range_count);
+                   s->out_path, s->counts, s->edges, s->range_count);
     }
 
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);

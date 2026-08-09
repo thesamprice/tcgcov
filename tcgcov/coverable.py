@@ -19,6 +19,7 @@ import sys
 
 from .symbolize import iter_covered_lines
 from .cliargs import add_symbolize_args
+from .paths import path_options
 
 # objdump disassembly line: optional leading space, hex address, ':', tab/space.
 OBJDUMP_ADDR_RE = re.compile(r"^[ ]*([0-9a-fA-F]+):[ \t]")
@@ -65,8 +66,7 @@ def run(args):
     seen = {}
     try:
         for norm, line, func, _depth, addr in iter_covered_lines(
-                addr2line, args.elf, addrs, args.source_root,
-                args.include_testsuites, tuple(args.keep), args.all_paths):
+                addr2line, args.elf, addrs, path_options(args)):
             seen.setdefault((norm, line, func), addr)
     except (OSError, RuntimeError) as e:
         print(f"error: {e}", file=sys.stderr)

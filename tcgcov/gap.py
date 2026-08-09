@@ -23,6 +23,7 @@ from .format import read_cov
 from .symbolize import iter_covered_lines
 from .merge import parse_info
 from .cliargs import add_symbolize_args
+from .paths import path_options
 
 
 def load_app(args):
@@ -36,8 +37,7 @@ def load_app(args):
         addr2line = args.addr2line or (args.toolchain_prefix + "addr2line")
         meta, addrs, counts = read_cov(args.cov)
         for norm, line, func, _depth, addr in iter_covered_lines(
-                addr2line, args.elf, addrs, args.source_root,
-                args.include_testsuites, tuple(args.keep), args.all_paths):
+                addr2line, args.elf, addrs, path_options(args)):
             c = counts.get(addr, 0) if counts else 1
             k = (norm, line)
             if c > app_count.get(k, 0):
