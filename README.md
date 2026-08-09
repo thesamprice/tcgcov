@@ -272,16 +272,29 @@ path flags and the same source root, or the keys will not line up.
 
 ### Path selection
 
-By default the tools normalize to repo-relative paths and drop toolchain
-internals, C-library sources, crt objects and unknown system paths, which is
-what makes cross-binary merging work. Two flags widen this for binaries that
-mix code from several trees:
+Every producer must be given the *same* path options, or the covered and
+coverable sides derive different keys and the merge is wrong. The driver below
+does this for you.
 
+- `--source-root <dir>` — **the normal choice.** Keep every source file under
+  the root, normalized relative to it, and drop everything outside it
+  (toolchain headers, C-library sources, crt objects). Relative paths are what
+  make cross-binary merging work.
 - `--all-paths` — keep every source file by its **absolute** path. Best for
   single-binary reports; absolute paths defeat cross-binary merging by design.
-- `--keep <marker>` (repeatable) — add a "keep from here" path substring, so
-  that tree is kept and normalized relative to the marker while everything else
-  keeps its existing treatment.
+- `--keep <marker>` (repeatable) — a "keep from here" path substring, for code
+  that lives outside the source root. That tree is kept and normalized relative
+  to the marker.
+- `--exclude <glob>` (repeatable) — drop normalized paths matching an
+  `fnmatch` glob, e.g. `--exclude 'tests/**'`. No exclusions by default.
+- `--preset <name>` — a named bundle of the above for a known project layout.
+  `rtems` keeps only `cpukit`, `bsps` and `contrib` and excludes
+  `testsuites/**`. Presets are a one-entry dict in `tcgcov/paths.py`; adding
+  one for your project is a few lines.
+
+With **none** of these given, the tools keep absolute paths and print a warning
+rather than dropping everything — a report you cannot merge is better than a
+silently empty one.
 
 ### One-command driver
 

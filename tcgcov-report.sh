@@ -16,7 +16,8 @@
 # Usage:
 #   tcgcov-report.sh --raw-dir DIR --out-dir DIR \
 #       [--source-root SRC] [--toolchain-prefix PREFIX] [--arch ARCH] \
-#       [--all-paths] [--keep MARKER ...] [--no-branches]
+#       [--all-paths] [--keep MARKER ...] [--exclude GLOB ...] \
+#       [--preset NAME] [--no-branches]
 #
 # Example (cross target):
 #   tcgcov-report.sh --raw-dir coverage/raw --out-dir coverage \
@@ -42,6 +43,8 @@ ARCH=""
 BRANCHES=1
 ALL_PATHS=""
 KEEP_ARGS=()
+EXCLUDE_ARGS=()
+PRESET=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,6 +55,8 @@ while [[ $# -gt 0 ]]; do
     --arch)             ARCH="$2"; shift 2 ;;
     --all-paths)        ALL_PATHS="--all-paths"; shift ;;
     --keep)             KEEP_ARGS+=(--keep "$2"); shift 2 ;;
+    --exclude)          EXCLUDE_ARGS+=(--exclude "$2"); shift 2 ;;
+    --preset)           PRESET="$2"; shift 2 ;;
     --no-branches)      BRANCHES=0; shift ;;
     -h|--help)          sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -61,15 +66,22 @@ done
 [[ -n "$RAW_DIR" && -n "$OUT_DIR" ]] || {
   echo "usage: tcgcov-report.sh --raw-dir DIR --out-dir DIR [--source-root SRC]" >&2
   echo "       [--toolchain-prefix PREFIX] [--arch ARCH] [--all-paths]" >&2
-  echo "       [--keep MARKER ...] [--no-branches]" >&2
+  echo "       [--keep MARKER ...] [--exclude GLOB ...] [--preset NAME]" >&2
+  echo "       [--no-branches]" >&2
   exit 2
 }
 
-# --source-root is optional; without it, --all-paths (absolute paths) or marker
-# matching must supply usable SF paths.
+# --source-root is optional, but without it (and without --keep/--all-paths)
+# the tools fall back to absolute source paths and warn: absolute paths defeat
+# merge-by-source, so an aggregate across several binaries needs a source root.
 SRC_OPT=()
 [[ -n "$SOURCE_ROOT" ]] && SRC_OPT=(--source-root "$SOURCE_ROOT")
 PREFIX_OPT=(--toolchain-prefix "$PREFIX")
+
+# Path-selection options passed through to every producer, so the covered and
+# coverable sides derive identical keys. They must agree or the merge is wrong.
+PATH_OPTS=("${SRC_OPT[@]}" $ALL_PATHS "${KEEP_ARGS[@]}" "${EXCLUDE_ARGS[@]}")
+[[ -n "$PRESET" ]] && PATH_OPTS+=(--preset "$PRESET")
 
 read_meta() {  # read_meta <cov> <key>
   "${TCGCOV[@]}" dump --metadata-only --key "$2" "$1" 2>/dev/null || true
@@ -103,15 +115,16 @@ for cov in "${covs[@]}"; do
 
   # Covered lines: what actually ran.
   "${TCGCOV[@]}" symbolize --cov "$cov" --elf "$elf" \
-    "${PREFIX_OPT[@]}" "${SRC_OPT[@]}" --arch "$ARCH" \
-    $ALL_PATHS "${KEEP_ARGS[@]}" --out "$SYM_DIR/$base.jsonl"
+    "${PREFIX_OPT[@]}" "${PATH_OPTS[@]}" --arch "$ARCH" \
+    --out "$SYM_DIR/$base.jsonl"
 
   # Coverable lines: the denominator. Test-agnostic, so cache it per ELF.
-  cab="$CAB_DIR/$(echo "$elf" | sed 's#[/.]#_#g').jsonl"
+  safe="${elf//\//_}"; safe="${safe//./_}"
+  cab="$CAB_DIR/$safe.jsonl"
   if [[ ! -s "$cab" ]]; then
     "${TCGCOV[@]}" coverable --elf "$elf" \
-      "${PREFIX_OPT[@]}" "${SRC_OPT[@]}" --arch "$ARCH" \
-      $ALL_PATHS "${KEEP_ARGS[@]}" --out "$cab"
+      "${PREFIX_OPT[@]}" "${PATH_OPTS[@]}" --arch "$ARCH" \
+      --out "$cab"
   fi
 
   # Branch outcomes, when the plugin recorded edges (edges=1).
@@ -120,8 +133,8 @@ for cov in "${covs[@]}"; do
     br="$OUT_DIR/branches/$base.jsonl"
     mkdir -p "$OUT_DIR/branches"
     if "${TCGCOV[@]}" branches --cov "$cov" --elf "$elf" \
-         "${PREFIX_OPT[@]}" "${SRC_OPT[@]}" --arch "$ARCH" \
-         $ALL_PATHS "${KEEP_ARGS[@]}" --out "$br" 2>"$br.log"; then
+         "${PREFIX_OPT[@]}" "${PATH_OPTS[@]}" --arch "$ARCH" \
+         --out "$br" 2>"$br.log"; then
       BR_OPT=(--branches "$br")
     else
       echo "note: no branch data for $base (see $br.log)" >&2

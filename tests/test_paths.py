@@ -261,8 +261,8 @@ class TestCache(unittest.TestCase):
         first = norm(self.RAW, opts(source_root="/src/cachetest"))
         self.assertEqual(first, "pkg/mod/file.c")
 
-        self.assertEqual(norm(self.RAW, opts(source_root="/src/cachetest/pkg")),
-                         "mod/file.c")
+        deeper = opts(source_root="/src/cachetest/pkg")
+        self.assertEqual(norm(self.RAW, deeper), "mod/file.c")
         self.assertEqual(norm(self.RAW, opts(keep=["/mod/"])), "mod/file.c")
         self.assertEqual(norm(self.RAW, opts(all_paths=True)), self.RAW)
         self.assertIsNone(norm(self.RAW, opts(source_root="/src/other")))

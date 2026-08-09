@@ -1,12 +1,13 @@
 [build-system]
-requires = ["setuptools>=61"]
+# 77 is the first release accepting the PEP 639 `license` string form below.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "tcgcov"
 description = "Non-intrusive code coverage for binaries under QEMU, via a TCG plugin"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 dynamic = ["version"]
 dependencies = []
 license = "GPL-2.0-or-later"

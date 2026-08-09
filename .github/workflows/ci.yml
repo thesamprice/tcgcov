@@ -13,9 +13,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The package is pure standard library; 3.8 is the floor declared in
-        # pyproject.toml, so test the floor and a current release.
-        python: ["3.8", "3.12"]
+        # The package is pure standard library; test the floor declared in
+        # pyproject.toml and a current release.
+        python: ["3.9", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -75,13 +75,19 @@ jobs:
       - name: Fetch the QEMU plugin header
         run: |
           # Building the plugin needs only qemu-plugin.h, not a QEMU tree.
+          # Pinned to a release tag: the plugin API is versioned, so CI should
+          # fail on a deliberate bump rather than drift with upstream master.
+          # (The GitHub mirror does not serve master over raw, only tags.)
           mkdir -p .ci/include/qemu
           curl -fsSL -o .ci/include/qemu/qemu-plugin.h \
-            https://raw.githubusercontent.com/qemu/qemu/master/include/qemu/qemu-plugin.h
+            https://raw.githubusercontent.com/qemu/qemu/v10.1.0/include/qemu/qemu-plugin.h
       - name: Compile
         run: |
+          # qemu-plugin.h is included as <qemu-plugin.h>, so both the include
+          # root and the qemu/ subdirectory are needed, as QEMU's own
+          # contrib/plugins build does.
           gcc -fsyntax-only -std=gnu11 -Wall -Wextra \
-              -I.ci/include $(pkg-config --cflags glib-2.0) \
+              -I.ci/include -I.ci/include/qemu $(pkg-config --cflags glib-2.0) \
               plugin/tcgcov.c
 
   shellcheck:
