@@ -209,6 +209,172 @@ class TestIndirectBranches(unittest.TestCase):
         self.assertTrue(graph.branch_points[0].indirect)
 
 
+class TestMicroBlazeAbsoluteTargets(unittest.TestCase):
+    """brai/braid/bralid/brki take ABSOLUTE operands, bri/brid/brlid do not.
+
+    microblaze-opc.h tags each immediate branch INST_NO_OFFSET (:226-229) or
+    INST_PC_OFFSET (:223-225, :230-241). Adding the PC to an absolute operand
+    manufactures an address, and when that address happens to land on a real
+    instruction, build_blocks splits a block there -- a corrupt block map
+    produced silently, with the right exit status.
+    """
+
+    def setUp(self):
+        self.profile = cfg.get_profile("microblaze")
+
+    def target(self, text, pc=0x1000):
+        return cfg._parse_target(text, pc, self.profile)
+
+    def test_pc_relative_forms_add_the_pc(self):
+        self.assertEqual(self.target("bri 256"), 0x1100)
+        self.assertEqual(self.target("brid 256"), 0x1100)
+        self.assertEqual(self.target("brlid r15, 256"), 0x1100)
+        self.assertEqual(self.target("beqid r6, 16"), 0x1010)
+        self.assertEqual(self.target("bnei r3, 12"), 0x100c)
+        self.assertEqual(self.target("bri -12"), 0xff4)
+
+    def test_absolute_forms_do_not_add_the_pc(self):
+        self.assertEqual(self.target("brai 256"), 0x100)
+        self.assertEqual(self.target("braid 256"), 0x100)
+        self.assertEqual(self.target("bralid r15, 256"), 0x100)
+        self.assertEqual(self.target("brki r16, 8"), 0x8)
+
+    def test_absolute_operand_does_not_inject_a_false_block_leader(self):
+        # 'braid 16' at 0x90000004 is absolute: it goes to 0x10, which is not in
+        # this dump. Read as PC-relative it would "target" 0x90000014, a real
+        # instruction, and split that block in two.
+        text = objdump([
+            "90000000 <main>:",
+            (0x90000000, "3021ffe0", "addik\tr1, r1, -32"),
+            (0x90000004, "b8180010", "braid\t16"),
+            (0x90000008, "80000000", "or\tr0, r0, r0"),
+            (0x9000000c, "30a00001", "addik\tr5, r0, 1"),
+            (0x90000010, "30a00002", "addik\tr5, r0, 2"),
+            (0x90000014, "30a00003", "addik\tr5, r0, 3"),
+            (0x90000018, "b60f0008", "rtsd\tr15, 8"),
+            (0x9000001c, "80000000", "or\tr0, r0, r0"),
+        ])
+        graph = cfg.analyze(text, cfg.get_profile("microblaze"))
+        braid = [i for i in graph.insns if i.mnemonic == "braid"][0]
+        self.assertEqual(braid.target, 0x10)
+        self.assertEqual([(b.start, b.end) for b in graph.blocks], [
+            (0x90000000, 0x90000008),   # ends with braid's delay slot
+            (0x9000000c, 0x9000001c),   # NOT split at 0x90000014
+        ])
+
+    def test_absolute_target_that_is_real_is_kept(self):
+        # Absolute really can name an address in the dump; when it does, it must
+        # become a leader, so the fix is not "ignore absolute operands".
+        text = objdump([
+            "00000000 <main>:",
+            (0x00000000, "3021ffe0", "addik\tr1, r1, -32"),
+            (0x00000004, "b8180010", "braid\t16"),
+            (0x00000008, "80000000", "or\tr0, r0, r0"),
+            (0x0000000c, "30a00001", "addik\tr5, r0, 1"),
+            (0x00000010, "b60f0008", "rtsd\tr15, 8"),
+            (0x00000014, "80000000", "or\tr0, r0, r0"),
+        ])
+        graph = cfg.analyze(text, cfg.get_profile("microblaze"))
+        braid = [i for i in graph.insns if i.mnemonic == "braid"][0]
+        self.assertEqual(braid.target, 0x10)
+        self.assertIn(0x10, {b.start for b in graph.blocks})
+
+    def test_absolute_key_is_accepted_in_a_user_profile(self):
+        body = {"name": "toyabs", "unconditional": r"^(jr|ja)\b",
+                "pcrel_operand": True, "absolute": r"^ja\b"}
+        f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(body, f)
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        cfg.load_profile_file(f.name)
+        p = cfg.get_profile("toyabs")
+        self.assertEqual(cfg._parse_target("jr 16", 0x100, p), 0x110)
+        self.assertEqual(cfg._parse_target("ja 16", 0x100, p), 0x10)
+
+
+# A STRIPPED binary: GNU objdump prints the branch target as a bare hex number
+# and appends " <sym+off>" only when a symbol covers it. Same instructions, same
+# targets -- just no symbol table, and no symbol header lines either.
+STRIPPED_AARCH64 = objdump([
+    (0x4008a0, "1f000871", "cmp\tw0, #0x1"),
+    (0x4008a4, "ab00005a", "b.lt\t4008b0"),
+    (0x4008a8, "20008052", "mov\tw0, #0x1"),
+    (0x4008ac, "c0035fd6", "ret"),
+    (0x4008b0, "00008052", "mov\tw0, #0x0"),
+    (0x4008b4, "c0035fd6", "ret"),
+], fmt="elf64-littleaarch64")
+
+
+class TestStrippedBinaryTargets(unittest.TestCase):
+    """A direct branch stays direct when the symbols are gone.
+
+    Requiring a literal '0x' or a '<sym>' suffix made every branch in a stripped
+    ELF parse as indirect, so the whole branch inventory was excluded and the
+    denominator silently became zero -- branch coverage reported nothing rather
+    than reporting a problem.
+    """
+
+    def test_bare_hex_target_is_resolved(self):
+        graph = cfg.analyze(STRIPPED_AARCH64, cfg.get_profile("aarch64"))
+        self.assertEqual([(bp.addr, bp.mnemonic, bp.taken, bp.fallthrough)
+                          for bp in graph.branch_points],
+                         [(0x4008a4, "b.lt", 0x4008b0, 0x4008a8)])
+        self.assertEqual(graph.indirect_branches, [])
+
+    def test_symbolic_and_stripped_forms_agree(self):
+        """The <sym+off> suffix must not change the parsed target."""
+        p = cfg.get_profile("aarch64")
+        addrs = {0x4008b0}
+        self.assertEqual(
+            cfg._parse_target("b.lt 4008b0", 0, p, None, addrs),
+            cfg._parse_target("b.lt 4008b0 <f+0x20>", 0, p, None, addrs))
+
+    def test_bare_number_that_is_not_an_address_is_refused(self):
+        """A bare operand is ambiguous, so it is validated, not trusted."""
+        p = cfg.get_profile("aarch64")
+        self.assertIsNone(cfg._parse_target("b.lt 12", 0, p, None, {0x4008b0}))
+        # ...and with no address set at all there is nothing to validate against.
+        self.assertIsNone(cfg._parse_target("b.lt 4008b0", 0, p))
+
+    def test_register_operand_is_not_read_as_a_bare_hex_target(self):
+        p = cfg.get_profile("aarch64")
+        self.assertIsNone(cfg._parse_target("br x8", 0, p, None, {0x8, 0xb0}))
+        self.assertIsNone(cfg._parse_target("blr x8", 0, p, None, {0x8}))
+
+    def test_stripped_x86_jump_still_terminates_its_block(self):
+        text = objdump([
+            (0x401000, "48 83 ec 08", "sub    $0x8,%rsp"),
+            (0x401004, "74 06", "je     40100c"),
+            (0x401006, "b8 01 00 00 00", "mov    $0x1,%eax"),
+            (0x40100b, "c3", "ret"),
+            (0x40100c, "31 c0", "xor    %eax,%eax"),
+            (0x40100e, "c3", "ret"),
+        ], fmt="elf64-x86-64")
+        graph = cfg.analyze(text, cfg.get_profile("x86_64"))
+        bp = graph.branch_points[0]
+        self.assertEqual((bp.taken, bp.fallthrough), (0x40100c, 0x401006))
+        self.assertFalse(bp.indirect)
+
+    def test_microblaze_displacement_is_not_read_as_hex(self):
+        """MicroBlaze prints a DECIMAL displacement; bare-hex must not win."""
+        p = cfg.get_profile("microblaze")
+        # 0x90000010 would be reachable if "16" were read as hex 0x16 + pc.
+        self.assertEqual(cfg._parse_target("bri 16", 0x90000000, p, None,
+                                           {0x90000010, 0x90000016}),
+                         0x90000010)
+
+    def test_microblaze_imm_prefixed_branch_stays_unknown(self):
+        """An 'imm' prefix makes the printed operand incomplete: refuse it.
+
+        Falling through to a bare-hex reading would re-derive the same wrong
+        number in a different base.
+        """
+        p = cfg.get_profile("microblaze")
+        prev = cfg.Insn(0x90000000, "imm -256", "imm", cfg.OTHER, ".text")
+        self.assertIsNone(cfg._parse_target("bri 4660", 0x90000004, p, prev,
+                                            {0x1234, 0x90000004}))
+
+
 class TestEdgeMatching(unittest.TestCase):
     def setUp(self):
         self.graph = cfg.analyze(MB_TEXT, cfg.get_profile("microblaze"))

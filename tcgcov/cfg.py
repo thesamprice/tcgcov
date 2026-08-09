@@ -34,6 +34,16 @@ matched (with re.match, case-insensitively) against the normalized instruction
 text "<mnemonic> <operands>". Classification order is return, call, conditional,
 unconditional, so precise patterns win over generic ones.
 
+Conditional calls
+-----------------
+Several ISAs can predicate a call: ARM `bleq`, PowerPC `bltl`, MIPS `bltzal`.
+Such an instruction is BOTH a two-way branch point and a block terminator, and
+`call` is tried before `conditional`, so a `call` pattern that swallows them
+deletes them from the branch inventory. Every profile therefore classifies them
+COND, which supplies both properties: COND is in TERMINATORS, and CFG builds a
+BranchPoint only for COND. The `call` patterns are written to match the
+UNCONDITIONAL forms alone.
+
 Users can add an arch without touching the package: write a JSON file and pass
 `--arch-profile FILE` (see load_profile_file() for the schema). An arch with no
 profile is NOT guessed at -- callers get UNSUPPORTED_PROFILE, whose contract is
@@ -84,6 +94,22 @@ HEX_TARGET_RE = re.compile(r"0x([0-9a-fA-F]+)")
 # The lookbehind rejects a register operand: in "beq r3, r4" the trailing token
 # is the register r4, NOT a displacement of 4.
 DECIMAL_TAIL_RE = re.compile(r"(?<![\w.$%])(-?\d+)\s*$")
+# A BARE trailing hex operand, with no "0x" and no "<sym>" after it. This is how
+# GNU objdump prints every direct branch in a STRIPPED binary -- the "<sym+off>"
+# suffix is appended only when a symbol covers the target address:
+#
+#   b.lt 4008b0 <f+0x20>   symbols present
+#   b.lt 4008b0            stripped -- same instruction, same target
+#
+# Without this the whole branch inventory of a stripped ELF parses as "indirect"
+# and is excluded from coverage, i.e. the denominator silently becomes zero.
+# It is the LOWEST-trust source precisely because a bare number is ambiguous
+# (MicroBlaze's "bri 12" is a displacement, ARM's "movw r0, 4660" an immediate),
+# so a value from here is accepted only after it is checked against the set of
+# real instruction addresses -- see _parse_target's `valid_addrs`.
+# The lookbehind rejects anything glued to a register/immediate/sign prefix
+# ("r3", "$8", "#16", "-4"), which a target operand never has.
+BARE_HEX_TARGET_RE = re.compile(r"(?<![\w.$%#+-])([0-9a-fA-F]+)\s*$")
 
 # Instruction kinds.
 OTHER, COND, UNCOND, CALL, RET = "other", "cond", "uncond", "call", "ret"
@@ -102,7 +128,7 @@ class ArchProfile(object):
     def __init__(self, name, conditional="", unconditional="", call="",
                  ret="", has_delay_slot=False, delay_slot="", insn_size=4,
                  pcrel_operand=False, comment_target=False, indirect="",
-                 aliases=(), supported=True, notes=""):
+                 absolute="", aliases=(), supported=True, notes=""):
         self.name = name
         self.has_delay_slot = bool(has_delay_slot)
         self.insn_size = int(insn_size)
@@ -122,6 +148,11 @@ class ArchProfile(object):
         # operand, so no static target exists no matter what the operands look
         # like (x86's 'jmp *0x10(%rax)' would otherwise "parse" as 0x10).
         self._indirect = self._compile(indirect)
+        # pcrel_operand is an ARCHITECTURE-wide default, but on most ISAs that
+        # have PC-relative branches at all, a handful of mnemonics take an
+        # ABSOLUTE operand instead. This regex names those exceptions, so the
+        # displacement is used as-is rather than added to the PC.
+        self._absolute = self._compile(absolute)
 
     @staticmethod
     def _compile(pattern):
@@ -138,6 +169,14 @@ class ArchProfile(object):
     def is_indirect(self, text):
         """True if the transfer target is a register/memory operand."""
         return self._indirect is not None and bool(self._indirect.match(text))
+
+    def is_absolute(self, text):
+        """True if this mnemonic's numeric operand is an ABSOLUTE address.
+
+        Only consulted for profiles with pcrel_operand set; it names the
+        per-mnemonic exceptions to that arch-wide default.
+        """
+        return self._absolute is not None and bool(self._absolute.match(text))
 
     def delays(self, kind, text):
         """True if this instruction is followed by an executed delay slot."""
@@ -184,6 +223,19 @@ def _p(*a, **kw):
 # forms; the link (call) forms exist ONLY with a delay slot; every 'd'-suffixed
 # form delays and no other form does. objdump prints the raw displacement as the
 # operand and the resolved target only as a trailing "// <hex>" comment.
+#
+# ABSOLUTE vs PC-RELATIVE. Every immediate-operand branch carries an explicit
+# flag in the opcode table, and the two groups are NOT interchangeable:
+#
+#   microblaze-opc.h:223-225  bri / brid / brlid        INST_PC_OFFSET
+#   microblaze-opc.h:226-229  brai / braid / bralid /
+#                             brki                      INST_NO_OFFSET
+#   microblaze-opc.h:230-241  beqi..bgeid (all 12)      INST_PC_OFFSET
+#
+# So `brai 256` goes to 0x100, NOT to pc+256. Adding the PC to an absolute
+# operand fabricates an address that can easily land on some unrelated real
+# instruction, and build_blocks then splits a block there -- a corrupt block
+# map, reported with no error. Hence the per-mnemonic `absolute` regex below.
 _p("microblaze",
    aliases=("microblazeel", "microblazebe"),
    conditional=r"^(beqid|beqi|beqd|beq|bneid|bnei|bned|bne|bltid|blti|bltd|blt"
@@ -199,11 +251,17 @@ _p("microblaze",
    # trailing 4 is emphatically not a displacement.
    indirect=r"^(beqd?|bned?|bltd?|bled?|bgtd?|bged?|brd?|brad?|brld?|brald?)"
             r"(?=\s|$)",
+   # INST_NO_OFFSET immediate forms (microblaze-opc.h:226-229): the operand IS
+   # the target address. Everything else on this arch is INST_PC_OFFSET.
+   absolute=r"^(bralid|braid|brai|brki)\b",
    has_delay_slot=True, insn_size=4,
    comment_target=True, pcrel_operand=True,
    notes="brk/brki (break/trap) are grouped with calls: they transfer control "
          "and end a translation block, but never delay. The register-target "
-         "forms (br/brd/bra/brad/brld/brald) are indirect and excluded.")
+         "forms (br/brd/bra/brad/brld/brald) are indirect and excluded. "
+         "brai/braid/bralid/brki take ABSOLUTE operands; every other "
+         "immediate form (bri/brid/brlid and all 12 conditional forms) is "
+         "PC-relative.")
 
 # RISC-V rv32/rv64 -- binutils prints the standard aliases by default (beqz,
 # bnez, blez, bgez, bltz, bgtz, j, jr, jal, jalr, ret) and the compressed
@@ -223,17 +281,42 @@ _p("riscv",
          "address deltas, so a mixed RVC/RV32I stream is fine.")
 
 # ARM A32/T32 -- objdump prints the condition suffix on the mnemonic (and maps
-# 'al' to the empty string, so a bare 'b' is unconditional). BL with a condition
-# (bleq, blne, ...) is a CALL while ble/blt/bls are conditional BRANCHES; the \b
-# after the exact condition alternation is what keeps those apart. Thumb adds
-# the .n/.w width suffix and cbz/cbnz. objdump prints cs/cc, never hs/lo, but
-# both are accepted.
+# 'al' to the empty string, so a bare 'b' is unconditional). Thumb adds the
+# .n/.w width suffix and cbz/cbnz. objdump prints cs/cc, never hs/lo, but both
+# are accepted.
+#
+# CONDITIONAL CALLS. 'bleq/blne/bllt/...' are BL under a condition: they are
+# two-way branch points that happen to link. Classifying them as calls (which
+# the exact-condition alternation used to do, because classify() tries `call`
+# before `cond`) kept them out of the branch inventory entirely, so every
+# if-converted call in A32 code was missing from the denominator. They are
+# classified COND instead, which gives BOTH properties this instruction needs:
+# COND is in TERMINATORS so the block still ends here, and CFG builds a
+# BranchPoint for COND so both outcomes are counted. This is exactly how the
+# PowerPC profile already treats its conditional-and-link forms (bltl, bnel),
+# so the two arches now agree. Only the unconditional 'bl/blx/blxns' remain
+# CALL; the \b after the bare mnemonic is what keeps 'ble' (b+le, a plain
+# conditional branch) from matching 'bl'.
+#
+# Low-overhead loops (Armv8.1-M, arm-dis.c:4410-4418): 'le'/'letp' are the
+# loop-END back-edge (decrement LR, branch if the loop is not finished) and
+# 'wls'/'wlstp' the loop-START guard (branch past the loop when the count is
+# zero). All four are genuine conditional branches with a printed target.
+# 'dls'/'dlstp' (arm-dis.c:4420-4422) are NOT branches -- they only initialize
+# LR -- and are deliberately left as OTHER.
 _ARM_CC = r"(eq|ne|cs|hs|cc|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le)"
 _p("arm",
    aliases=("armv7", "armel", "armhf", "thumb", "littlearm", "bigarm"),
-   conditional=r"^(b" + _ARM_CC + r"|cbn?z)(\.[nw])?\b",
-   unconditional=r"^(bal|b|bx|bxj|bxns)(\.[nw])?\b",
-   call=r"^(bl" + _ARM_CC + r"?|blx" + _ARM_CC + r"?|blxns)(\.[nw])?\b",
+   conditional=r"^(b" + _ARM_CC + r"|bl" + _ARM_CC + r"|blx" + _ARM_CC +
+               r"|cbn?z|letp|le|wlstp|wls)(\.[nw])?\b",
+   # tbb/tbh (arm-dis.c:4563-4565) are Thumb table branches: unconditional
+   # register-indirect jumps. They MUST terminate the block -- the inline jump
+   # table sits in the bytes right after them, and objdump happily disassembles
+   # those bytes as instructions, so a tbb that does not end its block splices
+   # table data into the block map.
+   unconditional=r"^(bal|b|bx|bxj|bxns|tbb|tbh)(\.[nw])?\b"
+                 r"|^movs?" + _ARM_CC + r"?(\.[nw])?\s+pc\s*,",
+   call=r"^(bl|blx|blxns)(\.[nw])?\b",
    # ARM has no return instruction: returning is 'bx lr', a pop/ldm that writes
    # pc, or a move to pc. Missing one only merges two blocks, but function
    # symbols are block leaders as well, which limits the damage.
@@ -242,10 +325,18 @@ _p("arm",
        r"|ldm[\w.]*\s+\w+!?,\s*\{[^}]*\bpc\b"
        r"|movs?" + _ARM_CC + r"?(\.[nw])?\s+pc,\s*lr\b"
        r"|ldr" + _ARM_CC + r"?(\.[nw])?\s+pc,)",
+   # Register-target transfers, whose operands are never an address. 'blx'
+   # splits on the first operand character: objdump prints a register for the
+   # indirect form ("blx r3") and a digit for the direct one ("blx 8010 <f>").
+   indirect=r"^(bx|bxj|bxns|tbb|tbh)" + _ARM_CC + r"?(\.[nw])?\b"
+            r"|^blx" + _ARM_CC + r"?(\.[nw])?\s+[a-z]"
+            r"|^(movs?|ldr)[\w.]*\s+pc\s*,",
    insn_size=4,
-   notes="'ble/blt/bls' are conditional branches, 'bleq/blne/...' conditional "
-         "calls. v8.1-M low-overhead-loop branches (bf/wls/le/dls) are not "
-         "modeled.")
+   notes="'ble/blt/bls' are conditional branches; 'bleq/blne/...' are "
+         "CONDITIONAL CALLS and are classified COND so they are branch points "
+         "as well as block terminators (same as PowerPC 'bltl'). v8.1-M "
+         "'le/letp/wls/wlstp' are conditional branches; 'bf/bfl/bfx/bfcsel' "
+         "(arm-dis.c:4425-4433) are not modeled.")
 
 # AArch64 -- b.<cond> (and the v8.8 bc.<cond>), cbz/cbnz, tbz/tbnz and the v9.6
 # CMPBR family are the conditional branches; objdump appends a "// b.hs" alias
@@ -272,7 +363,11 @@ _X86_CC = (r"(o|no|b|ae|e|ne|be|a|s|ns|p|np|l|ge|le|g|z|nz|c|nc|na|nae|nb|nbe"
            r"|ng|nge|nl|nle|pe|po|cxz|ecxz|rcxz)")
 _X86_KW = dict(
     conditional=_X86_PREFIX + r"(j" + _X86_CC + r"|loopn?[ez]?)\b",
-    unconditional=_X86_PREFIX + r"(jmp|jmpq|jmpl|jmpw|ljmp\w*)\b",
+    # jmpabs (i386-dis.c:14640) is the APX 64-bit absolute direct jump. It is
+    # printed as "jmpabs $0x...", i.e. WITHOUT the '*' that marks every other
+    # absolute-looking x86 transfer, so it is a direct unconditional branch --
+    # and, being unconditional, it has to end its block.
+    unconditional=_X86_PREFIX + r"(jmpabs|jmp|jmpq|jmpl|jmpw|ljmp\w*)\b",
     call=_X86_PREFIX + r"(call|callq|calll|callw|lcall\w*)\b",
     ret=_X86_PREFIX + r"(ret|retq|retl|retw|retf\w*|lret\w*|iret\w*"
                       r"|sysret\w*|sysexit)\b",
@@ -288,6 +383,19 @@ _p("x86", aliases=("i386", "i486", "i586", "i686"), **_X86_KW)
 # is what the delay_slot lookahead encodes. bltzal/bgezal(l) branch AND link;
 # they are listed as conditional because they are genuine branch points (the
 # link is a side effect), and classification checks calls before conditionals.
+#
+# Every mnemonic below carries CBD (INSN_COND_BRANCH_DELAY, mips-opc.c:224) or
+# NODS (INSN_NO_DELAY_SLOT, mips-opc.c:228) in the opcode table. The additions:
+#
+#   mips-opc.c:729,734    bc1eqz / bc1nez     CBD -- the ONLY FP conditional
+#                                             branches in MIPS32r6, which
+#                                             replaced bc1t/bc1f wholesale, so
+#                                             missing them loses every FP
+#                                             branch in r6 code
+#   mips-opc.c:3366,3371  bc2eqz / bc2nez     CBD -- coprocessor-2 equivalent
+#   mips-opc.c:2146-2148  bposge32 / bposge64 CBD, bposge32c NODS -- DSP ASE
+#   mips-opc.c:718-723    bbit0 / bbit1 /     CBD -- Octeon branch-on-bit
+#                         bbit032 / bbit132
 _p("mips",
    aliases=("mips64", "mipsel", "mipsisa32", "mipsisa64", "tradlittlemips",
             "tradbigmips"),
@@ -296,7 +404,9 @@ _p("mips",
                r"|beqzalc|bnezalc"
                r"|beqzc?|bnezc?|beqc?|bnec?|blezc?|bgtzc?|bltzc?|bgezc?"
                r"|bltuc|bgeuc|bltc|bgec|bovc|bnvc"
-               r"|bc[0-3][tf]l?|bn?z\.[bhwvd])\b",
+               r"|bc[0-3][tf]l?|bc[12](eqz|nez)"
+               r"|bposge(32c?|64)|bbit[01](32)?"
+               r"|bn?z\.[bhwvd])\b",
    unconditional=r"^(bc|b|j|jr|jr\.hb|jrc)\b",
    call=r"^(jalx?|jalrc?|jalr\.hb|balc?|jialc)\b",
    ret=r"^(jr(\.hb)?\s+\$?(ra|31)\b|jrc\s+\$?ra\b|jic\s+\$?ra\b)",
@@ -331,24 +441,54 @@ _p("powerpc",
 # are ',a' (annul) and ',pn'; GNU objdump never prints ',pt' (llvm-objdump
 # does, so it is accepted). Operands are preceded by a space, giving the
 # characteristic double space after the mnemonic.
+#
+# BRANCH NEVER. 'bn' (sparc-opc.c:1379, condition CONDN), 'fbn' and 'cbn'
+# (sparc-opc.c:1697) encode the never-true condition: they NEVER transfer to
+# the label they print. binutils files bn under F_CONDBR and fbn/cbn under
+# F_UNBR, but neither classification is usable here -- calling them
+# unconditional made build_blocks split a block at a target that is never
+# reached, and calling them conditional would add a branch point whose taken
+# side is unreachable by construction, i.e. a permanently half-covered branch.
+# They fall through, always, so they are OTHER: not a terminator, not a branch
+# point. (Caveat: 'bn,a' annuls its delay slot, so the following instruction is
+# skipped. That is a control-flow effect this CFG has no way to express; it
+# affects which instruction executes, not the branch denominator.)
+#
+# COPROCESSOR BRANCHES. The 'cb*' spellings are real -- they are the third
+# expansion of the CONDFC macro (sparc-opc.c:1674-1706), paired one-for-one
+# with the 'fb*' names. Bare 'cb' DOES exist (sparc-opc.c:1688, paired with
+# 'fb') but it is F_UNBR, branch-ALWAYS, so making the suffix group optional in
+# the conditional pattern was wrong in both directions: it classified the
+# unconditional 'cb'/'cba' as conditional, while the real conditional spellings
+# 'cb02', 'cb023', 'cb013' and 'cb12' were absent and fell through to OTHER.
+# The 14 condition spellings below are enumerated from sparc-opc.c:1690-1706;
+# the letter forms (cbe/cbf/cbr/... , sparc-opc.c:1953-1967) are the sparclet
+# coprocessor branches, F_CONDBR, which share the same opcode space and are
+# what objdump prints for a sparclet target.
 _SPARC_SUFFIX = r"(,a)?(,pt|,pn)?"
+_SPARC_CB = (r"cb(012|013|023|123|01|02|03|12|13|23|0|1|2|3"
+             r"|n(efr|ef|er|fr|e|f|r)|efr|ef|er|fr|e|f|r)")
 _p("sparc",
    aliases=("sparc64", "sparcv9", "sparclite", "sparc:v9"),
    conditional=r"^(bne|bneg|be|bg|bge|bgu|ble|bleu|bl|bcc|bcs|bpos|bvc|bvs"
                r"|bz|bnz|blu"
                r"|fb(ne|e|g|ge|lg|le|l|ue|ug|uge|ule|ul|u|o)"
-               r"|cb(01[23]?|012|03|0|1|2|3|123|13|23)?"
+               r"|" + _SPARC_CB +
                r"|br[zn]|brnz|brlez|brlz|brgz|brgez"
                r"|c[wx]b(ne|e|g|le|ge|l|gu|leu|cc|cs|neg|pos|vc|vs))"
                + _SPARC_SUFFIX + r"\b",
-   unconditional=r"^(ba|bn|b|fba|fbn|fb|jmpl|jmp)" + _SPARC_SUFFIX + r"\b",
+   # 'bn'/'fbn'/'cbn' are deliberately absent: see BRANCH NEVER above.
+   unconditional=r"^(ba|b|fba|fb|cba|cb|jmpl|jmp)" + _SPARC_SUFFIX + r"\b",
    call=r"^call\b",
    ret=r"^(retl|return|rett|ret)\b",
    has_delay_slot=True,
    # Everything delays except v9 'return' and the CBcond compare-and-branch
    # family (cwb*/cxb*).
    delay_slot=r"^(?!return\b|c[wx]b)\w+",
-   insn_size=4)
+   insn_size=4,
+   notes="'bn'/'fbn'/'cbn' (branch never) are OTHER: they never transfer, so "
+         "they neither end a block nor form a branch point. Bare 'cb'/'cba' "
+         "are branch-ALWAYS (sparc-opc.c:1688-1689), not conditional.")
 
 
 # --- lookup -----------------------------------------------------------------
@@ -442,6 +582,10 @@ def load_profile_file(path):
         pcrel_operand   bool, a trailing decimal operand is a PC-relative
                         displacement (used only when objdump printed no
                         resolved target)
+        absolute        regex naming the mnemonics that are the EXCEPTION to
+                        pcrel_operand -- their operand is already the target
+                        address and the PC must not be added (MicroBlaze
+                        brai/braid/bralid/brki)
         comment_target  bool, the resolved target may appear in a trailing
                         "// <hex>" comment (MicroBlaze does this)
         indirect        regex marking register/memory-target transfers, whose
@@ -472,7 +616,7 @@ def load_profile_file(path):
         body["ret"] = body.pop("return", body.pop("ret", ""))
         allowed = ("conditional", "unconditional", "call", "ret",
                    "has_delay_slot", "delay_slot", "insn_size",
-                   "pcrel_operand", "comment_target", "indirect",
+                   "pcrel_operand", "comment_target", "indirect", "absolute",
                    "aliases", "notes")
         unknown = [k for k in body if k not in allowed]
         if unknown:
@@ -580,7 +724,7 @@ def _instruction_text(rest):
     return ""
 
 
-def _parse_target(text, insn_addr, profile, prev=None):
+def _parse_target(text, insn_addr, profile, prev=None, valid_addrs=None):
     """Return the resolved branch target address, or None if not statically known.
 
     Sources, in order of trust:
@@ -588,12 +732,17 @@ def _parse_target(text, insn_addr, profile, prev=None):
       1. "<hex> <sym+0xoff>" -- how most targets print a direct target. The LAST
          match wins because some ISAs put other operands first (PowerPC
          `beq cr7,<addr>`).
-      2. A trailing "// <hex>" comment -- MicroBlaze prints the raw displacement
+      2. An explicit 0x operand (llvm-objdump always prints one).
+      3. A trailing "// <hex>" comment -- MicroBlaze prints the raw displacement
          as the operand and the resolved target only as a comment.
-      3. An explicit 0x operand (stripped binaries print no <sym>).
       4. Only for profiles that ask for it: a trailing decimal operand read as a
-         PC-relative displacement (MicroBlaze again, where objdump omits the
-         comment for some forms).
+         displacement (MicroBlaze, where objdump omits the comment for some
+         forms). PC-relative by default, but ABSOLUTE for the mnemonics the
+         profile's `absolute` pattern names -- getting that split wrong
+         manufactures an address out of thin air.
+      5. A BARE trailing hex operand with no 0x and no <sym>, which is all a
+         stripped binary gives you. Ambiguous by nature, so it is accepted only
+         when it names a real instruction address -- pass `valid_addrs`.
 
     Anything else is a register/indirect target and returns None -- callers must
     EXCLUDE those from branch coverage rather than call them uncovered.
@@ -613,12 +762,24 @@ def _parse_target(text, insn_addr, profile, prev=None):
     if profile.pcrel_operand:
         # A preceding MicroBlaze `imm` supplies the immediate's upper 16 bits,
         # so the printed displacement alone is not the real target: refuse
-        # rather than compute a wrong one.
+        # rather than compute a wrong one. Refusing means refusing outright --
+        # falling through to the bare-hex reading below would re-derive the very
+        # number we just rejected, in a different base.
         if prev is not None and prev.mnemonic.lower() == "imm":
             return None
         m = DECIMAL_TAIL_RE.search(text)
         if m:
-            return (insn_addr + int(m.group(1))) & 0xFFFFFFFFFFFFFFFF
+            disp = int(m.group(1))
+            if profile.is_absolute(text):
+                return disp & 0xFFFFFFFFFFFFFFFF
+            return (insn_addr + disp) & 0xFFFFFFFFFFFFFFFF
+        return None
+    if valid_addrs:
+        m = BARE_HEX_TARGET_RE.search(text)
+        if m:
+            addr = int(m.group(1), 16)
+            if addr in valid_addrs:
+                return addr
     return None
 
 
@@ -662,6 +823,10 @@ def parse_objdump(text, profile):
             % len(text.splitlines()))
 
     insns.sort(key=lambda i: i.addr)
+    # The address set is what makes the bare-hex target reading (stripped
+    # binaries) safe: a number that is not an instruction address is not a
+    # target, whatever it looks like.
+    valid_addrs = {insn.addr for insn in insns}
     for i, insn in enumerate(insns):
         nxt = insns[i + 1] if i + 1 < len(insns) else None
         if nxt is not None and nxt.section == insn.section \
@@ -671,7 +836,8 @@ def parse_objdump(text, profile):
             insn.size = profile.insn_size
         if insn.kind in (COND, UNCOND, CALL):
             insn.target = _parse_target(insn.text, insn.addr, profile,
-                                        insns[i - 1] if i else None)
+                                        insns[i - 1] if i else None,
+                                        valid_addrs)
     return insns
 
 
