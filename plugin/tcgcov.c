@@ -5,8 +5,17 @@
  * memory, and writes one compact "TCGCOV1" binary artifact at QEMU exit.
  * Symbolization (addr2line/LCOV) is done offline by a host tool.
  *
- * Optionally (edges=1) it also records the directed control-flow edges taken
- * between translation blocks, so that branch coverage can be computed offline.
+ * Every address record carries an execution count. That is not an option: it
+ * used to be `counts=1`, but maintaining the count unconditionally SUBSUMES the
+ * separate "was this executed" flag - `count != 0` IS executed - so removing
+ * the option removed a field and two branches from the per-instruction hot
+ * path rather than adding work to it. `counts=` is now rejected outright.
+ *
+ * It also records the directed control-flow edges taken between translation
+ * blocks, so that branch coverage can be computed offline. That one IS still an
+ * option (`edges=off`) because it cannot be folded away the same manner: it
+ * costs an extra per-TB callback and a hash-table insert per block execution,
+ * which a long-running system run may reasonably decline. It defaults to on.
  *
  * Fidelity of the address records depends on the mode:
  *
@@ -173,14 +182,15 @@ typedef struct {
  * TB callback is what records coverage) and for edges=on in any mode (where it
  * is what records the incoming edge).
  *
- * `executed` and `count` are only meaningful in the two TB-level modes; in
- * mode=tb-insn the address records come from CovInsn instead.
+ * `count` is only meaningful in the two TB-level modes; in mode=tb-insn the
+ * address records come from CovInsn instead and this stays zero. A non-zero
+ * count is also the "this block executed" predicate - there is no separate
+ * flag, because a maintained count already answers that question.
  */
 typedef struct {
     uint64_t tb_vaddr;
     U64Vec insns;                  /* in-range insn vaddrs (tb-insn-fast) */
-    unsigned int executed;         /* monotonic 0 -> 1, relaxed atomic */
-    uint64_t count;                /* execution count (counts mode), 64-bit */
+    uint64_t count;                /* execution count, 64-bit */
 
     /*
      * Edge support: the vaddr of the LAST instruction of this TB. Using the
@@ -202,8 +212,7 @@ typedef struct {
  */
 typedef struct {
     uint64_t vaddr;
-    uint64_t count;                /* execution count (counts mode) */
-    unsigned int executed;         /* monotonic 0 -> 1, relaxed atomic */
+    uint64_t count;                /* execution count; non-zero == executed */
 } CovInsn;
 
 #define TCGCOV_INSN_SLAB_ITEMS 1024
@@ -215,10 +224,11 @@ typedef struct InsnSlab {
 } InsnSlab;
 
 /*
- * { address, execution count } record used when counts mode is enabled. The
- * first `addr_rec` bytes of this struct ARE the on-disk record (8 bytes without
- * counts, 16 with), and its size is what records_size is computed from, so it
- * carries the same size assertion as the other on-disk structs.
+ * { address, execution count } address record. This struct IS the on-disk
+ * record, and its size is what records_size is computed from, so it carries the
+ * same size assertion as the other on-disk structs. The format also defines an
+ * 8-byte count-less form (HAS_COUNTS clear); this producer never emits it, but
+ * a reader must still accept it.
  */
 typedef struct {
     uint64_t addr;
@@ -229,10 +239,10 @@ G_STATIC_ASSERT(sizeof(AddrCount) == 16);
 G_STATIC_ASSERT(offsetof(AddrCount, count) == 8);
 
 /*
- * A directed control-flow edge. src/dst are written to disk in this order;
- * count is written only when TCGCOV_FLAG_EDGE_COUNTS is set. The struct is
- * three uint64_t with no padding on any supported ABI, so the first 16 or 24
- * bytes can be written directly.
+ * A directed control-flow edge, written to disk in this field order. The struct
+ * is three uint64_t with no padding on any supported ABI, so it can be written
+ * directly. The format also defines a 16-byte count-less form (EDGE_COUNTS
+ * clear); this producer never emits it, but a reader must still accept it.
  */
 typedef struct {
     uint64_t src;                  /* last insn vaddr of the source TB */
@@ -302,8 +312,7 @@ typedef struct {
     bool system_emulation;
 
     CovMode mode;
-    bool counts;
-    bool edges;                    /* edges=1 */
+    bool edges;                    /* edges=off disables the edge section */
     bool verbose;
 
     /*
@@ -418,12 +427,6 @@ static gboolean edge_equal(gconstpointer a, gconstpointer b)
     return ea->src == eb->src && ea->dst == eb->dst;
 }
 
-/* Size of one on-disk edge record for the current configuration. */
-static size_t edge_record_size(CovState *s)
-{
-    return s->counts ? 24 : 16;
-}
-
 /*
  * Resolve a vCPU's slot. The table is fixed-size, so an unexpectedly large
  * cpu_index (hot-plug beyond max_vcpus, or a user-mode guest with more live
@@ -471,24 +474,17 @@ static CovInsn *insn_alloc(CovState *s, uint64_t vaddr)
  * been addressed here because it cannot be fixed inside this file: the
  * remedies are a link flag (-latomic) or dropping to a 32-bit-safe counter
  * type, and both belong to the build/format contract rather than the source.
- * Counts are only used in counts=1 mode; the coverage bitmap itself uses
- * `unsigned int`, which is lock-free everywhere.
+ *
+ * This used to apply only to counts=1 runs, because coverage itself was a
+ * separate `unsigned int` flag that is lock-free everywhere. The count is now
+ * the only coverage state there is, so a 32-bit host has to solve this to get
+ * any coverage at all rather than merely losing hit counts.
+ *
+ * The increments are RELAXED. Nothing orders them against other memory: each
+ * counter is read exactly once, from plugin_exit, after every vCPU has stopped,
+ * so the only property required is that concurrent increments do not lose each
+ * other. Relaxed atomic read-modify-write gives exactly that and no barrier.
  */
-
-/*
- * Mark a monotonic 0 -> 1 flag. Deliberately not g_atomic_int_set(): GLib's
- * setter is sequentially consistent and emits a full barrier (two on the
- * __sync fallback path) on every execution. The flag only ever moves one way
- * and is read once, at exit, after all vCPUs have stopped - so a relaxed store
- * suffices, and the guarding relaxed load keeps the steady state (already set)
- * to a plain load off a clean, shared cache line with no store traffic at all.
- */
-static inline void mark_executed(unsigned int *flag)
-{
-    if (!__atomic_load_n(flag, __ATOMIC_RELAXED)) {
-        __atomic_store_n(flag, 1, __ATOMIC_RELAXED);
-    }
-}
 
 /* ------------------------------------------------------------------ */
 /* TCG callbacks.                                                     */
@@ -557,12 +553,8 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 {
     CovTb *ctb = (CovTb *)udata;
 
-    mark_executed(&ctb->executed);
-
-    if (g_state.counts) {
-        /* 64-bit atomic add (GLib has no portable g_atomic_int64_add). */
-        __atomic_fetch_add(&ctb->count, 1, __ATOMIC_RELAXED);
-    }
+    /* 64-bit atomic add (GLib has no portable g_atomic_int64_add). */
+    __atomic_fetch_add(&ctb->count, 1, __ATOMIC_RELAXED);
 
     if (g_state.edges) {
         record_edge(&g_state, cpu_index, ctb->tb_vaddr);
@@ -585,6 +577,10 @@ static void vcpu_tb_edge_entry(unsigned int cpu_index, void *udata)
  * immediately before the instruction's own translated code, so it fires if and
  * only if the CPU reached this instruction - which is exactly the coverage
  * question being asked.
+ *
+ * This is the hottest code in the plugin - it runs once per in-range guest
+ * instruction - and it is deliberately one relaxed atomic increment with no
+ * load of plugin state, no branch and no separate coverage flag to maintain.
  */
 static void vcpu_insn_exec(unsigned int cpu_index, void *udata)
 {
@@ -592,11 +588,7 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata)
 
     (void)cpu_index;
 
-    mark_executed(&ci->executed);
-
-    if (g_state.counts) {
-        __atomic_fetch_add(&ci->count, 1, __ATOMIC_RELAXED);
-    }
+    __atomic_fetch_add(&ci->count, 1, __ATOMIC_RELAXED);
 }
 
 /*
@@ -656,7 +648,8 @@ static void vcpu_discon(qemu_plugin_id_t id, unsigned int cpu_index,
 /*
  * vCPU initialization. Used only to surface an undersized slot table at
  * startup - when the guest brings the vCPU online - instead of silently at the
- * first edge, or (with counts and edges both quiet) not at all.
+ * first edge that vCPU would have recorded. Registered only when edges are on,
+ * since the slot table is what it is checking.
  */
 static void vcpu_init(qemu_plugin_id_t id, unsigned int cpu_index)
 {
@@ -690,7 +683,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
     /*
      * A CovTb is needed when a TB-level callback will be registered: for the
-     * TB-level address modes it carries the coverage state, and for edges it
+     * TB-level address modes it carries the coverage count, and for edges it
      * carries the block's start and last-instruction addresses. In exact mode
      * with edges off, nothing at TB granularity is recorded, so none is made.
      */
@@ -862,8 +855,8 @@ static char *build_metadata_json(CovState *s, uint64_t record_count,
     json_append_str(m, "bsp", s->bsp);
     json_append_str(m, "elf", s->elf_path);
     json_append_str(m, "address_kind", "vaddr");
-    g_string_append_printf(m, "  \"counts_enabled\": %s,\n",
-                           s->counts ? "true" : "false");
+    /* Counts and edges are unconditional in this producer; see FORMAT.md 10. */
+    g_string_append(m, "  \"counts_enabled\": true,\n");
     g_string_append_printf(m, "  \"record_count\": %" PRIu64 ",\n",
                            record_count);
     g_string_append_printf(m, "  \"edges_enabled\": %s,\n",
@@ -896,6 +889,12 @@ static char *build_metadata_json(CovState *s, uint64_t record_count,
  * unsorted array. Duplicates (retranslated or overlapping blocks) are expected
  * and merged by the caller.
  *
+ * A non-zero count is the coverage predicate. There is no separate `executed`
+ * flag any more: the count is maintained on every execution, so `count != 0`
+ * answers the same question with one fewer field to keep hot. The only way the
+ * two could disagree is a counter wrapping to exactly 2^64 executions of one
+ * address, which no run reaches.
+ *
  * Must be called with s->lock held.
  */
 static GArray *collect_addrs(CovState *s)
@@ -906,14 +905,12 @@ static GArray *collect_addrs(CovState *s)
         for (InsnSlab *slab = s->insn_slabs; slab; slab = slab->next) {
             for (size_t i = 0; i < slab->used; i++) {
                 CovInsn *ci = &slab->items[i];
+                uint64_t c = __atomic_load_n(&ci->count, __ATOMIC_RELAXED);
 
-                if (!__atomic_load_n(&ci->executed, __ATOMIC_RELAXED)) {
+                if (c == 0) {
                     continue;
                 }
-                AddrCount ac = {
-                    ci->vaddr,
-                    __atomic_load_n(&ci->count, __ATOMIC_RELAXED)
-                };
+                AddrCount ac = { ci->vaddr, c };
                 g_array_append_val(out, ac);
             }
         }
@@ -922,12 +919,11 @@ static GArray *collect_addrs(CovState *s)
 
     for (guint i = 0; i < s->blocks->len; i++) {
         CovTb *ctb = g_ptr_array_index(s->blocks, i);
-        uint64_t c;
+        uint64_t c = __atomic_load_n(&ctb->count, __ATOMIC_RELAXED);
 
-        if (!__atomic_load_n(&ctb->executed, __ATOMIC_RELAXED)) {
+        if (c == 0) {
             continue;
         }
-        c = __atomic_load_n(&ctb->count, __ATOMIC_RELAXED);
 
         if (s->mode == TCGCOV_MODE_TB_INSN_FAST && ctb->insns.count > 0) {
             for (size_t j = 0; j < ctb->insns.count; j++) {
@@ -947,7 +943,7 @@ static GArray *collect_addrs(CovState *s)
  * Snapshot every vCPU's edge table into one flat unsorted array. Safe without
  * locking because plugin_exit runs when all vCPUs are quiescent; that is also
  * why the per-vCPU tables never need a lock on the fast path. Returns an empty
- * array when edges are off.
+ * array when edges are off, since the slot table is then never allocated.
  */
 static GArray *collect_edges(CovState *s)
 {
@@ -1034,13 +1030,15 @@ static void fill_edge_header(CovState *s, tcgcov_header *h, uint64_t n_edges)
         return;
     }
 
-    h->flags |= TCGCOV_FLAG_HAS_EDGES;
-    if (s->counts) {
-        h->flags |= TCGCOV_FLAG_EDGE_COUNTS;
-    }
+    /*
+     * EDGE_COUNTS is always set alongside HAS_EDGES because counts are
+     * unconditional; the 16-byte count-less edge record remains legal in the
+     * format for other producers, but this one never writes it.
+     */
+    h->flags |= TCGCOV_FLAG_HAS_EDGES | TCGCOV_FLAG_EDGE_COUNTS;
     h->edge_count = n_edges;
     h->edges_offset = h->records_offset + h->records_size;
-    h->edges_size = n_edges * (uint64_t)edge_record_size(s);
+    h->edges_size = n_edges * (uint64_t)sizeof(Edge);
 }
 
 /*
@@ -1057,15 +1055,14 @@ static bool write_all(FILE *f, const void *buf, size_t len)
 
 static bool write_edges(CovState *s, FILE *f, GArray *edges, guint n)
 {
-    size_t rec = edge_record_size(s);
-
     if (!s->edges) {
         return true;
     }
     for (guint i = 0; i < n; i++) {
         const Edge *e = &g_array_index(edges, Edge, i);
-        /* Edge is { src, dst, count }; the first `rec` bytes are the record. */
-        if (!write_all(f, e, rec)) {
+
+        /* Edge is exactly the on-disk { src, dst, count } record. */
+        if (!write_all(f, e, sizeof(*e))) {
             return false;
         }
     }
@@ -1192,7 +1189,6 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
     GArray *pairs;
     GArray *edges;
     guint n_addrs, n_edges;
-    size_t addr_rec = s->counts ? sizeof(AddrCount) : sizeof(uint64_t);
     char *meta;
     size_t meta_size;
     tcgcov_header h;
@@ -1221,12 +1217,12 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
     h.header_size = (uint32_t)sizeof(h);
     h.record_type = mode_is_insn_granular(s->mode) ? TCGCOV_REC_INSN_ADDR
                                                    : TCGCOV_REC_TB_ADDR;
-    h.flags = s->counts ? TCGCOV_FLAG_HAS_COUNTS : 0;
+    h.flags = TCGCOV_FLAG_HAS_COUNTS;
     h.record_count = n_addrs;
     h.metadata_offset = sizeof(h);
     h.metadata_size = meta_size;
     h.records_offset = sizeof(h) + meta_size;
-    h.records_size = (uint64_t)n_addrs * addr_rec;
+    h.records_size = (uint64_t)n_addrs * sizeof(AddrCount);
     fill_edge_header(s, &h, n_edges);
 
     f = open_tmp(s->out_path, &tmp);
@@ -1237,9 +1233,9 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
 
     ok = write_all(f, &h, sizeof(h)) && write_all(f, meta, meta_size);
     for (guint i = 0; ok && i < n_addrs; i++) {
-        /* AddrCount is { addr, count }; the first `addr_rec` bytes are it. */
+        /* AddrCount is exactly the on-disk { addr, count } record. */
         const AddrCount *ac = &g_array_index(pairs, AddrCount, i);
-        ok = write_all(f, ac, addr_rec);
+        ok = write_all(f, ac, sizeof(*ac));
     }
     ok = ok && write_edges(s, f, edges, n_edges);
 
@@ -1261,10 +1257,10 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
                    tmp, s->out_path, g_strerror(errno));
         unlink(tmp);
     } else if (s->verbose) {
-        g_printerr("tcgcov: wrote %u %s records (%s), %u edges to %s\n",
-                   n_addrs, s->counts ? "count" : "address",
-                   fidelity_name(s->mode), s->edges ? n_edges : 0,
-                   s->out_path);
+        g_printerr("tcgcov: wrote %u {address, count} records (%s), "
+                   "%u edges to %s\n",
+                   n_addrs, fidelity_name(s->mode),
+                   s->edges ? n_edges : 0, s->out_path);
     }
 
 out:
@@ -1397,7 +1393,20 @@ static bool parse_arg(CovState *s, const char *arg)
     } else if (g_strcmp0(k, "filter") == 0) {
         return parse_filter(s, v);
     } else if (g_strcmp0(k, "counts") == 0) {
-        return parse_bool_arg(k, v, &s->counts);
+        /*
+         * Removed rather than silently accepted. Execution counts are now
+         * always recorded, so `counts=0` would ask for something this plugin
+         * cannot do, and `counts=1` would ask for what it already does; the
+         * two used to mean genuinely different artifacts. A script that still
+         * passes either must fail loudly, because the alternative is a run
+         * that quietly produces a different file than the caller asked for.
+         */
+        g_printerr("tcgcov: the 'counts' argument was removed; execution "
+                   "counts are now always recorded and cannot be disabled "
+                   "(removing the option also removed the redundant executed "
+                   "flag from the per-instruction fast path). Drop '%s' from "
+                   "the plugin arguments.\n", arg);
+        return false;
     } else if (g_strcmp0(k, "edges") == 0) {
         return parse_bool_arg(k, v, &s->edges);
     } else if (g_strcmp0(k, "verbose") == 0) {
@@ -1451,6 +1460,14 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     s->target_name = g_strdup(info->target_name);
     s->system_emulation = info->system_emulation;
     s->mode = TCGCOV_MODE_TB_INSN;  /* default: exact per-instruction */
+    /*
+     * Edges default to ON: branch coverage working out of the box is worth
+     * more than the per-block cost, and a report where every branch reads
+     * "never evaluated" because nobody passed edges=1 is a worse failure than
+     * a slightly slower run. `edges=off` remains available for runs where the
+     * extra per-TB callback and hash insert per block execution do matter.
+     */
+    s->edges = true;
 
     /*
      * Refuse to start on a bad argument rather than run with settings the
@@ -1479,11 +1496,11 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
 
     if (s->verbose) {
         g_printerr("tcgcov: target=%s system=%d mode=%s fidelity=%s out=%s "
-                   "counts=%d edges=%d discon=%d plugin_api=%d vcpu_slots=%zu "
-                   "filters=%zu\n",
+                   "counts=always edges=%d discon=%d plugin_api=%d "
+                   "vcpu_slots=%zu filters=%zu\n",
                    s->target_name, s->system_emulation,
                    mode_name(s->mode), fidelity_name(s->mode),
-                   s->out_path, s->counts, s->edges,
+                   s->out_path, s->edges,
                    s->edges && TCGCOV_HAVE_DISCON,
                    QEMU_PLUGIN_VERSION, s->vcpu_cap, s->range_count);
     }

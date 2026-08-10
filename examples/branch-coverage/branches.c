@@ -6,7 +6,8 @@
  * README.md in this directory for the expected output.
  *
  * Build freestanding for a bare-metal target, run under QEMU with the tcgcov
- * plugin and edges=1, then run the pipeline. Compile at -O0: at -O1 and above
+ * plugin, then run the pipeline. Edge recording is on by default, and
+ * execution counts are always on. Compile at -O0: at -O1 and above
  * the compiler inlines these and constant-folds every condition away, leaving
  * nothing to measure.
  */

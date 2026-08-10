@@ -7,6 +7,31 @@ young, both changed during the extraction, and [`docs/QEMU-BLOCK-SCANNING.md`](d
 proposes changing them further. Expect breaking changes between minor versions
 until 1.0.
 
+## Unreleased
+
+### Changed — breaking
+
+- **Execution counts are always on, and the `counts=` plugin argument is gone.**
+  Passing `counts=` now fails the launch rather than being silently accepted as
+  an argument that no longer means anything.
+
+  This is a speed-up, not a cost. The plugin previously carried both a
+  monotonic `executed` flag and a `count` per instruction, and the per-instruction
+  hot path was: load the flag, compare, maybe store; load the global `counts`
+  setting, branch; then maybe increment. Making the count unconditional makes
+  the flag redundant — `count != 0` *is* executed — so the flag and its test
+  were deleted, and the hot path is now a single relaxed atomic add. Fewer
+  instructions than before, and one less mode to document and test.
+
+  Address records are consequently always the 16-byte `{addr, count}` form.
+  **The binary format did not change**: `HAS_COUNTS` and `EDGE_COUNTS` are
+  simply always set now, so existing readers keep working.
+
+- **`edges=` now defaults to on**, so branch coverage works without being asked
+  for. The option is retained, unlike `counts=`, because the edge path cannot be
+  folded away — it needs a per-block callback and a hash insert per block
+  execution — so `edges=off` remains meaningful for long-running measurements.
+
 ## 0.1.0 — 2026-08-09
 
 First public release. Extracted from an internal tool called *RTQCov* that

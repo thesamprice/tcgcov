@@ -666,33 +666,38 @@ before trusting anything.
 ### 6.2 32-bit hosts and `libatomic`
 
 The execution counters are `uint64_t` incremented with `__atomic_fetch_add`
-(`plugin/tcgcov.c:564`, `:598`). On a 32-bit host there is no native 64-bit
+(`plugin/tcgcov.c:557`, `:591`). On a 32-bit host there is no native 64-bit
 read-modify-write, so the compiler may emit a call to `__atomic_fetch_add_8` in
 libatomic. `plugin/Makefile` does not link `-latomic`, so such a build fails to
 link — or loads with an unresolved symbol. This is documented and deliberately
 unfixed in the source, because the remedy is a link flag or a narrower counter
-type, both of which belong to the build contract (`plugin/tcgcov.c:462-476`).
+type, both of which belong to the build contract (`plugin/tcgcov.c:465-487`).
 
-**Which option this affects: `counts=1` only.** The coverage flag itself is an
-`unsigned int` (`mark_executed`, `plugin/tcgcov.c:486-491`), which is lock-free
-everywhere. Edge counts are plain non-atomic increments in per-vCPU state
-(`plugin/tcgcov.c:547`). So on a 32-bit host, drop `counts=` and line and
-branch coverage are unaffected.
+**This now affects every run, and there is no option to avoid it.** It used to
+apply only to `counts=1`, because coverage itself was tracked by a separate
+`unsigned int` flag that is lock-free everywhere. That flag is gone: counts are
+unconditional and a non-zero count *is* the coverage predicate, which is what
+made the flag redundant and the per-instruction fast path a single atomic add.
+The consequence for a 32-bit host is that this has to be solved — `-latomic` at
+link time — to get any coverage at all, where before it could be sidestepped by
+omitting `counts=`. Edge counts are unaffected either way: they are plain
+non-atomic increments in per-vCPU state (`plugin/tcgcov.c:543`).
 
 ### 6.3 Per-vCPU edge slots
 
-The per-vCPU edge table is allocated **once**, only when `edges=1`
-(`plugin/tcgcov.c:1468-1470`), and never grown so that no reader can race a
-realloc (`plugin/tcgcov.c:310-318`, `:1423-1439`):
+The per-vCPU edge table is allocated **once**, and only when edges are on —
+which is the default, so `edges=off` is what skips it
+(`plugin/tcgcov.c:1485-1487`) — and never grown so that no reader can race a
+realloc (`plugin/tcgcov.c:319-327`, `:1432-1448`):
 
 * **system emulation:** `info->system.max_vcpus` slots;
 * **user mode:** a fixed `TCGCOV_VCPU_FALLBACK` = **1024** slots, because each
   guest thread is a vCPU and there is no bound to query
-  (`plugin/tcgcov.c:274-281`).
+  (`plugin/tcgcov.c:285-291`).
 
 Past the cap, `vcpu_slot()` returns NULL and the plugin **drops that vCPU's
 edges**, printing one warning and never scribbling out of bounds
-(`plugin/tcgcov.c:427-444`):
+(`plugin/tcgcov.c:431-447`):
 
 ```
 tcgcov: cpu_index <N> is outside the <cap>-slot per-vCPU edge table; edges for this vCPU are dropped
@@ -926,8 +931,9 @@ What each number should look like:
 are determined by the source, with the expected result stated up front — 4 of 8
 outcomes taken, 3 of 4 branches evaluated, and one branch that must report `-`
 (never evaluated) rather than `0` (evaluated, that outcome never occurred).
-Build it freestanding for your target at `-O0 -g`, run it under QEMU with
-`edges=1`, and compare against
+Build it freestanding for your target at `-O0 -g`, run it under QEMU with the
+plugin (no plugin options needed — edges are recorded by default), and compare
+against
 `examples/branch-coverage/README.md:9-17` and the LCOV block at `:46-65`.
 
 Build it at `-O0`. At `-O1` and above these functions inline into `main` and

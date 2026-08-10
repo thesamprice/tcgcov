@@ -43,8 +43,12 @@ A TCGCOV1 file has four sections, always in this order:
 * The **address records** answer "which guest code addresses executed?"
   (line/statement coverage).
 * The **edge records** answer "which control-flow transfers were taken?"
-  (branch coverage). They are present only when the plugin was run with
-  `edges=1`.
+  (branch coverage). The plugin records them by default; they are absent only
+  when it was run with `edges=off`.
+
+Address records always carry an execution count in files written by this
+plugin — see §3 and §10. The count-less forms the format also defines are still
+described here, because a reader must handle artifacts from any producer.
 
 There is **no padding and no alignment** between sections. `metadata_size` is
 the exact byte length of the JSON text and is usually not a multiple of 8, so
@@ -104,12 +108,23 @@ an unknown bit set should still be able to read the sections it understands,
 because unknown bits never change the size or position of the sections
 described above; whether to warn is up to the reader.
 
-Producer note: the current plugin ties `EDGE_COUNTS` to the same `counts=1`
-argument that sets `HAS_COUNTS`, so in practice it emits bits 0 and 2 together
-or neither. A reader must **not** rely on that — treat the four combinations
-of bit 0 and bit 2 as independently legal.
+### What the current producer always sets
 
-When edges were not recorded (`edges=0`, the default), the writer guarantees:
+`HAS_COUNTS` is **always set** by the current plugin, and `EDGE_COUNTS` is
+always set whenever `HAS_EDGES` is. Execution counts used to be the optional
+`counts=1`; that argument no longer exists, because keeping the count always
+made the plugin's separate "was this executed" flag redundant (`count != 0` is
+the same predicate) and so removing the option removed work from the
+per-instruction hot path rather than adding it. `HAS_EDGES` is set unless the
+run passed `edges=off`.
+
+So a file from this producer has `flags == 7` normally, or `flags == 1` with
+`edges=off`. **A reader must not rely on that.** All four combinations of bit 0
+and bit 2 are independently legal, other producers may write any of them, and
+artifacts predating this change have bit 0 clear — which is why both record
+layouts remain specified in §4 and §5 and both must be implemented.
+
+When edges were not recorded (`edges=off`), the writer guarantees:
 `HAS_EDGES` clear, `EDGE_COUNTS` clear, `edge_count == 0`,
 `edges_offset == 0`, `edges_size == 0`.
 
@@ -126,13 +141,16 @@ Located at `records_offset`, `record_count` records, `records_size` bytes
 total. `record_type` says whether an address denotes a translation-block start
 (`1`) or a single instruction (`2`); it does not change the record layout.
 
-**`HAS_COUNTS` clear — 8 bytes per record:**
+**`HAS_COUNTS` clear — 8 bytes per record.** Never written by the current
+plugin (§3), but legal, and produced by versions of it that predate the removal
+of the `counts=` argument:
 
 | Offset | Size | Type     | Field  |
 |-------:|-----:|----------|--------|
 | 0      | 8    | `uint64` | `addr` |
 
-**`HAS_COUNTS` set — 16 bytes per record:**
+**`HAS_COUNTS` set — 16 bytes per record.** What the current plugin always
+writes:
 
 | Offset | Size | Type     | Field   |
 |-------:|-----:|----------|---------|
@@ -147,7 +165,9 @@ Guarantees:
   overlapping translation blocks are merged before writing, and in counts mode
   their `count` values are summed.
 * `count` is the number of executions attributed to that address.
-* A `count` of `0` should not occur, but is not structurally illegal.
+* A `count` of `0` should not occur, but is not structurally illegal. The
+  current plugin cannot emit one: a zero count is precisely how it decides an
+  address never executed and omits the record.
 
 ### 4.1 Fidelity: what an address record actually proves
 
@@ -188,14 +208,16 @@ inherits that block's entry count.
 Located at `edges_offset`, `edge_count` records, `edges_size` bytes total.
 Present only when `HAS_EDGES` is set.
 
-**`EDGE_COUNTS` clear — 16 bytes per record:**
+**`EDGE_COUNTS` clear — 16 bytes per record.** Never written by the current
+plugin (§3), but legal:
 
 | Offset | Size | Type     | Field |
 |-------:|-----:|----------|-------|
 | 0      | 8    | `uint64` | `src` |
 | 8      | 8    | `uint64` | `dst` |
 
-**`EDGE_COUNTS` set — 24 bytes per record:**
+**`EDGE_COUNTS` set — 24 bytes per record.** What the current plugin always
+writes when there is an edge section at all:
 
 | Offset | Size | Type     | Field   |
 |-------:|-----:|----------|---------|
@@ -297,9 +319,9 @@ keys it does not know.
 | `bsp`              | string    | Free-form metadata string supplied via the `bsp=` plugin argument. Empty when not given. Opaque to the format. |
 | `elf`              | string    | Path to the guest ELF, supplied via the `elf=` plugin argument, for offline symbolization. Empty when not given. |
 | `address_kind`     | string    | Always `"vaddr"` in version 1: addresses are guest virtual addresses. |
-| `counts_enabled`   | boolean   | Mirrors the `HAS_COUNTS` flag. |
+| `counts_enabled`   | boolean   | Mirrors the `HAS_COUNTS` flag. Always `true` from the current producer; older files may have `false`. |
 | `record_count`     | number    | Mirrors `header.record_count`. |
-| `edges_enabled`    | boolean   | Mirrors the `HAS_EDGES` flag. |
+| `edges_enabled`    | boolean   | Mirrors the `HAS_EDGES` flag. `true` from the current producer unless it was run with `edges=off`. |
 | `edge_count`       | number    | Mirrors `header.edge_count`. |
 | `insn_fidelity`    | string    | *(added)* `"exact"` when every emitted address provably reached the CPU, `"tb-approx"` when instruction addresses were inferred from block entry and may include instructions after an abort point. See §4.1. Treat it as an open set; an unrecognised value should be read as "weaker than exact". |
 | `discon_tracking`  | boolean   | *(added)* `true` when the producer was notified of interrupt/exception discontinuities and dropped pending edge sources across them. Always `false` when `edges_enabled` is `false`, or when the producer was built against a QEMU plugin API older than 5. See §5.1. |
@@ -370,6 +392,13 @@ constants.
 
 A real 497-byte file: `record_type = 1` (TB addresses), counts off, edges on
 without edge counts, three address records and two edges, no filters.
+
+This capture predates the removal of the `counts=` argument, so it is a
+combination the current plugin can no longer produce — 8-byte address records
+and 16-byte edge records. It is kept exactly as captured *because* of that: it
+is a worked example of the cleared-flag layouts a reader must still handle, and
+the equivalent file from today's plugin differs only in having bits 0 and 2 set
+and the wider records that implies.
 
 ```
 metadata_size  = 353
@@ -558,8 +587,7 @@ For reference, the plugin arguments that shape the output:
 | `mode=tb`      | —              | `record_type = 1`, one record per executed translation-block start. Cheapest; one callback per block. |
 | `mode=tb-insn` | *(default)*    | `record_type = 2`, one record per instruction the CPU actually reached. `insn_fidelity = "exact"`. Costs one callback per in-range instruction — the slowest mode, and the default because a coverage tool that over-reports is worse than a slow one. `mode=insn` is an accepted alias. |
 | `mode=tb-insn-fast` | —         | `record_type = 2`, but instruction addresses are expanded from a single per-block callback. `insn_fidelity = "tb-approx"`; **over-reports instructions after an aborted block**. See §4.1. |
-| `counts=1`     | off            | Sets `HAS_COUNTS`; also sets `EDGE_COUNTS` when edges are on. |
-| `edges=1`      | off            | Sets `HAS_EDGES` and emits the edge section. |
+| `edges=`       | **on**         | `edges=off` clears `HAS_EDGES` and omits the edge section. |
 | `filter=A-B[,C-D...]` | none    | Only record addresses in `[start, end)`. Values accept `0x` hex. Recorded in `metadata.filters`. |
 | `elf=PATH`     | none           | Recorded in `metadata.elf` for offline symbolization. JSON-escaped, so any path is safe; see §6.1. |
 | `test_id=STR`  | none           | Free-form metadata string. JSON-escaped; see §6.1. |
@@ -571,8 +599,25 @@ Boolean arguments accept `1`/`0` as well as QEMU's own `on`/`off`,
 installation rather than being ignored, so a bad launch line cannot masquerade
 as a coverage regression.
 
-With `edges=0` (the default) the edge section is absent, `HAS_EDGES` is clear,
-and no per-block edge-tracking work is done at run time.
+With `edges=off` the edge section is absent, `HAS_EDGES` is clear, and no
+per-block edge-tracking work is done at run time.
+
+**There is no `counts=` argument.** Execution counts are unconditional, so
+`HAS_COUNTS` is always set and address records are always 16 bytes. Passing
+`counts=` at all — `on` or `off` — **fails the launch** with a message saying
+so, rather than being accepted as a no-op: a stale script that asked for a
+different artifact must find out at launch, not at read time.
+
+Counts are unconditional because making them so was a *simplification*. The
+plugin used to keep a separate monotonic "executed" flag beside the count, and
+the per-instruction callback had to maintain both and test the `counts` setting
+in between. Once the count is always maintained the flag is redundant — an
+address executed if and only if its count is non-zero — so the flag, its test
+and the setting lookup were all deleted and the callback became a single
+relaxed atomic increment. `edges=` survives as an option precisely because the
+same argument does *not* apply to it: edges need an extra per-block callback
+and a hash-table insert per block execution, which is real work that `edges=off`
+genuinely removes.
 
 ### Change of default fidelity
 
@@ -584,3 +629,19 @@ through — the removed addresses are ones that never executed. A reader
 comparing artifacts across that change should key off `metadata.insn_fidelity`
 rather than assume the two are directly comparable; a missing `insn_fidelity`
 means the file predates the change and is `"tb-approx"` in `tb-insn` mode.
+
+### Change of counts and edges defaults
+
+Counts became unconditional and edges became on-by-default in the same release.
+This is **not** a format change — no offset, field or flag bit moved, and a
+reader written against the previous version of this document reads the new
+files correctly, because it already had to handle both flag states.
+
+What changes is what a reader will actually see in the wild: address records
+from the current producer are 16 bytes and always carry a count, and an edge
+section is present unless the run asked for `edges=off`. Code that branched on
+`HAS_COUNTS`/`HAS_EDGES` keeps working and simply takes the other arm more
+often; code that *assumed* 8-byte address records without checking the flag was
+always wrong and will now notice. Neither the covered-address set nor the edge
+set is affected — an address is reported as covered under exactly the same
+condition as before.

@@ -43,7 +43,7 @@ it.
   target ELF
       │
       ├──►  QEMU system emulation + libtcgcov.so  ──►  run.cov
-      │         (executed guest addresses, optional hit counts, optional edges)
+      │         (executed guest addresses + hit counts + control-flow edges)
       │
       │     ┌─────────────────────────────────────────────────────────────┐
       └────►│ objdump -d  +  addr2line   (target toolchain, DWARF)        │
@@ -156,8 +156,12 @@ Add the plugin to any QEMU system-emulation command line:
 
 ```bash
 qemu-system-<target> ... \
-  -plugin ./libtcgcov.so,out=run1.cov,mode=tb-insn,elf=/path/to/image.elf,counts=1
+  -plugin ./libtcgcov.so,out=run1.cov,elf=/path/to/image.elf
 ```
+
+That line is the whole thing: hit counts and branch coverage need no arguments,
+because execution counts are always recorded and edge recording is on by
+default.
 
 Plugin arguments are `key=value`, comma-separated:
 
@@ -166,8 +170,7 @@ Plugin arguments are `key=value`, comma-separated:
 | `out=` | `tcgcov.cov` | output artifact path (written atomically via `.tmp` + rename) |
 | `mode=` | `tb-insn` | see the fidelity table below |
 | `filter=` | *(none)* | `0xSTART-0xEND[,…]` address ranges to record; empty means everything |
-| `counts=` | `off` | record 64-bit execution counts (turns the report into a hotspot view) |
-| `edges=` | `off` | record control-flow edges, the input to branch coverage |
+| `edges=` | **`on`** | record control-flow edges, the input to branch coverage; `edges=off` to skip the work |
 | `elf=` | `""` | path to the ELF, copied into the artifact's metadata so the host tools need no manifest |
 | `test_id=`, `bsp=` | `""` | free-form labels (run name, board/platform) copied into the metadata |
 | `verbose=` | `off` | log a one-line summary at exit |
@@ -177,6 +180,12 @@ Boolean arguments accept `on`/`off`, `true`/`false`, `yes`/`no` and `1`/`0`.
 refuses to start QEMU** rather than running with settings you did not ask for —
 a run that silently records nothing costs far more to diagnose than a failed
 launch.
+
+**There is no `counts=` argument, and passing one fails the launch.** Execution
+counts are always recorded and cannot be turned off. That is a simplification
+rather than an extra cost — see [Hit counts](#hit-counts) — and `counts=` is
+rejected outright instead of being ignored so that a script still passing it
+finds out immediately rather than getting an artifact it did not ask for.
 
 `mode=` trades cost against fidelity:
 
@@ -189,9 +198,11 @@ launch.
 The artifact records which fidelity it was produced at, so a reader can tell.
 
 **How it works.** A translation callback records each block and its in-range
-instruction addresses; a minimal execution callback marks the block executed.
-At QEMU exit the executed blocks are expanded to addresses, sorted,
-de-duplicated and written. Output size tracks *unique code covered*, not how
+instruction addresses; a minimal execution callback bumps that address's
+counter — one relaxed atomic increment, no branch, and no separate "executed"
+flag to maintain, since a non-zero count already means the same thing. At QEMU
+exit the addresses with a non-zero count are expanded, sorted, de-duplicated
+and written. Output size tracks *unique code covered*, not how
 long the run was — an hour-long soak test and a one-second smoke test produce
 files of comparable size. The structure follows QEMU's own
 `contrib/plugins/drcov.c`.
@@ -205,14 +216,28 @@ The on-disk format (`TCGCOV1`) is documented in [`docs/FORMAT.md`](docs/FORMAT.m
 
 ### Hit counts
 
-With `counts=1` the plugin records how many times each block executed, and the
-count survives all the way to `DA:<line>,<count>` in the LCOV output, so the
-same HTML report doubles as a hotspot view. Coverage is just `count > 0`, so
-percentages are identical to a run without counts. Granularity is the
-translation block: every instruction in a block shares the block's count, and a
-line's count is the **max** over its instruction addresses (so it is not
-inflated by how many instructions a line compiled into). The counter is 64-bit,
-because an idle loop overflows 32 bits easily.
+The plugin always records how many times each address executed, and the count
+survives all the way to `DA:<line>,<count>` in the LCOV output, so the same HTML
+report doubles as a hotspot view. A line's count is the **max** over its
+instruction addresses, so it is not inflated by how many instructions the line
+compiled into; in `mode=tb` and `mode=tb-insn-fast` every instruction of a block
+shares that block's entry count. The counter is 64-bit, because an idle loop
+overflows 32 bits easily.
+
+This used to be the optional `counts=1`. It is now unconditional, and the
+option was **removed** rather than defaulted on, because keeping the count is
+what makes everything else cheaper. The plugin previously carried a monotonic
+`executed` flag *beside* the count, so the per-instruction callback did a
+relaxed load of the flag, a compare, sometimes a store, then a load of the
+`counts` setting and a branch, and only then the increment. With the count
+always maintained the flag says nothing the count does not — an address ran if
+and only if its count is non-zero — so the flag, the compare, the store, the
+setting lookup and the branch were all deleted. On arm64 the callback compiles
+to four instructions with no branches, down from twelve with two.
+
+Coverage is still exactly `count > 0`, and the covered-address set is unchanged
+from a `counts=0` run of the previous version — verified artifact-for-artifact
+across all three modes.
 
 ---
 
@@ -400,9 +425,13 @@ successors — and matches it against the edges the plugin observed, emitting
 LCOV `BRDA:` records. `genhtml --branch-coverage` then reports a branch whose
 `else` side never executed as **half covered** rather than fully covered.
 
-Enable edge recording with `edges=1` on the plugin, then run
-`tcgcov branches`; the driver does both by default and takes `--no-branches` to
-turn it off. See `tcgcov branches --help` for the current options.
+Edge recording is on by default, so this works with no plugin arguments at all;
+run `tcgcov branches` on the artifact afterwards. The driver does both by
+default and takes `--no-branches` to skip the host-side analysis. Pass
+`edges=off` to the plugin if you want to drop the recording side too — unlike
+counts, edges cost a real per-block callback and a hash insert per block
+execution, which is worth declining on a long-running measurement. See
+`tcgcov branches --help` for the current options.
 
 ### How a branch is identified across binaries
 

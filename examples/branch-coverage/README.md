@@ -25,10 +25,12 @@ and linker script, then:
 # 1. Build the plugin against the QEMU you will run it under.
 make -C plugin QEMU_INCLUDE=<qemu-source>/include
 
-# 2. Record. edges=1 is what enables branch coverage.
+# 2. Record. No plugin options are needed: edge recording (what branch
+#    coverage is computed from) is on by default and execution counts are
+#    always on.
 <qemu-system-target> -M <machine> -kernel branches.elf \
     -nographic -monitor none -serial file:uart.txt \
-    -plugin ./plugin/libtcgcov.so,out=branches.cov,mode=tb-insn,edges=1,elf=branches.elf
+    -plugin ./plugin/libtcgcov.so,out=branches.cov,elf=branches.elf
 
 # 3. Analyse.
 PREFIX=<your-toolchain-prefix->     # e.g. riscv64-unknown-elf-

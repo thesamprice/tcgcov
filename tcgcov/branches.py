@@ -184,8 +184,8 @@ def run(args):
             return 1
         meta = meta or m
         if not e:
-            print(f"warning: {path} has no EDGE records (plugin run without "
-                  f"edge collection?)", file=sys.stderr)
+            print(f"warning: {path} has no EDGE records (plugin run with "
+                  f"edges=off?)", file=sys.stderr)
         edges.extend(e)
 
     try:

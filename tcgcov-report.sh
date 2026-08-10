@@ -162,7 +162,9 @@ process_one() {  # process_one <cov>
       --out "$cab.$base.tmp" && mv "$cab.$base.tmp" "$cab"
   fi
 
-  # Branch outcomes, when the plugin recorded edges (edges=on).
+  # Branch outcomes. The plugin records edges by default, so this normally has
+  # data to work with; --no-branches skips the analysis, and a .cov captured
+  # with the plugin's edges=off simply yields no branch records.
   if [[ "$BRANCHES" == 1 ]]; then
     br="$OUT_DIR/branches/$base.jsonl"
     set +e
