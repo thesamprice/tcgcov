@@ -9,6 +9,24 @@ until 1.0.
 
 ## Unreleased
 
+### Added
+
+- `tcgcov dump --scrub` and `--scrub-out FILE` redact the absolute ELF path an
+  artifact embeds, so a `.cov` can be attached to a bug report without
+  disclosing the filesystem layout of the machine that produced it. The
+  redacted copy is a fully valid artifact; analysing it needs `--elf`
+  explicitly, since it no longer names its own ELF.
+
+### Fixed
+
+- A `--keep` marker no longer rebases an **in-tree** file onto the marker.
+  RTEMS has `testsuites/validation/bsps/ts-fatal-extension.c`, and the `rtems`
+  preset's `/bsps/` marker rewrote it to `bsps/ts-fatal-extension.c` — a path
+  that names no file, that `genhtml` could not open, and that could collide
+  with a real file of that name under `bsps/`. It also defeated the preset's
+  `testsuites/**` exclude. For a file under the source root, a marker now
+  decides only *whether* to keep it, never what it is relative to.
+
 ### Changed — breaking
 
 - **Execution counts are always on, and the `counts=` plugin argument is gone.**

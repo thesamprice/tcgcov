@@ -214,6 +214,34 @@ written when the harness kills the emulator.
 The on-disk format (`TCGCOV1`) is documented in [`docs/FORMAT.md`](docs/FORMAT.md);
 `tcgcov dump` inspects any artifact.
 
+### Sharing an artifact
+
+An artifact embeds the **absolute path of the ELF** it was recorded against, so
+the host tools need no separate manifest. That is convenient locally and
+awkward when attaching one to a bug report, because it discloses the filesystem
+layout of the machine that produced it.
+
+```bash
+tcgcov dump run.cov --scrub                      # redact paths in the output
+tcgcov dump run.cov --scrub-out run.shared.cov   # a redacted COPY
+```
+
+Paths are reduced to a basename rather than removed — the basename says which
+test the artifact belongs to, which is usually why it is being shared, and is
+not itself a disclosure. Free-form labels (`test_id`, `bsp`) are redacted only
+if they look like paths. A `"scrubbed": true` key is added so a reader knows
+the ELF path is no longer the one it was recorded against.
+
+The redacted copy is a fully valid artifact — addresses, counts and edges come
+through byte for byte — but since it no longer names its ELF, analysing it
+needs `--elf` given explicitly.
+
+> The LCOV output does **not** need this: `--source-root` already makes every
+> `SF:` path repo-relative, which is the same property that makes cross-binary
+> merging work. `genhtml` is the exception — it writes the invoking command
+> line to a `cmd_line` file and embeds the working directory in page headers,
+> so pass `genhtml --prefix <source-root>`.
+
 ### Hit counts
 
 The plugin always records how many times each address executed, and the count

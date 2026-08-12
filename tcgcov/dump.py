@@ -1,12 +1,97 @@
 """Inspect an TCGCOV1 coverage artifact (header, metadata, addresses, counts,
-edges)."""
+edges).
+
+Artifacts embed the absolute path of the ELF they were recorded against, so
+that the host tools need no separate manifest. That is convenient locally and
+awkward when attaching an artifact to a bug report, because it discloses the
+filesystem layout of the machine that produced it. --scrub redacts those paths
+for display, and --scrub-out writes a redacted copy that is still a valid
+artifact.
+"""
 
 import argparse
 import json
+import os
+import struct
 import sys
 
 from .format import (parse_header, unpack_records, unpack_edges, REC_TYPE,
-                     FLAG_HAS_COUNTS, FLAG_HAS_EDGES, FLAG_EDGE_COUNTS)
+                     HEADER_FMT, MAGIC, FLAG_HAS_COUNTS, FLAG_HAS_EDGES,
+                     FLAG_EDGE_COUNTS)
+
+# Metadata keys whose value is a filesystem path. Everything else in the
+# metadata is a number, a boolean, or a short free-form label.
+_PATH_KEYS = ("elf",)
+
+
+def _looks_like_a_path(value):
+    """True for a string that discloses a filesystem location.
+
+    A bare basename ('hello.exe') does not: it is what the scrub leaves
+    behind, so treating it as a path would make scrubbing non-idempotent.
+    """
+    return isinstance(value, str) and (os.sep in value or value.startswith("~"))
+
+
+def scrub_metadata(meta):
+    """Return a copy of `meta` with filesystem paths reduced to basenames.
+
+    The basename is kept rather than dropped because it identifies which test
+    the artifact belongs to, which is usually the whole reason for sharing it,
+    and a basename is not a disclosure. Free-form labels (test_id, bsp) are
+    scrubbed only when they look like paths -- they are user-supplied and a
+    caller may have put anything in them.
+
+    A 'scrubbed' key is added so a reader can tell that the ELF path in this
+    artifact is no longer the one it was recorded against. The host tools take
+    --elf explicitly, so a scrubbed artifact remains fully analysable.
+    """
+    out = dict(meta)
+    for key, value in meta.items():
+        if key in _PATH_KEYS or _looks_like_a_path(value):
+            if isinstance(value, str) and value:
+                out[key] = os.path.basename(value.rstrip(os.sep))
+    out["scrubbed"] = True
+    return out
+
+
+def write_scrubbed(src_path, dst_path):
+    """Write `src_path` to `dst_path` with its metadata paths redacted.
+
+    Only the metadata section changes. Because it changes LENGTH, the record
+    and edge sections move, so the header offsets are recomputed rather than
+    copied. The record and edge bytes themselves are passed through verbatim --
+    they are addresses and counts, and contain nothing to redact.
+    """
+    with open(src_path, "rb") as f:
+        data = f.read()
+    hdr = parse_header(data, src_path)
+
+    meta_raw = data[hdr["metadata_offset"]:
+                    hdr["metadata_offset"] + hdr["metadata_size"]]
+    meta = json.loads(meta_raw.decode("utf-8"))
+    new_meta = json.dumps(scrub_metadata(meta), indent=2).encode("utf-8") + b"\n"
+
+    records = data[hdr["records_offset"]:
+                   hdr["records_offset"] + hdr["records_size"]]
+    edges = data[hdr["edges_offset"]:hdr["edges_offset"] + hdr["edges_size"]] \
+        if hdr["edges_size"] else b""
+
+    hsize = struct.calcsize(HEADER_FMT)
+    meta_off = hsize
+    rec_off = meta_off + len(new_meta)
+    edge_off = rec_off + len(records) if edges else 0
+
+    header = struct.pack(
+        HEADER_FMT, MAGIC, hdr["version"], hdr["endian"], hsize,
+        hdr["record_type"], hdr["flags"], hdr["record_count"],
+        meta_off, len(new_meta), rec_off, len(records),
+        hdr["edge_count"], edge_off, len(edges))
+
+    tmp = dst_path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(header + new_meta + records + edges)
+    os.replace(tmp, dst_path)
 
 
 def load(path):
@@ -62,14 +147,35 @@ def add_arguments(parser):
                         help="print just this metadata value, unquoted, for "
                              "shell use (implies --metadata-only); exits 1 if "
                              "the key is absent")
+    parser.add_argument("--scrub", action="store_true",
+                        help="redact filesystem paths in the printed metadata, "
+                             "reducing them to a basename; use when pasting "
+                             "output into a bug report")
+    parser.add_argument("--scrub-out", metavar="FILE",
+                        help="write a redacted COPY of the artifact to FILE, "
+                             "still a valid artifact but with the recording "
+                             "machine's paths removed; analysing it needs the "
+                             "ELF given explicitly with --elf")
 
 
 def run(args):
+    if args.scrub_out:
+        try:
+            write_scrubbed(args.file, args.scrub_out)
+        except (OSError, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        print(f"{args.file}: scrubbed copy -> {args.scrub_out}",
+              file=sys.stderr)
+
     try:
         header, meta, addrs, counts, edges = load(args.file)
     except (OSError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+
+    if args.scrub:
+        meta = scrub_metadata(meta)
 
     # Scripted callers read one field (the ELF path, the target name) out of a
     # .cov to drive the rest of the pipeline; keep that output bare so it can be
