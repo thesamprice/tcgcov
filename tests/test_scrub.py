@@ -3,6 +3,12 @@
 An artifact embeds the absolute path of the ELF it was recorded against, so
 that the host tools need no separate manifest. Attaching one to a bug report
 therefore discloses the filesystem layout of the machine that produced it.
+
+The fixtures spell a user's home as '/u/<name>/' rather than '/home/<name>/'.
+Nothing here depends on the prefix -- the scrub only cares that a value has
+directory components -- and CI rejects committed '/home/...' and '/Users/...'
+literals. Exempting this file from that check would leave the one file whose
+subject is leaked paths unguarded against leaking a real one.
 """
 
 import json
@@ -45,7 +51,7 @@ def build_cov(path, elf, test_id="", n_addrs=3, n_edges=2):
 class TestScrubMetadata(unittest.TestCase):
 
     def test_absolute_elf_path_becomes_a_basename(self):
-        meta = {"elf": "/home/someone/build/tests/hello.exe", "bsp": "x"}
+        meta = {"elf": "/u/someone/build/tests/hello.exe", "bsp": "x"}
         out = dump.scrub_metadata(meta)
         self.assertEqual(out["elf"], "hello.exe")
         self.assertEqual(out["bsp"], "x")
@@ -61,7 +67,7 @@ class TestScrubMetadata(unittest.TestCase):
     def test_free_form_labels_are_scrubbed_only_when_they_are_paths(self):
         """test_id and bsp are user supplied; a caller may have put a path
         in one, but an ordinary label must survive untouched."""
-        out = dump.scrub_metadata({"test_id": "/home/me/runs/run7",
+        out = dump.scrub_metadata({"test_id": "/u/me/runs/run7",
                                    "bsp": "rv32imafdc"})
         self.assertEqual(out["test_id"], "run7")
         self.assertEqual(out["bsp"], "rv32imafdc")
@@ -76,7 +82,7 @@ class TestScrubbedArtifact(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.mkdtemp()
         self.src = build_cov(os.path.join(self.d, "in.cov"),
-                             "/home/someone/build/hello.exe")
+                             "/u/someone/build/hello.exe")
         self.dst = os.path.join(self.d, "out.cov")
 
     def test_payload_survives_the_header_rebuild(self):
@@ -92,12 +98,12 @@ class TestScrubbedArtifact(unittest.TestCase):
         self.assertEqual(b[0]["elf"], "hello.exe")
         self.assertTrue(b[0]["scrubbed"])
 
-    def test_no_home_path_survives(self):
+    def test_no_directory_path_survives(self):
         dump.write_scrubbed(self.src, self.dst)
         with open(self.src, "rb") as f:
-            self.assertIn(b"/home/someone/", f.read())
+            self.assertIn(b"/u/someone/", f.read())
         with open(self.dst, "rb") as f:
-            self.assertNotIn(b"/home/someone/", f.read())
+            self.assertNotIn(b"/u/someone/", f.read())
 
     def test_result_is_a_valid_artifact(self):
         """It must still parse -- a scrubbed artifact that cannot be read is
