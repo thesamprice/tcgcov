@@ -259,6 +259,45 @@ class TestRtemsPreset(unittest.TestCase):
         self.assertEqual(norm("/src/rtems/cpukit/score/src/x.c", o),
                          "cpukit/score/src/x.c")
 
+    def test_in_tree_marker_match_stays_source_root_relative(self):
+        """A marker must never rebase an IN-TREE file onto the marker.
+
+        RTEMS really has testsuites/validation/bsps/ts-fatal-extension.c. The
+        rtems preset carries a '/bsps/' marker, which rewrote that to
+        'bsps/ts-fatal-extension.c' -- a file that does not exist, which
+        genhtml then refused to open, and which could collide with a real file
+        of that name under bsps/. It also defeated the preset's
+        'testsuites/**' exclude, since the exclude is applied to the
+        normalized path. Found on a 674-test RTEMS run: 2 of 1254 source
+        files.
+        """
+        o = opts(source_root=SRC, preset="rtems")
+        self.assertIsNone(
+            norm(SRC + "/testsuites/validation/bsps/ts-fatal-extension.c", o))
+        # The kept roots are unaffected.
+        self.assertEqual(norm(SRC + "/bsps/include/bsp/fatal.h", o),
+                         "bsps/include/bsp/fatal.h")
+
+    def test_in_tree_marker_rescue_keeps_a_path_that_exists(self):
+        """A marker may still rescue in-tree code outside the kept roots --
+        but source-root relative, so the path names a real file.
+
+        Driven through normalize_path directly because `roots` is only
+        reachable from a preset, and the one preset that has roots also
+        excludes the tree this exercises.
+        """
+        self.assertEqual(
+            normalize_path(SRC + "/testsuites/validation/bsps/x.c", SRC,
+                           ("/bsps/",), ("cpukit",), (), False),
+            "testsuites/validation/bsps/x.c")
+
+    def test_out_of_tree_marker_is_still_marker_relative(self):
+        """Outside the source root the marker IS the only available base."""
+        self.assertEqual(
+            normalize_path("/elsewhere/proj/cpukit/score/x.c", SRC,
+                           ("/cpukit/",), (), (), False),
+            "cpukit/score/x.c")
+
     def test_preset_is_pure_expansion(self):
         # A preset must add no behaviour of its own: spelling out its markers,
         # roots and excludes by hand has to give the same bundle.

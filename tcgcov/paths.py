@@ -134,13 +134,28 @@ def _normalize_uncached(raw, source_root, markers, roots, excludes, all_paths):
     if all_paths:
         result = real
     else:
+        in_tree = False
         if source_root:
             sr = os.path.realpath(source_root)
             if real.startswith(sr + sep):
+                in_tree = True
                 rel = os.path.relpath(real, sr)
                 if not roots or rel.split(sep, 1)[0] in roots:
                     result = rel
-        if result is None:
+                elif _strip_marker(real, markers) is not None:
+                    # In-tree, outside the kept roots, but a marker matches, so
+                    # the caller wants it. Keep it SOURCE-ROOT relative: the
+                    # marker-relative form names a file that does not exist.
+                    # RTEMS has testsuites/validation/bsps/ts-fatal-extension.c,
+                    # which the '/bsps/' marker rewrote to 'bsps/ts-fatal-
+                    # extension.c' -- a path genhtml cannot open, and one that
+                    # could collide with a real file of that name under bsps/.
+                    # It also defeated the preset's 'testsuites/**' exclude,
+                    # because the exclude is applied to the normalized path.
+                    result = rel
+        if result is None and not in_tree:
+            # Marker stripping is for code OUTSIDE the source root; for in-tree
+            # files the source root is the only correct base.
             result = _strip_marker(real, markers)
         if result is None and not source_root and not markers:
             if not _warned_no_root:
