@@ -132,9 +132,18 @@ context-change callback shape (option 2 above, drafted as an RFC in
 [QEMU-RFC-context.md](QEMU-RFC-context.md), **not sent**) implemented
 against qemu-10.2.4 with MicroBlaze enablement (RPID write path) and a
 demo plugin. A 60 s Linux boot measured **93 distinct contexts and
-137,579 context switches** with per-context TB counts. Remaining for this
-tier: the `TCGCOV2` format (#5) and the tcgcov plugin consuming the
-callback.
+137,579 context switches** with per-context TB counts.
+
+**Tier verified 2026-08-14** — `TCGCOV2` (FORMAT.md §11) and the plugin's
+`ctx=on` landed, and the acceptance experiment passed: see
+`examples/linux-ctx/` — cov_a and cov_b, different programs at the same
+`-Ttext-segment=0x30000000`, running concurrently, attributed to their
+contexts by per-binary beacon sections and yielding separate, correct
+reports (loop counts 80 vs 130, opposite branch arms; 87 colliding
+addresses of which 23 carry different per-context counts). The metadata
+`contexts` table plus `tcgcov contexts --elf/--extract` is the join
+machinery; a guest `/proc/*/maps` dump remains the alternative when
+beacon discipline is not available.
 
 ### Tier 4 — dynamic linking and ASLR
 
