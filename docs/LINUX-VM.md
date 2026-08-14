@@ -74,6 +74,14 @@ the dynamic linker).
 Acceptance: coverage attributed to a `.ko`'s sources from a boot that loads
 it.
 
+**Verified 2026-08-14** — see `examples/linux-module/`: `CONFIG_DUMMY=m`, a
+sidecar init script printing `/proc/modules` + `/sys/module/*/sections/.text`
+between console markers, and two new host-side pieces this tier produced:
+`tcgcov rebase` (runtime→link windowing with printed drop counts) and
+`--section` on symbolize (ET_REL objects need `addr2line -j`). 13/13
+module-window addrs resolved to 18 lines of `dummy.c` and its inlined
+headers, `dummy_xmit` carrying the real transmit count.
+
 ### Tier 2 — one user binary, statically linked, ASLR off
 
 The bare-metal discipline transplanted: boot with `norandmaps`, run **one**

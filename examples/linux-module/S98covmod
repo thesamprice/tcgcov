@@ -1,0 +1,11 @@
+#!/bin/sh
+[ "$1" = start ] || exit 0
+modprobe dummy 2>/dev/null || insmod /lib/modules/*/kernel/drivers/net/dummy.ko 2>/dev/null
+ip link add d0 type dummy 2>/dev/null
+ip link set d0 up 2>/dev/null
+echo "SIDECAR-BEGIN"
+cat /proc/modules
+for f in /sys/module/dummy/sections/.text /sys/module/dummy/sections/.exit.text /sys/module/dummy/sections/.rodata; do
+  [ -f "$f" ] && echo "$f $(cat "$f")"
+done
+echo "SIDECAR-END"

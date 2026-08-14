@@ -44,6 +44,10 @@ def add_symbolize_args(parser):
                         help="keep every source file by absolute path (for "
                              "app ELFs mixing code from different trees); "
                              "absolute paths defeat cross-binary merging")
+    parser.add_argument("--section",
+                        help="treat addresses as offsets into this ELF "
+                             "section (addr2line -j; for ET_REL objects "
+                             "such as kernel modules)")
     parser.add_argument("--arch", default="",
                         help="arch tag for output records (covered: defaults to "
                              "the .cov target_name when empty)")

@@ -8,7 +8,7 @@ from .paths import normalize_path
 LINE_RE = re.compile(r"^(\d+)")  # leading integer of "123 (discriminator 1)"
 
 
-def run_addr2line(addr2line, elf, addrs):
+def run_addr2line(addr2line, elf, addrs, section=None):
     """Yield (address, [(function, file, line_str), ...]) per input address.
 
     Uses a single batched `addr2line -a -f -C -i` call. The -a flag prints the
@@ -21,7 +21,10 @@ def run_addr2line(addr2line, elf, addrs):
     under LC_ALL=C (the default in most containers) `text=True` decodes as
     ASCII, so one non-ASCII byte would abort symbolization entirely.
     """
-    cmd = [addr2line, "-a", "-f", "-C", "-i", "-e", elf]
+    cmd = [addr2line, "-a", "-f", "-C", "-i"]
+    if section:
+        cmd += ["-j", section]
+    cmd += ["-e", elf]
     stdin = "".join("0x%x\n" % a for a in addrs)
     proc = subprocess.run(cmd, input=stdin, capture_output=True,
                           encoding="utf-8", errors="surrogateescape")
@@ -50,7 +53,7 @@ def run_addr2line(addr2line, elf, addrs):
         yield cur_addr, frames
 
 
-def iter_covered_lines(addr2line, elf, addrs, opts, stats=None):
+def iter_covered_lines(addr2line, elf, addrs, opts, stats=None, section=None):
     """Yield (norm_file, line:int, function, depth:int, address) for covered/coverable.
 
     Shared core used by both the covered and coverable producers: normalize,
@@ -62,7 +65,7 @@ def iter_covered_lines(addr2line, elf, addrs, opts, stats=None):
     'no_line' ('??' or unparsable line) and 'path_filtered' (normalize_path
     returned None). Purely diagnostic; the yield stream is unchanged.
     """
-    for addr, frames in run_addr2line(addr2line, elf, addrs):
+    for addr, frames in run_addr2line(addr2line, elf, addrs, section=section):
         for depth, (func, fpath, lno) in enumerate(frames):
             if func == "??":
                 if stats is not None:

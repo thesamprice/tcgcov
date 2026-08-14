@@ -200,3 +200,32 @@ def read_edges(path):
     dst is the first vaddr of the destination block.
     """
     return read_all(path)[3]
+
+
+def write_cov(path, meta, records, edges=None, record_type=1):
+    """Write a TCGCOV1 artifact: the inverse of read_all.
+
+    `records` is a list of (addr, count) -- counts are always written
+    (HAS_COUNTS), matching what the plugin emits.  `edges`, if given, is a
+    list of (src, dst, count) written with EDGE_COUNTS.  `meta` is the
+    metadata dict, serialized as UTF-8 JSON.
+    """
+    blob = json.dumps(meta, sort_keys=True).encode("utf-8")
+    flags = FLAG_HAS_COUNTS
+    if edges:
+        flags |= FLAG_HAS_EDGES | FLAG_EDGE_COUNTS
+    records_off = HEADER_SIZE + len(blob)
+    records_size = len(records) * REC_STRIDE[True]
+    edges_off = records_off + records_size if edges else 0
+    edges_size = len(edges) * EDGE_STRIDE[True] if edges else 0
+    hdr = struct.pack(HEADER_FMT, MAGIC, 1, 1, HEADER_SIZE, record_type,
+                      flags, len(records), HEADER_SIZE, len(blob),
+                      records_off, records_size,
+                      len(edges) if edges else 0, edges_off, edges_size)
+    with open(path, "wb") as f:
+        f.write(hdr)
+        f.write(blob)
+        for a, c in records:
+            f.write(struct.pack("<QQ", a, c))
+        for e in (edges or []):
+            f.write(struct.pack("<QQQ", *e))

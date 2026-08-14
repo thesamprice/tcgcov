@@ -66,7 +66,8 @@ def run(args):
     resolved_addrs = set()
     try:
         for norm, line, func, depth, addr in iter_covered_lines(
-                addr2line, args.elf, addrs, path_options(args), stats=stats):
+                addr2line, args.elf, addrs, path_options(args), stats=stats,
+                section=getattr(args, "section", None)):
             resolved_addrs.add(addr)
             key = (norm, line, func)
             if key not in seen or depth < seen[key]:
@@ -91,7 +92,7 @@ def run(args):
             }) + "\n")
 
     breakdown = f"{args.cov}: {len(addrs)} addrs"
-    if exec_ranges is not None:
+    if exec_ranges:  # empty for ET_REL (sh_addr 0): skip classification
         n_in = sum(1 for a in addrs if in_ranges(a, exec_ranges))
         breakdown += (f": {n_in} within ELF text, {len(addrs) - n_in} outside"
                       f", {len(resolved_addrs)} resolved to lines")
