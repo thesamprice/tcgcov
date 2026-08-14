@@ -1,0 +1,2 @@
+#!/bin/sh
+[ "$1" = start ] && /usr/bin/covtest && echo "COVTEST-RAN"

@@ -89,6 +89,13 @@ test binary should be linked at a distinctive base address.
 Acceptance: line+branch coverage for a userspace test binary running under a
 stock Buildroot rootfs.
 
+**Verified 2026-08-14** — see `examples/linux-userspace/`: a static `-O0 -g`
+binary at `-Wl,-Ttext-segment=0x30000000` (busybox owns the 0x10000000
+default; the DSO mmap region is ~0x48000000), auto-run from an init script.
+The match-rate line fenced 53,079 foreign addresses out of 53,923; the
+result: LF:21 LH:11, BRF:6 BRH:4, with the designed taken/untaken branch
+pair and a loop line carrying its true count of 8.
+
 ### Tier 3 — process-aware coverage (format v2 + QEMU changes)
 
 The real feature. Requirements:
