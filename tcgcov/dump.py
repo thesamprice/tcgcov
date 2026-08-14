@@ -1,5 +1,5 @@
-"""Inspect an TCGCOV1 coverage artifact (header, metadata, addresses, counts,
-edges).
+"""Inspect a TCGCOV coverage artifact (header, metadata, addresses, counts,
+edges, contexts).
 
 Artifacts embed the absolute path of the ELF they were recorded against, so
 that the host tools need no separate manifest. That is convenient locally and
@@ -15,9 +15,11 @@ import os
 import struct
 import sys
 
-from .format import (parse_header, unpack_records, unpack_edges, REC_TYPE,
-                     HEADER_FMT, MAGIC, FLAG_HAS_COUNTS, FLAG_HAS_EDGES,
-                     FLAG_EDGE_COUNTS)
+from .format import (parse_header, unpack_records, unpack_edges,
+                     unpack_ctx_records, unpack_ctx_edges, REC_TYPE,
+                     HEADER_FMT, MAGIC, MAGIC_V2, FLAG_HAS_COUNTS,
+                     FLAG_HAS_EDGES, FLAG_EDGE_COUNTS, FLAG_HAS_CTX,
+                     CTX_UNAVAILABLE)
 
 # Metadata keys whose value is a filesystem path. Everything else in the
 # metadata is a number, a boolean, or a short free-form label.
@@ -83,7 +85,8 @@ def write_scrubbed(src_path, dst_path):
     edge_off = rec_off + len(records) if edges else 0
 
     header = struct.pack(
-        HEADER_FMT, MAGIC, hdr["version"], hdr["endian"], hsize,
+        HEADER_FMT, MAGIC_V2 if hdr["version"] >= 2 else MAGIC,
+        hdr["version"], hdr["endian"], hsize,
         hdr["record_type"], hdr["flags"], hdr["record_count"],
         meta_off, len(new_meta), rec_off, len(records),
         hdr["edge_count"], edge_off, len(edges))
@@ -110,14 +113,47 @@ def load(path):
         meta = {"_parse_error": str(e), "_raw": meta_raw.decode("latin1")}
 
     has_counts = bool(flags & FLAG_HAS_COUNTS)
-    addrs, count_map = unpack_records(data, hdr["records_offset"],
-                                      hdr["records_size"], has_counts)
-    counts = [count_map[a] for a in addrs] if count_map is not None else None
+    has_ctx = bool(flags & FLAG_HAS_CTX)
+    ctx_summary = None
+    if has_ctx:
+        # Aggregate for the address/count displays below, but keep a
+        # per-context summary: (ctx, records, total execs, edges).
+        records = unpack_ctx_records(data, hdr["records_offset"],
+                                     hdr["records_size"], has_counts)
+        ctx_edges = []
+        if flags & FLAG_HAS_EDGES and hdr["edges_size"]:
+            ctx_edges = unpack_ctx_edges(data, hdr["edges_offset"],
+                                         hdr["edges_size"],
+                                         bool(flags & FLAG_EDGE_COUNTS))
+        summary = {}
+        count_map = {} if has_counts else None
+        addr_order = {}
+        for c, a, cnt in records:
+            row = summary.setdefault(c, [0, 0, 0])
+            row[0] += 1
+            row[1] += cnt or 0
+            addr_order.setdefault(a, True)
+            if count_map is not None:
+                count_map[a] = count_map.get(a, 0) + cnt
+        merged = {}
+        for c, s, d, cnt in ctx_edges:
+            summary.setdefault(c, [0, 0, 0])[2] += 1
+            merged[(s, d)] = merged.get((s, d), 0) + cnt
+        addrs = list(addr_order)
+        counts = [count_map[a] for a in addrs] if count_map is not None \
+            else None
+        edges = [(s, d, c) for (s, d), c in sorted(merged.items())]
+        ctx_summary = sorted(summary.items())
+    else:
+        addrs, count_map = unpack_records(data, hdr["records_offset"],
+                                          hdr["records_size"], has_counts)
+        counts = [count_map[a] for a in addrs] if count_map is not None \
+            else None
 
-    edges = []
-    if flags & FLAG_HAS_EDGES and hdr["edges_size"]:
-        edges = unpack_edges(data, hdr["edges_offset"], hdr["edges_size"],
-                             bool(flags & FLAG_EDGE_COUNTS))
+        edges = []
+        if flags & FLAG_HAS_EDGES and hdr["edges_size"]:
+            edges = unpack_edges(data, hdr["edges_offset"], hdr["edges_size"],
+                                 bool(flags & FLAG_EDGE_COUNTS))
 
     header = {
         "version": hdr["version"], "endian": hdr["endian"],
@@ -127,12 +163,13 @@ def load(path):
         "flags": flags, "has_counts": has_counts,
         "has_edges": bool(flags & FLAG_HAS_EDGES),
         "edge_counts": bool(flags & FLAG_EDGE_COUNTS),
+        "has_ctx": has_ctx,
         "record_count": hdr["record_count"],
         "metadata_size": hdr["metadata_size"],
         "records_size": hdr["records_size"],
         "edge_count": hdr["edge_count"], "edges_size": hdr["edges_size"],
     }
-    return header, meta, addrs, counts, edges
+    return header, meta, addrs, counts, edges, ctx_summary
 
 
 def add_arguments(parser):
@@ -169,7 +206,7 @@ def run(args):
               file=sys.stderr)
 
     try:
-        header, meta, addrs, counts, edges = load(args.file)
+        header, meta, addrs, counts, edges, ctx_summary = load(args.file)
     except (OSError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -200,6 +237,19 @@ def run(args):
     print("== metadata ==")
     print(json.dumps(meta, indent=2))
 
+    if ctx_summary is not None:
+        print("== contexts ==")
+        print(f"  count: {len(ctx_summary)}")
+        print("  (addresses/counts/edges below are aggregated across "
+              "contexts; use `tcgcov contexts` to slice)")
+        shown = ctx_summary if args.all else ctx_summary[:args.n]
+        for ctx, (nrec, total, nedges) in shown:
+            name = "<unavailable>" if ctx == CTX_UNAVAILABLE else f"0x{ctx:x}"
+            print(f"  ctx {name}: {nrec} records, {total} execs, "
+                  f"{nedges} edges")
+        if not args.all and len(ctx_summary) > args.n:
+            print(f"  ... ({len(ctx_summary) - args.n} more) ...")
+
     print("== addresses ==")
     print(f"  count: {len(addrs)}")
     if addrs:
@@ -214,7 +264,7 @@ def run(args):
         for i in hottest:
             print(f"    0x{addrs[i]:x}  count={counts[i]}")
 
-    if header["record_count"] != len(addrs):
+    if not header["has_ctx"] and header["record_count"] != len(addrs):
         print(f"  WARNING: header record_count={header['record_count']} "
               f"!= decoded {len(addrs)}")
 
@@ -240,7 +290,7 @@ def run(args):
     if header["has_edges"]:
         print("== edges ==")
         print(f"  count: {len(edges)}")
-        if header["edge_count"] != len(edges):
+        if not header["has_ctx"] and header["edge_count"] != len(edges):
             print(f"  WARNING: header edge_count={header['edge_count']} "
                   f"!= decoded {len(edges)}")
         shown = edges if args.all else edges[:args.n]

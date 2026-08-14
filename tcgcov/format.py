@@ -1,15 +1,15 @@
-"""TCGCOV1 binary artifact format: constants and reader.
+"""TCGCOV1/TCGCOV2 binary artifact format: constants and reader.
 
 The on-disk layout (all little-endian):
 
     struct tcgcov_header {          # 88 bytes
-        char     magic[8];          # "TCGCOV1\0"
-        uint16_t version;
+        char     magic[8];          # "TCGCOV1\0" or "TCGCOV2\0"
+        uint16_t version;           # 1 or 2, always matching the magic
         uint16_t endian;            # 1 = little, 2 = big
         uint32_t header_size;
         uint32_t record_type;       # 1=TB_ADDR, 2=INSN_ADDR, 3=EDGE
         uint32_t flags;             # bit0 HAS_COUNTS, bit1 HAS_EDGES,
-                                    # bit2 EDGE_COUNTS
+                                    # bit2 EDGE_COUNTS, bit3 HAS_CTX (v2)
         uint64_t record_count;
         uint64_t metadata_offset;
         uint64_t metadata_size;
@@ -23,6 +23,16 @@ The on-disk layout (all little-endian):
     <address records>               # 8-byte addr, or 16-byte {addr,count} if HAS_COUNTS
     <edge records>                  # 16-byte {src,dst}, or 24-byte {src,dst,count}
                                     # if EDGE_COUNTS; sorted by (src,dst)
+
+TCGCOV2 adds one thing: an address-space context ID on every record. With
+HAS_CTX set, every address record is prefixed with a uint64 ctx (so 16 or
+24 bytes) and every edge record likewise (24 or 32 bytes); records sort by
+(ctx, addr) and edges by (ctx, src, dst). Context 2**64-1 means "the
+producer could not learn the context" (QEMU_PLUGIN_CTX_UNAVAILABLE). The
+metadata may carry a "contexts" object mapping decimal ctx IDs to facts the
+producer knew about them (currently {"entries": times-switched-into}).
+HAS_CTX is only legal in a TCGCOV2 file; everything else is unchanged, and
+a v2 file without HAS_CTX is byte-for-byte a v1 file with a new magic.
 
 Edge records are what makes BRANCH coverage possible. `src` is the vaddr of the
 LAST INSTRUCTION of the source translation block, not its first: on delay-slot
@@ -39,17 +49,31 @@ import json
 import struct
 
 MAGIC = b"TCGCOV1\0"
+MAGIC_V2 = b"TCGCOV2\0"
 HEADER_FMT = "<8sHHIIIQQQQQQQQ"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)          # 88
 
-# Address-record and edge-record strides, selected by the flags. records_size
-# and edges_size must be whole multiples of these.
+# Address-record and edge-record strides, selected by the flags:
+# keyed on (has_counts, has_ctx). records_size and edges_size must be whole
+# multiples of these.
 REC_STRIDE = {False: 8, True: 16}
 EDGE_STRIDE = {False: 16, True: 24}
 
 FLAG_HAS_COUNTS = 0x1
 FLAG_HAS_EDGES = 0x2
 FLAG_EDGE_COUNTS = 0x4
+FLAG_HAS_CTX = 0x8
+
+# The producer's "no context available" marker (QEMU_PLUGIN_CTX_UNAVAILABLE).
+CTX_UNAVAILABLE = 2**64 - 1
+
+
+def _rec_stride(has_counts, has_ctx):
+    return REC_STRIDE[bool(has_counts)] + (8 if has_ctx else 0)
+
+
+def _edge_stride(has_counts, has_ctx):
+    return EDGE_STRIDE[bool(has_counts)] + (8 if has_ctx else 0)
 
 REC_TYPE = {1: "TB_ADDR", 2: "INSN_ADDR", 3: "EDGE"}
 
@@ -75,10 +99,11 @@ def parse_header(data, path="<data>"):
 
     After this returns, the unpackers below cannot read out of bounds.
     """
-    if len(data) < 8 or data[:8] != MAGIC:
-        raise ValueError(f"{path}: not a TCGCOV1 file (bad magic)")
+    if len(data) < 8 or data[:8] not in (MAGIC, MAGIC_V2):
+        raise ValueError(f"{path}: not a TCGCOV file (bad magic)")
+    magic_version = 1 if data[:8] == MAGIC else 2
     if len(data) < HEADER_SIZE:
-        raise ValueError(f"{path}: truncated TCGCOV1 header: {len(data)} "
+        raise ValueError(f"{path}: truncated TCGCOV header: {len(data)} "
                          f"bytes, need {HEADER_SIZE}")
 
     version, endian = struct.unpack_from("<HH", data, 8)
@@ -89,9 +114,11 @@ def parse_header(data, path="<data>"):
     if endian != 1:
         raise ValueError(f"{path}: bad endian field {endian} "
                          f"(expected 1=little or 2=big)")
-    if version != 1:
-        raise ValueError(f"{path}: unsupported format version {version} "
-                         f"(this reader knows version 1)")
+    if version != magic_version:
+        raise ValueError(f"{path}: version field {version} does not match "
+                         f"the TCGCOV{magic_version} magic; the two changed "
+                         f"together and a mismatch means a corrupt or "
+                         f"hand-forged header")
 
     hdr = dict(zip(HEADER_FIELDS, struct.unpack(HEADER_FMT,
                                                 data[:HEADER_SIZE])))
@@ -113,12 +140,16 @@ def parse_header(data, path="<data>"):
                              f"runs past the end of the {size}-byte file")
 
     flags = hdr["flags"]
-    stride = REC_STRIDE[bool(flags & FLAG_HAS_COUNTS)]
+    has_ctx = bool(flags & FLAG_HAS_CTX)
+    if has_ctx and version < 2:
+        raise ValueError(f"{path}: HAS_CTX flag set in a TCGCOV1 file; "
+                         f"context records exist only from TCGCOV2 on")
+    stride = _rec_stride(flags & FLAG_HAS_COUNTS, has_ctx)
     if hdr["records_size"] % stride:
         raise ValueError(f"{path}: records_size {hdr['records_size']} is not "
                          f"a multiple of the {stride}-byte record stride")
     if flags & FLAG_HAS_EDGES:
-        stride = EDGE_STRIDE[bool(flags & FLAG_EDGE_COUNTS)]
+        stride = _edge_stride(flags & FLAG_EDGE_COUNTS, has_ctx)
         if hdr["edges_size"] % stride:
             raise ValueError(f"{path}: edges_size {hdr['edges_size']} is not "
                              f"a multiple of the {stride}-byte edge stride")
@@ -157,12 +188,45 @@ def unpack_edges(data, off, size, has_counts):
     return [(s, d, 1) for s, d in zip(flat[0::2], flat[1::2])]
 
 
-def read_all(path):
-    """Return (metadata, [addresses], counts, edges) from an TCGCOV1 file.
+def unpack_ctx_records(data, off, size, has_counts):
+    """Decode a TCGCOV2 context record array -> [(ctx, addr, count)].
 
-    counts is None unless the file was written in counts mode (FLAG_HAS_COUNTS).
-    edges is a list of (src, dst, count) triples, empty when the artifact has no
-    FLAG_HAS_EDGES section.
+    Without HAS_COUNTS the count is reported as None. Bounds are guaranteed
+    by parse_header, as with unpack_records.
+    """
+    words = 3 if has_counts else 2
+    n = size // _rec_stride(has_counts, True)
+    if not n:
+        return []
+    flat = struct.unpack_from("<%dQ" % (words * n), data, off)
+    if has_counts:
+        return list(zip(flat[0::3], flat[1::3], flat[2::3]))
+    return [(c, a, None) for c, a in zip(flat[0::2], flat[1::2])]
+
+
+def unpack_ctx_edges(data, off, size, has_counts):
+    """Decode a TCGCOV2 context edge array -> [(ctx, src, dst, count)].
+
+    Without EDGE_COUNTS the count is reported as 1, mirroring unpack_edges.
+    """
+    words = 4 if has_counts else 3
+    n = size // _edge_stride(has_counts, True)
+    if not n:
+        return []
+    flat = struct.unpack_from("<%dQ" % (words * n), data, off)
+    if has_counts:
+        return list(zip(flat[0::4], flat[1::4], flat[2::4], flat[3::4]))
+    return [(c, s, d, 1) for c, s, d in
+            zip(flat[0::3], flat[1::3], flat[2::3])]
+
+
+def read_full(path):
+    """Return (metadata, header, records, edges) with contexts preserved.
+
+    records is [(ctx, addr, count)] and edges [(ctx, src, dst, count)]. For a
+    file without context records (TCGCOV1, or v2 without HAS_CTX) every ctx is
+    None; count is None for count-less address records. This is the one reader
+    that exposes the v2 context axis raw; read_all() collapses it.
     """
     with open(path, "rb") as f:
         data = f.read()
@@ -171,14 +235,70 @@ def read_all(path):
     meta_off, meta_size = hdr["metadata_offset"], hdr["metadata_size"]
     meta = json.loads(data[meta_off:meta_off + meta_size].decode("utf-8"))
 
+    has_counts = bool(flags & FLAG_HAS_COUNTS)
+    if flags & FLAG_HAS_CTX:
+        records = unpack_ctx_records(data, hdr["records_offset"],
+                                     hdr["records_size"], has_counts)
+        edges = []
+        if flags & FLAG_HAS_EDGES and hdr["edges_size"]:
+            edges = unpack_ctx_edges(data, hdr["edges_offset"],
+                                     hdr["edges_size"],
+                                     bool(flags & FLAG_EDGE_COUNTS))
+        return meta, hdr, records, edges
+
     addrs, counts = unpack_records(data, hdr["records_offset"],
-                                   hdr["records_size"],
-                                   bool(flags & FLAG_HAS_COUNTS))
+                                   hdr["records_size"], has_counts)
+    records = [(None, a, counts[a] if counts else None) for a in addrs]
     edges = []
     if flags & FLAG_HAS_EDGES and hdr["edges_size"]:
-        edges = unpack_edges(data, hdr["edges_offset"], hdr["edges_size"],
-                             bool(flags & FLAG_EDGE_COUNTS))
-    return meta, addrs, counts, edges
+        edges = [(None, s, d, c) for s, d, c in
+                 unpack_edges(data, hdr["edges_offset"], hdr["edges_size"],
+                              bool(flags & FLAG_EDGE_COUNTS))]
+    return meta, hdr, records, edges
+
+
+def read_all(path, ctx=None):
+    """Return (metadata, [addresses], counts, edges) from a TCGCOV file.
+
+    counts is None unless the file was written in counts mode (FLAG_HAS_COUNTS).
+    edges is a list of (src, dst, count) triples, empty when the artifact has no
+    FLAG_HAS_EDGES section.
+
+    For a TCGCOV2 file with context records, the context axis is collapsed so
+    every existing consumer keeps working: with ctx=None counts are summed
+    across all contexts (the same address executed in two processes appears
+    once, with the total); with ctx=<int> only that context's records and
+    edges are returned. Passing ctx on a file without context records is an
+    error -- there is nothing to select on, and silently returning everything
+    would misattribute coverage.
+    """
+    meta, hdr, records, edges = read_full(path)
+    flags = hdr["flags"]
+    has_ctx = bool(flags & FLAG_HAS_CTX)
+    if ctx is not None and not has_ctx:
+        raise ValueError(f"{path}: context {ctx:#x} requested but the file "
+                         f"has no context records (not a TCGCOV2/HAS_CTX "
+                         f"artifact)")
+
+    has_counts = bool(flags & FLAG_HAS_COUNTS)
+    if has_ctx and ctx is not None:
+        records = [r for r in records if r[0] == ctx]
+        edges = [e for e in edges if e[0] == ctx]
+
+    counts = {} if has_counts else None
+    addr_seen = {}
+    for _c, a, cnt in records:
+        if a not in addr_seen:
+            addr_seen[a] = True
+        if counts is not None:
+            counts[a] = counts.get(a, 0) + cnt
+    addrs = list(addr_seen)
+
+    merged = {}
+    for _c, s, d, cnt in edges:
+        merged[(s, d)] = merged.get((s, d), 0) + cnt
+    out_edges = [(s, d, c) for (s, d), c in sorted(merged.items())]
+    return meta, addrs, counts, out_edges
 
 
 def read_cov(path):
@@ -202,30 +322,43 @@ def read_edges(path):
     return read_all(path)[3]
 
 
-def write_cov(path, meta, records, edges=None, record_type=1):
-    """Write a TCGCOV1 artifact: the inverse of read_all.
+def write_cov(path, meta, records, edges=None, record_type=1, ctx=False):
+    """Write a TCGCOV artifact: the inverse of read_all/read_full.
 
-    `records` is a list of (addr, count) -- counts are always written
-    (HAS_COUNTS), matching what the plugin emits.  `edges`, if given, is a
-    list of (src, dst, count) written with EDGE_COUNTS.  `meta` is the
-    metadata dict, serialized as UTF-8 JSON.
+    With ctx=False (the default), a TCGCOV1 file: `records` is a list of
+    (addr, count) -- counts are always written (HAS_COUNTS), matching what
+    the plugin emits -- and `edges`, if given, is (src, dst, count) written
+    with EDGE_COUNTS.
+
+    With ctx=True, a TCGCOV2 file with HAS_CTX: `records` is
+    (ctx, addr, count) and `edges` is (ctx, src, dst, count); both are
+    sorted before writing, per the format's (ctx, addr) / (ctx, src, dst)
+    ordering rule. `meta` is the metadata dict, serialized as UTF-8 JSON.
     """
     blob = json.dumps(meta, sort_keys=True).encode("utf-8")
     flags = FLAG_HAS_COUNTS
     if edges:
         flags |= FLAG_HAS_EDGES | FLAG_EDGE_COUNTS
+    if ctx:
+        flags |= FLAG_HAS_CTX
+        records = sorted(records)
+        edges = sorted(edges) if edges else edges
+    magic, version = (MAGIC_V2, 2) if ctx else (MAGIC, 1)
+    rec_words, edge_words = (3, 4) if ctx else (2, 3)
     records_off = HEADER_SIZE + len(blob)
-    records_size = len(records) * REC_STRIDE[True]
+    records_size = len(records) * 8 * rec_words
     edges_off = records_off + records_size if edges else 0
-    edges_size = len(edges) * EDGE_STRIDE[True] if edges else 0
-    hdr = struct.pack(HEADER_FMT, MAGIC, 1, 1, HEADER_SIZE, record_type,
+    edges_size = len(edges) * 8 * edge_words if edges else 0
+    hdr = struct.pack(HEADER_FMT, magic, version, 1, HEADER_SIZE, record_type,
                       flags, len(records), HEADER_SIZE, len(blob),
                       records_off, records_size,
                       len(edges) if edges else 0, edges_off, edges_size)
     with open(path, "wb") as f:
         f.write(hdr)
         f.write(blob)
-        for a, c in records:
-            f.write(struct.pack("<QQ", a, c))
+        rec_fmt = "<%dQ" % rec_words
+        for r in records:
+            f.write(struct.pack(rec_fmt, *r))
+        edge_fmt = "<%dQ" % edge_words
         for e in (edges or []):
-            f.write(struct.pack("<QQQ", *e))
+            f.write(struct.pack(edge_fmt, *e))

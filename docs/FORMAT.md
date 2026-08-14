@@ -102,6 +102,7 @@ TCGCOV1 — offsets `0..87` are entirely accounted for by the table above.
 | 0   | `0x1` | `HAS_COUNTS`  | Each **address** record carries an execution count and is 16 bytes instead of 8. Applies only to the address record section. |
 | 1   | `0x2` | `HAS_EDGES`   | An edge section is present. `edge_count`/`edges_offset`/`edges_size` are meaningful. |
 | 2   | `0x4` | `EDGE_COUNTS` | Each **edge** record carries a traversal count and is 24 bytes instead of 16. Only meaningful when `HAS_EDGES` is also set; readers should ignore it otherwise. |
+| 3   | `0x8` | `HAS_CTX`     | **TCGCOV2 only.** Every address and edge record is prefixed with a `uint64` address-space context ID; see §11. Illegal in a file bearing the `TCGCOV1` magic — a v1 reader would mis-stride the sections, so the magic changed with the flag. |
 
 All other bits are reserved and are written as zero. A reader that encounters
 an unknown bit set should still be able to read the sections it understands,
@@ -588,6 +589,7 @@ For reference, the plugin arguments that shape the output:
 | `mode=tb-insn` | *(default)*    | `record_type = 2`, one record per instruction the CPU actually reached. `insn_fidelity = "exact"`. Costs one callback per in-range instruction — the slowest mode, and the default because a coverage tool that over-reports is worse than a slow one. `mode=insn` is an accepted alias. |
 | `mode=tb-insn-fast` | —         | `record_type = 2`, but instruction addresses are expanded from a single per-block callback. `insn_fidelity = "tb-approx"`; **over-reports instructions after an aborted block**. See §4.1. |
 | `edges=`       | **on**         | `edges=off` clears `HAS_EDGES` and omits the edge section. |
+| `ctx=`         | off            | `ctx=on` records per-address-space-context and writes a **TCGCOV2** file with `HAS_CTX`; see §11. Requires a plugin built against a QEMU with the context-visibility API, and `mode=tb` or `mode=tb-insn-fast` (fails the launch otherwise). |
 | `filter=A-B[,C-D...]` | none    | Only record addresses in `[start, end)`. Values accept `0x` hex. Recorded in `metadata.filters`. |
 | `elf=PATH`     | none           | Recorded in `metadata.elf` for offline symbolization. JSON-escaped, so any path is safe; see §6.1. |
 | `test_id=STR`  | none           | Free-form metadata string. JSON-escaped; see §6.1. |
@@ -645,3 +647,67 @@ often; code that *assumed* 8-byte address records without checking the flag was
 always wrong and will now notice. Neither the covered-address set nor the edge
 set is affected — an address is reported as covered under exactly the same
 condition as before.
+
+---
+
+## 11. TCGCOV2: context records
+
+TCGCOV2 answers the question TCGCOV1 cannot: *which guest address space
+executed this address?* On a full-system guest with an MMU, every process
+occupies the same VA range; a v1 artifact of a Linux boot is a blend of every
+process that ran. TCGCOV2 keys every record by an **address-space context
+ID** — an opaque, target-defined value reported by QEMU's (proposed)
+plugin context-visibility API (MicroBlaze: the 8-bit MMU PID in `RPID`; see
+`docs/QEMU-RFC-context.md`).
+
+### What changes, exactly
+
+* `magic` is `"TCGCOV2\0"` and `version` is `2`. The two always change
+  together; a reader must reject a mismatch.
+* Flag bit 3 (`HAS_CTX`, `0x8`) may be set. When it is:
+  * every **address record** gains a leading `uint64 ctx`:
+    `{ ctx, addr }` (16 bytes) or `{ ctx, addr, count }` (24 bytes with
+    `HAS_COUNTS`), sorted ascending by `(ctx, addr)`;
+  * every **edge record** gains a leading `uint64 ctx`:
+    `{ ctx, src, dst }` (24 bytes) or `{ ctx, src, dst, count }` (32 bytes
+    with `EDGE_COUNTS`), sorted ascending by `(ctx, src, dst)`.
+* The same `addr` may appear once per context; `record_count` counts
+  `(ctx, addr)` pairs. Likewise for edges.
+* A context value of `2^64 - 1` means the producer could not learn the
+  context (`QEMU_PLUGIN_CTX_UNAVAILABLE`): the API existed but the target
+  did not report one.
+* Everything else — header layout, endianness rules, metadata encoding,
+  section bounds discipline — is unchanged. A TCGCOV2 file **without**
+  `HAS_CTX` is byte-for-byte a TCGCOV1 file with the new magic, and is legal.
+
+### Metadata additions
+
+The producer records, when `ctx=on`:
+
+* `"ctx_enabled": true`
+* `"ctx_switches": N` — context-change callbacks observed;
+* `"contexts": { "<decimal ctx>": { "entries": N }, ... }` — how many times
+  each context was switched into (its first observation counts as an entry).
+
+Hardware context IDs are not process IDs. Naming a context — joining it to a
+binary — is a host-side step: `tcgcov contexts FILE --elf BIN` scores each
+context's addresses against the ELF's executable ranges, which identifies the
+context of a binary linked at a distinctive base. A guest-side
+`/proc/*/maps` dump can serve the same purpose when VA ranges alone cannot.
+
+### Edge semantics across a switch
+
+The producer treats a context switch as a control-flow discontinuity: the
+pending edge source is invalidated, so no edge is ever recorded from one
+context's block to another's. An edge with context `C` asserts both endpoints
+executed in `C`.
+
+### Reader guidance
+
+Collapsing the context axis (summing counts of the same address across
+contexts, merging identical edges) reproduces exactly what a TCGCOV1 run
+would have recorded; the reference reader's `read_all()` does this by
+default, so v1-era consumers work on v2 files unchanged. Slicing one context
+(`read_all(path, ctx=N)`, or `tcgcov contexts FILE --extract N -o OUT` to
+materialize a TCGCOV1 file) is what makes per-process coverage: symbolize
+the slice against that process's ELF and the entire v1 pipeline applies.

@@ -13,8 +13,9 @@ CLI (also runnable as `python3 -m tcgcov`):
     tcgcov dump|symbolize|coverable|branches|lcov|merge
 """
 
-from .format import (read_cov, read_edges, read_all, MAGIC, FLAG_HAS_COUNTS,
-                     FLAG_HAS_EDGES, FLAG_EDGE_COUNTS)
+from .format import (read_cov, read_edges, read_all, read_full, MAGIC,
+                     MAGIC_V2, FLAG_HAS_COUNTS, FLAG_HAS_EDGES,
+                     FLAG_EDGE_COUNTS, FLAG_HAS_CTX, CTX_UNAVAILABLE)
 from .paths import normalize_path, path_options, PathOptions, PRESETS
 from .symbolize import run_addr2line, iter_covered_lines
 from .cfg import analyze, get_profile, load_profile_file, ARCH_PROFILES
@@ -25,6 +26,7 @@ __all__ = [
     "read_cov", "read_edges", "read_all", "normalize_path", "path_options",
     "PathOptions", "PRESETS", "run_addr2line",
     "iter_covered_lines", "analyze", "get_profile", "load_profile_file",
-    "ARCH_PROFILES", "MAGIC", "FLAG_HAS_COUNTS", "FLAG_HAS_EDGES",
-    "FLAG_EDGE_COUNTS", "__version__",
+    "ARCH_PROFILES", "MAGIC", "MAGIC_V2", "FLAG_HAS_COUNTS", "FLAG_HAS_EDGES",
+    "FLAG_EDGE_COUNTS", "FLAG_HAS_CTX", "CTX_UNAVAILABLE", "read_full",
+    "__version__",
 ]

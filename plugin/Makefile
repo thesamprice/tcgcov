@@ -46,6 +46,12 @@ HAVE_DISCON := $(shell grep -qs qemu_plugin_register_vcpu_discon_cb \
                          "$(PLUGIN_HEADER)" && echo 1 || echo 0)
 CFLAGS    += -DTCGCOV_HAVE_DISCON=$(HAVE_DISCON)
 
+# Same probe for the (proposed) context-visibility API; only QEMU trees
+# carrying the tcgcov context patches have it, at any version number.
+HAVE_CTX  := $(shell grep -qs qemu_plugin_register_vcpu_ctx_changed_cb \
+                         "$(PLUGIN_HEADER)" && echo 1 || echo 0)
+CFLAGS    += -DTCGCOV_HAVE_CTX=$(HAVE_CTX)
+
 UNAME_S   := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 # macOS builds the plugin as a bundle and needs undefined symbols left to the

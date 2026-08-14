@@ -2,7 +2,8 @@
 
 import argparse
 
-from . import addr2line, branches, coverable, lcov, merge, dump, restrict, gap, rebase
+from . import (addr2line, branches, contexts, coverable, lcov, merge, dump,
+               restrict, gap, rebase)
 from . import __version__
 
 # (subcommand name, module, short help). The module supplies add_arguments(p)
@@ -15,6 +16,8 @@ SUBCOMMANDS = [
      "ELF + .cov edges -> per-branch-outcome JSONL (BRDA input)"),
     ("rebase", rebase,
      "shift a runtime-address window to link addresses (kernel modules)"),
+    ("contexts", contexts,
+     "list a TCGCOV2 artifact's contexts, or extract one as TCGCOV1"),
     ("lcov", lcov, "symbolized JSONL -> per-test LCOV .info"),
     ("merge", merge, "merge per-test .info -> aggregate (by source+line)"),
     ("restrict", restrict,

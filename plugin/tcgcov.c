@@ -77,11 +77,24 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define TCGCOV_HAVE_DISCON 0
 #endif
 
+/*
+ * Context-visibility API (qemu_plugin_vcpu_ctx_id and the ctx-changed
+ * callback): a proposed QEMU addition, present only in trees carrying the
+ * tcgcov context patches (see docs/QEMU-RFC-context.md). Probed by the
+ * Makefile the same way as the discon callbacks; ctx=on is refused at
+ * install time when this is 0, because per-context coverage without the
+ * API would silently attribute everything to one context.
+ */
+#ifndef TCGCOV_HAVE_CTX
+#define TCGCOV_HAVE_CTX 0
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Raw file format (TCGCOV1).                                          */
 /* ------------------------------------------------------------------ */
 
 #define TCGCOV_MAGIC "TCGCOV1\0"   /* 8 bytes including the NUL */
+#define TCGCOV_MAGIC_V2 "TCGCOV2\0" /* ctx-bearing artifacts (ctx=on) */
 
 enum {
     TCGCOV_REC_TB_ADDR   = 1,      /* records are TB start addresses */
@@ -109,6 +122,13 @@ enum {
      * Only meaningful together with TCGCOV_FLAG_HAS_EDGES.
      */
     TCGCOV_FLAG_EDGE_COUNTS = 0x4,
+    /*
+     * TCGCOV2 only: every address record is prefixed with a uint64 ctx
+     * (address-space context ID) and every edge record likewise; records
+     * sort by (ctx, addr), edges by (ctx, src, dst). Never set in a file
+     * bearing the TCGCOV1 magic.
+     */
+    TCGCOV_FLAG_HAS_CTX     = 0x8,
 };
 
 /* All multi-byte header fields are little-endian on disk. */
@@ -252,6 +272,45 @@ typedef struct {
 
 G_STATIC_ASSERT(sizeof(Edge) == 24);
 
+/*
+ * Context-bearing forms of the two record types, written to disk in this
+ * field order when ctx=on (TCGCOV2, TCGCOV_FLAG_HAS_CTX). CtxEdge doubles
+ * as the plugin's internal edge representation in every mode: with ctx off
+ * the ctx field is always 0 and the v1 writer emits the {src, dst, count}
+ * tail only, which the layout below makes contiguous by construction.
+ */
+typedef struct {
+    uint64_t ctx;                  /* address-space context ID */
+    uint64_t addr;
+    uint64_t count;
+} CtxAddrCount;
+
+G_STATIC_ASSERT(sizeof(CtxAddrCount) == 24);
+G_STATIC_ASSERT(offsetof(CtxAddrCount, addr) == 8);
+
+typedef struct {
+    uint64_t ctx;                  /* address-space context ID */
+    uint64_t src;
+    uint64_t dst;
+    uint64_t count;
+} CtxEdge;
+
+G_STATIC_ASSERT(sizeof(CtxEdge) == 32);
+G_STATIC_ASSERT(offsetof(CtxEdge, src) == 8);
+
+/*
+ * Per-(context, block) execution count for ctx=on, accumulated in a per-vCPU
+ * hash table (same ownership discipline as the per-vCPU edge tables: only
+ * the owning vCPU thread touches it, plugin_exit reads it quiescent). The
+ * CovTb pointer rather than the address is the key so that tb-insn-fast can
+ * expand the block's instruction list at collection time.
+ */
+typedef struct {
+    uint64_t ctx;
+    const CovTb *tb;
+    uint64_t count;
+} CtxTbCount;
+
 #define TCGCOV_CACHELINE 64
 
 /*
@@ -273,9 +332,17 @@ G_STATIC_ASSERT(sizeof(Edge) == 24);
  */
 typedef struct {
     uint64_t prev_src;
-    GHashTable *edges;             /* Edge* -> same Edge*, keyed on (src,dst) */
+    GHashTable *edges;         /* CtxEdge* -> same, keyed on (ctx,src,dst) */
+    /*
+     * ctx=on state. cur_ctx is written by the ctx-changed callback and read
+     * by the execution callbacks - both run on this vCPU's thread, so the
+     * slot ownership rule covers them. It stays 0 with ctx off, which is
+     * what lets record_edge() use it unconditionally.
+     */
+    uint64_t cur_ctx;
+    GHashTable *ctx_tbs;       /* CtxTbCount* -> same, keyed on (ctx,tb) */
     bool prev_valid;
-    char pad[TCGCOV_CACHELINE - sizeof(uint64_t) - sizeof(void *)
+    char pad[TCGCOV_CACHELINE - 2 * sizeof(uint64_t) - 2 * sizeof(void *)
              - sizeof(bool)];
 } VcpuState;
 
@@ -313,7 +380,17 @@ typedef struct {
 
     CovMode mode;
     bool edges;                    /* edges=off disables the edge section */
+    bool ctx;                      /* ctx=on records per-context (TCGCOV2) */
     bool verbose;
+
+    /*
+     * ctx=on bookkeeping, updated from the (rare) ctx-changed callback.
+     * ctx_entries maps context ID -> times switched into, guarded by `lock`
+     * because several vCPUs can switch concurrently; ctx_switches is a
+     * relaxed atomic counter.
+     */
+    GHashTable *ctx_entries;       /* uint64* key -> uint64 count in value */
+    uint64_t ctx_switches;
 
     /*
      * Per-vCPU edge state, indexed by cpu_index. Allocated once at install
@@ -398,12 +475,31 @@ static gint addrcount_compare(gconstpointer a, gconstpointer b)
     return (av > bv) - (av < bv);
 }
 
-/* Sort edges ascending by (src, dst), as the file format requires. */
+/* Sort ctx address records ascending by (ctx, addr), per the v2 format. */
+static gint ctxaddr_compare(gconstpointer a, gconstpointer b)
+{
+    const CtxAddrCount *ca = a;
+    const CtxAddrCount *cb = b;
+
+    if (ca->ctx != cb->ctx) {
+        return (ca->ctx > cb->ctx) - (ca->ctx < cb->ctx);
+    }
+    return (ca->addr > cb->addr) - (ca->addr < cb->addr);
+}
+
+/*
+ * Sort edges ascending by (ctx, src, dst), as the file format requires.
+ * With ctx off every ctx is 0 and this degenerates to the v1 (src, dst)
+ * order.
+ */
 static gint edge_compare(gconstpointer a, gconstpointer b)
 {
-    const Edge *ea = a;
-    const Edge *eb = b;
+    const CtxEdge *ea = a;
+    const CtxEdge *eb = b;
 
+    if (ea->ctx != eb->ctx) {
+        return (ea->ctx > eb->ctx) - (ea->ctx < eb->ctx);
+    }
     if (ea->src != eb->src) {
         return (ea->src > eb->src) - (ea->src < eb->src);
     }
@@ -412,19 +508,37 @@ static gint edge_compare(gconstpointer a, gconstpointer b)
 
 static guint edge_hash(gconstpointer p)
 {
-    const Edge *e = p;
+    const CtxEdge *e = p;
     uint64_t h = e->src * 0x9E3779B97F4A7C15ULL;
 
     h ^= e->dst + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+    h ^= e->ctx + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
     return (guint)(h ^ (h >> 32));
 }
 
 static gboolean edge_equal(gconstpointer a, gconstpointer b)
 {
-    const Edge *ea = a;
-    const Edge *eb = b;
+    const CtxEdge *ea = a;
+    const CtxEdge *eb = b;
 
-    return ea->src == eb->src && ea->dst == eb->dst;
+    return ea->ctx == eb->ctx && ea->src == eb->src && ea->dst == eb->dst;
+}
+
+static guint ctxtb_hash(gconstpointer p)
+{
+    const CtxTbCount *c = p;
+    uint64_t h = (uint64_t)(uintptr_t)c->tb * 0x9E3779B97F4A7C15ULL;
+
+    h ^= c->ctx + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+    return (guint)(h ^ (h >> 32));
+}
+
+static gboolean ctxtb_equal(gconstpointer a, gconstpointer b)
+{
+    const CtxTbCount *ca = a;
+    const CtxTbCount *cb = b;
+
+    return ca->ctx == cb->ctx && ca->tb == cb->tb;
 }
 
 /*
@@ -513,14 +627,16 @@ static CovInsn *insn_alloc(CovState *s, uint64_t vaddr)
 static void record_edge(CovState *s, unsigned int cpu_index, uint64_t dst)
 {
     VcpuState *v = vcpu_slot(s, cpu_index);
-    Edge key;
-    Edge *e;
+    CtxEdge key;
+    CtxEdge *e;
 
     if (G_UNLIKELY(v == NULL) || !v->prev_valid) {
         return;
     }
     v->prev_valid = false;
 
+    /* cur_ctx is 0 with ctx off, so no mode branch is needed here. */
+    key.ctx = v->cur_ctx;
     key.src = v->prev_src;
     key.dst = dst;
     key.count = 0;
@@ -535,7 +651,8 @@ static void record_edge(CovState *s, unsigned int cpu_index, uint64_t dst)
 
     e = g_hash_table_lookup(v->edges, &key);
     if (!e) {
-        e = g_new0(Edge, 1);
+        e = g_new0(CtxEdge, 1);
+        e->ctx = key.ctx;
         e->src = key.src;
         e->dst = key.dst;
         g_hash_table_insert(v->edges, e, e);
@@ -558,6 +675,46 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     if (g_state.edges) {
         record_edge(&g_state, cpu_index, ctb->tb_vaddr);
+    }
+}
+
+/*
+ * TB-entry callback for the TB-level address modes when ctx=on: the count
+ * lives in a per-(context, block) record in this vCPU's table instead of in
+ * the CovTb, so the same block executed by two processes stays two records.
+ * One hash lookup per block execution instead of one atomic add - that is
+ * the documented cost of ctx mode, and it is per-vCPU state, so the fast
+ * path stays lock-free and atomic-free.
+ */
+static void vcpu_tb_exec_ctx(unsigned int cpu_index, void *udata)
+{
+    CovTb *ctb = (CovTb *)udata;
+    CovState *s = &g_state;
+    VcpuState *v = vcpu_slot(s, cpu_index);
+    CtxTbCount key;
+    CtxTbCount *e;
+
+    if (G_UNLIKELY(v == NULL)) {
+        return;
+    }
+    if (G_UNLIKELY(v->ctx_tbs == NULL)) {
+        v->ctx_tbs = g_hash_table_new_full(ctxtb_hash, ctxtb_equal,
+                                           g_free, NULL);
+    }
+
+    key.ctx = v->cur_ctx;
+    key.tb = ctb;
+    e = g_hash_table_lookup(v->ctx_tbs, &key);
+    if (!e) {
+        e = g_new0(CtxTbCount, 1);
+        e->ctx = key.ctx;
+        e->tb = ctb;
+        g_hash_table_insert(v->ctx_tbs, e, e);
+    }
+    e->count++;
+
+    if (s->edges) {
+        record_edge(s, cpu_index, ctb->tb_vaddr);
     }
 }
 
@@ -645,16 +802,74 @@ static void vcpu_discon(qemu_plugin_id_t id, unsigned int cpu_index,
 }
 #endif
 
+#if TCGCOV_HAVE_CTX
 /*
- * vCPU initialization. Used only to surface an undersized slot table at
- * startup - when the guest brings the vCPU online - instead of silently at the
- * first edge that vCPU would have recorded. Registered only when edges are on,
- * since the slot table is what it is checking.
+ * Count a switch into `ctx` in the metadata table. Rare (context-switch
+ * rate, not execution rate), so a mutex is fine; several vCPUs can switch
+ * concurrently and the table is shared.
+ */
+static void ctx_note_entry(CovState *s, uint64_t ctx)
+{
+    uint64_t *entry;
+
+    g_mutex_lock(&s->lock);
+    if (G_UNLIKELY(s->ctx_entries == NULL)) {
+        s->ctx_entries = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+                                               NULL, g_free);
+    }
+    /* entry[0] is the ctx (and the key storage), entry[1] the tally. */
+    entry = g_hash_table_lookup(s->ctx_entries, &ctx);
+    if (entry == NULL) {
+        entry = g_new0(uint64_t, 2);
+        entry[0] = ctx;
+        g_hash_table_insert(s->ctx_entries, entry, entry);
+    }
+    entry[1]++;
+    g_mutex_unlock(&s->lock);
+}
+
+/*
+ * The guest switched address spaces on this vCPU. Runs on the vCPU's own
+ * thread (QEMU delivers it from the MMU write in translated code), so
+ * writing the slot needs no synchronisation. The pending edge source is
+ * invalidated: an edge from the old process's block to the new process's
+ * block is not a control-flow fact about either program.
+ */
+static void vcpu_ctx_changed(qemu_plugin_id_t id, unsigned int cpu_index,
+                             uint64_t ctx_id)
+{
+    CovState *s = &g_state;
+    VcpuState *v = vcpu_slot(s, cpu_index);
+
+    (void)id;
+
+    if (G_LIKELY(v != NULL)) {
+        v->cur_ctx = ctx_id;
+        v->prev_valid = false;
+    }
+    __atomic_fetch_add(&s->ctx_switches, 1, __ATOMIC_RELAXED);
+    ctx_note_entry(s, ctx_id);
+}
+#endif /* TCGCOV_HAVE_CTX */
+
+/*
+ * vCPU initialization. Surfaces an undersized slot table at startup - when
+ * the guest brings the vCPU online - instead of silently at the first edge
+ * that vCPU would have recorded, and with ctx=on seeds the slot's current
+ * context so records before the first switch are attributed correctly.
  */
 static void vcpu_init(qemu_plugin_id_t id, unsigned int cpu_index)
 {
+    VcpuState *v = vcpu_slot(&g_state, cpu_index);
+
     (void)id;
-    vcpu_slot(&g_state, cpu_index);
+    (void)v;
+#if TCGCOV_HAVE_CTX
+    if (g_state.ctx && v != NULL) {
+        v->cur_ctx = qemu_plugin_vcpu_ctx_id(cpu_index);
+        ctx_note_entry(&g_state, v->cur_ctx);
+    }
+#endif
 }
 
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
@@ -734,13 +949,17 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                 u64vec_push(&ctb->insns, vaddr);
             }
         }
-        qemu_plugin_register_vcpu_tb_exec_cb(tb, vcpu_tb_exec,
+        qemu_plugin_register_vcpu_tb_exec_cb(tb,
+                                             s->ctx ? vcpu_tb_exec_ctx
+                                                    : vcpu_tb_exec,
                                              QEMU_PLUGIN_CB_NO_REGS, ctb);
         break;
 
     case TCGCOV_MODE_TB:
     default:
-        qemu_plugin_register_vcpu_tb_exec_cb(tb, vcpu_tb_exec,
+        qemu_plugin_register_vcpu_tb_exec_cb(tb,
+                                             s->ctx ? vcpu_tb_exec_ctx
+                                                    : vcpu_tb_exec,
                                              QEMU_PLUGIN_CB_NO_REGS, ctb);
         break;
     }
@@ -870,6 +1089,31 @@ static char *build_metadata_json(CovState *s, uint64_t record_count,
     json_append_str(m, "insn_fidelity", fidelity_name(s->mode));
     g_string_append_printf(m, "  \"discon_tracking\": %s,\n",
                            (s->edges && TCGCOV_HAVE_DISCON) ? "true" : "false");
+    g_string_append_printf(m, "  \"ctx_enabled\": %s,\n",
+                           s->ctx ? "true" : "false");
+    if (s->ctx) {
+        GHashTableIter it;
+        gpointer k, v;
+        bool first = true;
+
+        g_string_append_printf(m, "  \"ctx_switches\": %" PRIu64 ",\n",
+                               s->ctx_switches);
+        g_string_append(m, "  \"contexts\": {");
+        if (s->ctx_entries != NULL) {
+            g_hash_table_iter_init(&it, s->ctx_entries);
+            while (g_hash_table_iter_next(&it, &k, &v)) {
+                const uint64_t *entry = v;
+
+                g_string_append_printf(m,
+                                       "%s\"%" PRIu64 "\": {\"entries\": %"
+                                       PRIu64 "}",
+                                       first ? "" : ", ",
+                                       entry[0], entry[1]);
+                first = false;
+            }
+        }
+        g_string_append(m, "},\n");
+    }
 
     g_string_append(m, "  \"filters\": [");
     for (size_t i = 0; i < s->range_count; i++) {
@@ -947,7 +1191,7 @@ static GArray *collect_addrs(CovState *s)
  */
 static GArray *collect_edges(CovState *s)
 {
-    GArray *out = g_array_new(FALSE, FALSE, sizeof(Edge));
+    GArray *out = g_array_new(FALSE, FALSE, sizeof(CtxEdge));
 
     for (size_t i = 0; i < s->vcpu_cap; i++) {
         GHashTable *t = s->vcpu[i].edges;
@@ -959,8 +1203,50 @@ static GArray *collect_edges(CovState *s)
         }
         g_hash_table_iter_init(&it, t);
         while (g_hash_table_iter_next(&it, &k, &v)) {
-            Edge e = *(Edge *)v;
+            CtxEdge e = *(CtxEdge *)v;
             g_array_append_val(out, e);
+        }
+    }
+
+    return out;
+}
+
+/*
+ * ctx=on version of collect_addrs: walk every vCPU's (context, block) table
+ * and emit CtxAddrCount records, expanding a block's instruction list in
+ * tb-insn-fast exactly as collect_addrs does from the CovTb count. Called
+ * with s->lock held, vCPUs quiescent.
+ */
+static GArray *collect_ctx_addrs(CovState *s)
+{
+    GArray *out = g_array_new(FALSE, FALSE, sizeof(CtxAddrCount));
+
+    for (size_t i = 0; i < s->vcpu_cap; i++) {
+        GHashTable *t = s->vcpu[i].ctx_tbs;
+        GHashTableIter it;
+        gpointer k, v;
+
+        if (t == NULL) {
+            continue;
+        }
+        g_hash_table_iter_init(&it, t);
+        while (g_hash_table_iter_next(&it, &k, &v)) {
+            const CtxTbCount *ctc = v;
+            const CovTb *ctb = ctc->tb;
+
+            if (ctc->count == 0) {
+                continue;
+            }
+            if (s->mode == TCGCOV_MODE_TB_INSN_FAST && ctb->insns.count > 0) {
+                for (size_t j = 0; j < ctb->insns.count; j++) {
+                    CtxAddrCount ac = { ctc->ctx, ctb->insns.items[j],
+                                        ctc->count };
+                    g_array_append_val(out, ac);
+                }
+            } else {
+                CtxAddrCount ac = { ctc->ctx, ctb->tb_vaddr, ctc->count };
+                g_array_append_val(out, ac);
+            }
         }
     }
 
@@ -979,15 +1265,43 @@ static guint merge_edges(GArray *edges)
     g_array_sort(edges, edge_compare);
 
     for (guint i = 0; i < edges->len; i++) {
-        Edge cur = g_array_index(edges, Edge, i);
+        CtxEdge cur = g_array_index(edges, CtxEdge, i);
 
         if (unique > 0 &&
-            edge_equal(&cur, &g_array_index(edges, Edge, unique - 1))) {
-            g_array_index(edges, Edge, unique - 1).count += cur.count;
+            edge_equal(&cur, &g_array_index(edges, CtxEdge, unique - 1))) {
+            g_array_index(edges, CtxEdge, unique - 1).count += cur.count;
         } else {
-            g_array_index(edges, Edge, unique) = cur;
+            g_array_index(edges, CtxEdge, unique) = cur;
             unique++;
         }
+    }
+    return unique;
+}
+
+/*
+ * ctx=on version of merge_addrs: sort by (ctx, addr) and merge duplicates,
+ * which arise when the same (context, address) was executed on more than one
+ * vCPU or reached through retranslated blocks.
+ */
+static guint merge_ctx_addrs(GArray *pairs)
+{
+    guint unique = 0;
+
+    g_array_sort(pairs, ctxaddr_compare);
+
+    for (guint i = 0; i < pairs->len; i++) {
+        CtxAddrCount cur = g_array_index(pairs, CtxAddrCount, i);
+        CtxAddrCount *prev;
+
+        if (unique > 0) {
+            prev = &g_array_index(pairs, CtxAddrCount, unique - 1);
+            if (prev->ctx == cur.ctx && prev->addr == cur.addr) {
+                prev->count += cur.count;
+                continue;
+            }
+        }
+        g_array_index(pairs, CtxAddrCount, unique) = cur;
+        unique++;
     }
     return unique;
 }
@@ -1038,7 +1352,8 @@ static void fill_edge_header(CovState *s, tcgcov_header *h, uint64_t n_edges)
     h->flags |= TCGCOV_FLAG_HAS_EDGES | TCGCOV_FLAG_EDGE_COUNTS;
     h->edge_count = n_edges;
     h->edges_offset = h->records_offset + h->records_size;
-    h->edges_size = n_edges * (uint64_t)sizeof(Edge);
+    h->edges_size = n_edges * (uint64_t)(s->ctx ? sizeof(CtxEdge)
+                                                : sizeof(Edge));
 }
 
 /*
@@ -1059,11 +1374,23 @@ static bool write_edges(CovState *s, FILE *f, GArray *edges, guint n)
         return true;
     }
     for (guint i = 0; i < n; i++) {
-        const Edge *e = &g_array_index(edges, Edge, i);
+        const CtxEdge *e = &g_array_index(edges, CtxEdge, i);
 
-        /* Edge is exactly the on-disk { src, dst, count } record. */
-        if (!write_all(f, e, sizeof(*e))) {
-            return false;
+        if (s->ctx) {
+            /* CtxEdge is exactly the on-disk v2 record. */
+            if (!write_all(f, e, sizeof(*e))) {
+                return false;
+            }
+        } else {
+            /*
+             * The v1 record is the { src, dst, count } tail of CtxEdge:
+             * three contiguous uint64_t starting at offset 8 (asserted at
+             * the definition), so the leading ctx (always 0 here) is simply
+             * not written.
+             */
+            if (!write_all(f, &e->src, sizeof(Edge))) {
+                return false;
+            }
         }
     }
     return true;
@@ -1200,29 +1527,33 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
     (void)userdata;
 
     g_mutex_lock(&s->lock);
-    pairs = collect_addrs(s);
+    pairs = s->ctx ? collect_ctx_addrs(s) : collect_addrs(s);
     edges = collect_edges(s);
     g_mutex_unlock(&s->lock);
 
-    n_addrs = merge_addrs(pairs);
+    n_addrs = s->ctx ? merge_ctx_addrs(pairs) : merge_addrs(pairs);
     n_edges = s->edges ? merge_edges(edges) : 0;
 
     meta = build_metadata_json(s, n_addrs, n_edges);
     meta_size = strlen(meta);
 
     memset(&h, 0, sizeof(h));
-    memcpy(h.magic, TCGCOV_MAGIC, 8);
-    h.version = 1;
+    memcpy(h.magic, s->ctx ? TCGCOV_MAGIC_V2 : TCGCOV_MAGIC, 8);
+    h.version = s->ctx ? 2 : 1;
     h.endian = 1;                          /* file is written little-endian */
     h.header_size = (uint32_t)sizeof(h);
     h.record_type = mode_is_insn_granular(s->mode) ? TCGCOV_REC_INSN_ADDR
                                                    : TCGCOV_REC_TB_ADDR;
     h.flags = TCGCOV_FLAG_HAS_COUNTS;
+    if (s->ctx) {
+        h.flags |= TCGCOV_FLAG_HAS_CTX;
+    }
     h.record_count = n_addrs;
     h.metadata_offset = sizeof(h);
     h.metadata_size = meta_size;
     h.records_offset = sizeof(h) + meta_size;
-    h.records_size = (uint64_t)n_addrs * sizeof(AddrCount);
+    h.records_size = (uint64_t)n_addrs * (s->ctx ? sizeof(CtxAddrCount)
+                                                 : sizeof(AddrCount));
     fill_edge_header(s, &h, n_edges);
 
     f = open_tmp(s->out_path, &tmp);
@@ -1233,9 +1564,14 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
 
     ok = write_all(f, &h, sizeof(h)) && write_all(f, meta, meta_size);
     for (guint i = 0; ok && i < n_addrs; i++) {
-        /* AddrCount is exactly the on-disk { addr, count } record. */
-        const AddrCount *ac = &g_array_index(pairs, AddrCount, i);
-        ok = write_all(f, ac, sizeof(*ac));
+        /* Both structs are exactly their on-disk record. */
+        if (s->ctx) {
+            const CtxAddrCount *ac = &g_array_index(pairs, CtxAddrCount, i);
+            ok = write_all(f, ac, sizeof(*ac));
+        } else {
+            const AddrCount *ac = &g_array_index(pairs, AddrCount, i);
+            ok = write_all(f, ac, sizeof(*ac));
+        }
     }
     ok = ok && write_edges(s, f, edges, n_edges);
 
@@ -1409,6 +1745,8 @@ static bool parse_arg(CovState *s, const char *arg)
         return false;
     } else if (g_strcmp0(k, "edges") == 0) {
         return parse_bool_arg(k, v, &s->edges);
+    } else if (g_strcmp0(k, "ctx") == 0) {
+        return parse_bool_arg(k, v, &s->ctx);
     } else if (g_strcmp0(k, "verbose") == 0) {
         return parse_bool_arg(k, v, &s->verbose);
     } else {
@@ -1482,9 +1820,36 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         }
     }
 
-    if (s->edges) {
+    if (s->ctx) {
+#if !TCGCOV_HAVE_CTX
+        g_printerr("tcgcov: ctx=on, but this plugin was built against a "
+                   "QEMU header without the context-visibility API "
+                   "(qemu_plugin_register_vcpu_ctx_changed_cb). Rebuild "
+                   "against a QEMU tree carrying the tcgcov context patches "
+                   "(docs/QEMU-RFC-context.md), or drop ctx=on.\n");
+        g_printerr("tcgcov: refusing to start\n");
+        return -1;
+#else
+        if (s->mode == TCGCOV_MODE_TB_INSN) {
+            /*
+             * Exact mode records from per-instruction callbacks, which have
+             * no per-(context, instruction) storage yet - attributing them
+             * to one context would be silently wrong for the others.
+             */
+            g_printerr("tcgcov: ctx=on supports mode=tb and mode=tb-insn-"
+                       "fast; mode=tb-insn is not context-aware yet\n");
+            g_printerr("tcgcov: refusing to start\n");
+            return -1;
+        }
+        qemu_plugin_register_vcpu_ctx_changed_cb(id, vcpu_ctx_changed);
+#endif
+    }
+
+    if (s->edges || s->ctx) {
         alloc_vcpu_table(s, info);
         qemu_plugin_register_vcpu_init_cb(id, vcpu_init);
+    }
+    if (s->edges) {
 #if TCGCOV_HAVE_DISCON
         qemu_plugin_register_vcpu_discon_cb(
             id,
@@ -1496,11 +1861,11 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
 
     if (s->verbose) {
         g_printerr("tcgcov: target=%s system=%d mode=%s fidelity=%s out=%s "
-                   "counts=always edges=%d discon=%d plugin_api=%d "
+                   "counts=always edges=%d ctx=%d discon=%d plugin_api=%d "
                    "vcpu_slots=%zu filters=%zu\n",
                    s->target_name, s->system_emulation,
                    mode_name(s->mode), fidelity_name(s->mode),
-                   s->out_path, s->edges,
+                   s->out_path, s->edges, s->ctx,
                    s->edges && TCGCOV_HAVE_DISCON,
                    QEMU_PLUGIN_VERSION, s->vcpu_cap, s->range_count);
     }

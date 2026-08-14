@@ -1,0 +1,6 @@
+#!/bin/sh
+# Start both same-base binaries concurrently; each is one long-lived process
+# (one address-space context). Markers let the host confirm both finished.
+[ "$1" = start ] || exit 0
+(/usr/bin/cov_a && echo "COV-A-DONE") &
+(/usr/bin/cov_b && echo "COV-B-DONE") &
