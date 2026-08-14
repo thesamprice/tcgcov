@@ -1,0 +1,412 @@
+--- a/include/qemu/plugin-event.h
++++ b/include/qemu/plugin-event.h
+@@ -23,6 +23,7 @@
+     QEMU_PLUGIN_EV_VCPU_INTERRUPT,
+     QEMU_PLUGIN_EV_VCPU_EXCEPTION,
+     QEMU_PLUGIN_EV_VCPU_HOSTCALL,
++    QEMU_PLUGIN_EV_VCPU_CTX_CHANGED,
+     QEMU_PLUGIN_EV_MAX, /* total number of plugin events we support */
+ };
+ 
+--- a/include/qemu/qemu-plugin.h
++++ b/include/qemu/qemu-plugin.h
+@@ -72,11 +72,15 @@
+  * - added qemu_plugin_write_memory_hwaddr
+  * - added qemu_plugin_write_register
+  * - added qemu_plugin_translate_vaddr
++ *
++ * version 6:
++ * - added qemu_plugin_vcpu_ctx_id
++ * - added qemu_plugin_register_vcpu_ctx_changed_cb
+  */
+ 
+ extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
+ 
+-#define QEMU_PLUGIN_VERSION 5
++#define QEMU_PLUGIN_VERSION 6
+ 
+ /**
+  * struct qemu_info_t - system information for plugins
+@@ -296,7 +300,53 @@
+ void qemu_plugin_register_vcpu_discon_cb(qemu_plugin_id_t id,
+                                          enum qemu_plugin_discon_type type,
+                                          qemu_plugin_vcpu_discon_cb_t cb);
++
++/**
++ * QEMU_PLUGIN_CTX_UNAVAILABLE - no address-space context identity available
++ *
++ * Returned by qemu_plugin_vcpu_ctx_id() for targets that have not
++ * implemented context reporting.
++ */
++#define QEMU_PLUGIN_CTX_UNAVAILABLE UINT64_MAX
++
++/**
++ * qemu_plugin_vcpu_ctx_id() - current address-space context of a vcpu
++ * @vcpu_index: the vcpu to query
++ *
++ * Returns an opaque, target-defined identifier for the guest address
++ * space the vcpu is currently executing in (e.g. the MMU PID/ASID).
++ * The only guaranteed property is that two simultaneously-live address
++ * spaces with different code mappings have different IDs on the same
++ * vcpu. Targets without enablement return QEMU_PLUGIN_CTX_UNAVAILABLE.
++ * In user-mode emulation the context is constant for the lifetime of
++ * the process.
++ */
++QEMU_PLUGIN_API
++uint64_t qemu_plugin_vcpu_ctx_id(unsigned int vcpu_index);
+ 
++/**
++ * typedef qemu_plugin_vcpu_ctx_changed_cb_t - context-change callback
++ * @id: plugin ID
++ * @vcpu_index: the vcpu whose context changed
++ * @ctx_id: the new context ID (see qemu_plugin_vcpu_ctx_id())
++ */
++typedef void (*qemu_plugin_vcpu_ctx_changed_cb_t)(qemu_plugin_id_t id,
++                                                  unsigned int vcpu_index,
++                                                  uint64_t ctx_id);
++
++/**
++ * qemu_plugin_register_vcpu_ctx_changed_cb() - register a context-change cb
++ * @id: plugin ID
++ * @cb: callback function
++ *
++ * The @cb function is called after a vcpu's address-space context
++ * changes and before the first TB executes in the new context on that
++ * vcpu. Targets without enablement never deliver the callback.
++ */
++QEMU_PLUGIN_API
++void qemu_plugin_register_vcpu_ctx_changed_cb(
++    qemu_plugin_id_t id, qemu_plugin_vcpu_ctx_changed_cb_t cb);
++
+ /** struct qemu_plugin_tb - Opaque handle for a translation block */
+ struct qemu_plugin_tb;
+ /** struct qemu_plugin_insn - Opaque handle for a translated instruction */
+--- a/include/qemu/plugin.h
++++ b/include/qemu/plugin.h
+@@ -64,6 +64,7 @@
+     qemu_plugin_vcpu_mem_cb_t        vcpu_mem;
+     qemu_plugin_vcpu_syscall_cb_t    vcpu_syscall;
+     qemu_plugin_vcpu_syscall_ret_cb_t vcpu_syscall_ret;
++    qemu_plugin_vcpu_ctx_changed_cb_t vcpu_ctx_changed;
+     void *generic;
+ };
+ 
+@@ -169,6 +170,7 @@
+                          uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5,
+                          uint64_t a6, uint64_t a7, uint64_t a8);
+ void qemu_plugin_vcpu_syscall_ret(CPUState *cpu, int64_t num, int64_t ret);
++void qemu_plugin_vcpu_ctx_changed(CPUState *cpu);
+ 
+ void qemu_plugin_vcpu_mem_cb(CPUState *cpu, uint64_t vaddr,
+                              uint64_t value_low,
+@@ -280,6 +282,9 @@
+ void qemu_plugin_vcpu_syscall_ret(CPUState *cpu, int64_t num, int64_t ret)
+ { }
+ 
++static inline void qemu_plugin_vcpu_ctx_changed(CPUState *cpu)
++{ }
++
+ static inline void qemu_plugin_vcpu_mem_cb(CPUState *cpu, uint64_t vaddr,
+                                            uint64_t value_low,
+                                            uint64_t value_high,
+--- a/include/hw/core/cpu.h
++++ b/include/hw/core/cpu.h
+@@ -164,6 +164,11 @@
+     int64_t (*get_arch_id)(CPUState *cpu);
+     void (*set_pc)(CPUState *cpu, vaddr value);
+     vaddr (*get_pc)(CPUState *cpu);
++    /*
++     * Current guest address-space context identity (e.g. MMU PID/ASID)
++     * for TCG plugins; NULL when the target does not report one.
++     */
++    uint64_t (*plugin_ctx_id)(CPUState *cpu);
+     int (*gdb_read_register)(CPUState *cpu, GByteArray *buf, int reg);
+     int (*gdb_write_register)(CPUState *cpu, uint8_t *buf, int reg);
+     vaddr (*gdb_adjust_breakpoint)(CPUState *cpu, vaddr addr);
+--- a/plugins/plugin.h
++++ b/plugins/plugin.h
+@@ -79,6 +79,8 @@
+                             qemu_plugin_simple_cb_t cb,
+                             bool reset);
+ 
++uint64_t plugin_cpu_ctx_id(CPUState *cpu);
++
+ void plugin_register_cb(qemu_plugin_id_t id, enum qemu_plugin_event ev,
+                         void *func);
+ 
+--- a/plugins/core.c
++++ b/plugins/core.c
+@@ -599,6 +599,40 @@
+ {
+     plugin_vcpu_cb__discon(cpu, QEMU_PLUGIN_EV_VCPU_HOSTCALL,
+                            QEMU_PLUGIN_DISCON_HOSTCALL, from);
++}
++
++uint64_t plugin_cpu_ctx_id(CPUState *cpu)
++{
++    if (cpu->cc->plugin_ctx_id) {
++        return cpu->cc->plugin_ctx_id(cpu);
++    }
++    return QEMU_PLUGIN_CTX_UNAVAILABLE;
++}
++
++/*
++ * Disable CFI checks.
++ * The callback function has been loaded from an external library so we do not
++ * have type information
++ */
++QEMU_DISABLE_CFI
++void qemu_plugin_vcpu_ctx_changed(CPUState *cpu)
++{
++    struct qemu_plugin_cb *cb, *next;
++    enum qemu_plugin_event ev = QEMU_PLUGIN_EV_VCPU_CTX_CHANGED;
++    uint64_t ctx_id;
++
++    if (!test_bit(ev, cpu->plugin_state->event_mask)) {
++        return;
++    }
++    ctx_id = plugin_cpu_ctx_id(cpu);
++
++    QLIST_FOREACH_SAFE_RCU(cb, &plugin.cb_lists[ev], entry, next) {
++        qemu_plugin_vcpu_ctx_changed_cb_t func = cb->f.vcpu_ctx_changed;
++
++        qemu_plugin_set_cb_flags(cpu, QEMU_PLUGIN_CB_RW_REGS);
++        func(cb->ctx->id, cpu->cpu_index, ctx_id);
++        qemu_plugin_set_cb_flags(cpu, QEMU_PLUGIN_CB_NO_REGS);
++    }
+ }
+ 
+ void qemu_plugin_register_vcpu_idle_cb(qemu_plugin_id_t id,
+--- a/plugins/api.c
++++ b/plugins/api.c
+@@ -206,6 +206,22 @@
+                                          qemu_plugin_vcpu_syscall_ret_cb_t cb)
+ {
+     plugin_register_cb(id, QEMU_PLUGIN_EV_VCPU_SYSCALL_RET, cb);
++}
++
++void qemu_plugin_register_vcpu_ctx_changed_cb(
++    qemu_plugin_id_t id, qemu_plugin_vcpu_ctx_changed_cb_t cb)
++{
++    plugin_register_cb(id, QEMU_PLUGIN_EV_VCPU_CTX_CHANGED, cb);
++}
++
++uint64_t qemu_plugin_vcpu_ctx_id(unsigned int vcpu_index)
++{
++    CPUState *cpu = qemu_get_cpu(vcpu_index);
++
++    if (!cpu) {
++        return QEMU_PLUGIN_CTX_UNAVAILABLE;
++    }
++    return plugin_cpu_ctx_id(cpu);
+ }
+ 
+ /*
+--- a/target/microblaze/cpu.c
++++ b/target/microblaze/cpu.c
+@@ -457,6 +457,20 @@
+ #endif /* !CONFIG_USER_ONLY */
+ };
+ 
++#ifndef CONFIG_USER_ONLY
++/*
++ * Address-space context identity for TCG plugins: the 8-bit process ID
++ * the MMU matches TLB entries against. Constant zero when the core has
++ * no MMU, which is the correct "single context" answer.
++ */
++static uint64_t mb_cpu_plugin_ctx_id(CPUState *cs)
++{
++    MicroBlazeCPU *cpu = MICROBLAZE_CPU(cs);
++
++    return cpu->env.mmu.regs[MMU_R_PID] & 0xff;
++}
++#endif
++
+ static void mb_cpu_class_init(ObjectClass *oc, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(oc);
+@@ -479,6 +493,7 @@
+ #ifndef CONFIG_USER_ONLY
+     dc->vmsd = &vmstate_mb_cpu;
+     cc->sysemu_ops = &mb_sysemu_ops;
++    cc->plugin_ctx_id = mb_cpu_plugin_ctx_id;
+ #endif
+     device_class_set_props(dc, mb_properties);
+     cc->gdb_core_xml_file = "microblaze-core.xml";
+--- a/target/microblaze/mmu.c
++++ b/target/microblaze/mmu.c
+@@ -25,6 +25,7 @@
+ #include "accel/tcg/cpu-mmu-index.h"
+ #include "exec/page-protection.h"
+ #include "exec/target_page.h"
++#include "qemu/plugin.h"
+ 
+ static unsigned int tlb_decode_size(unsigned int f)
+ {
+@@ -291,6 +292,7 @@
+             if (v != env->mmu.regs[rn]) {
+                 mmu_change_pid(env, v);
+                 env->mmu.regs[rn] = v;
++                qemu_plugin_vcpu_ctx_changed(env_cpu(env));
+             }
+             break;
+         case MMU_R_TLBX:
+--- a/contrib/plugins/meson.build
++++ b/contrib/plugins/meson.build
+@@ -1,6 +1,6 @@
+-contrib_plugins = ['bbv', 'cache', 'cflow', 'drcov', 'execlog', 'hotblocks',
+-                   'hotpages', 'howvec', 'hwprofile', 'ips', 'stoptrigger',
+-                   'traps', 'uftrace']
++contrib_plugins = ['bbv', 'cache', 'cflow', 'ctxdemo', 'drcov', 'execlog',
++                   'hotblocks', 'hotpages', 'howvec', 'hwprofile', 'ips',
++                   'stoptrigger', 'traps', 'uftrace']
+ if host_os != 'windows'
+   # lockstep uses socket.h
+   contrib_plugins += 'lockstep'
+--- /dev/null
++++ b/contrib/plugins/ctxdemo.c
+@@ -0,0 +1,144 @@
++/*
++ * ctxdemo: per-address-space-context TB execution counts.
++ *
++ * Demonstrates the proposed context-visibility API: records how many TBs
++ * execute in each guest address-space context (e.g. the MicroBlaze MMU
++ * PID) and how many context switches were observed. Companion to the
++ * tcgcov "expose guest context to plugins" RFC.
++ *
++ * License: GNU GPL, version 2 or later.
++ */
++#include <glib.h>
++#include <stdio.h>
++#include <inttypes.h>
++
++#include <qemu-plugin.h>
++
++QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
++
++#define MAX_VCPUS 64
++
++typedef struct {
++    uint64_t ctx;
++    uint64_t tbs;
++    uint64_t entries;   /* times this context was switched into */
++} CtxRec;
++
++typedef struct {
++    uint64_t ctx;
++    uint64_t *tb_count; /* cached pointer into the context's CtxRec */
++} VCPUCur;
++
++static GHashTable *ctxs;      /* ctx id -> CtxRec, guarded by lock */
++static GMutex lock;
++static VCPUCur cur[MAX_VCPUS];
++static uint64_t switches;
++static uint64_t unattributed;
++
++static CtxRec *get_ctx_rec(uint64_t ctx)
++{
++    CtxRec *rec;
++
++    g_mutex_lock(&lock);
++    rec = g_hash_table_lookup(ctxs, &ctx);
++    if (!rec) {
++        rec = g_new0(CtxRec, 1);
++        rec->ctx = ctx;
++        g_hash_table_insert(ctxs, &rec->ctx, rec);
++    }
++    g_mutex_unlock(&lock);
++    return rec;
++}
++
++static void bind_vcpu(unsigned int vcpu_index, uint64_t ctx)
++{
++    CtxRec *rec = get_ctx_rec(ctx);
++
++    rec->entries++;
++    cur[vcpu_index].ctx = ctx;
++    cur[vcpu_index].tb_count = &rec->tbs;
++}
++
++static void vcpu_init(qemu_plugin_id_t id, unsigned int vcpu_index)
++{
++    if (vcpu_index < MAX_VCPUS) {
++        bind_vcpu(vcpu_index, qemu_plugin_vcpu_ctx_id(vcpu_index));
++    }
++}
++
++static void vcpu_ctx_changed(qemu_plugin_id_t id, unsigned int vcpu_index,
++                             uint64_t ctx_id)
++{
++    if (vcpu_index < MAX_VCPUS) {
++        switches++;
++        bind_vcpu(vcpu_index, ctx_id);
++    }
++}
++
++static void vcpu_tb_exec(unsigned int vcpu_index, void *udata)
++{
++    if (vcpu_index < MAX_VCPUS && cur[vcpu_index].tb_count) {
++        (*cur[vcpu_index].tb_count)++;
++    } else {
++        unattributed++;
++    }
++}
++
++static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
++{
++    qemu_plugin_register_vcpu_tb_exec_cb(tb, vcpu_tb_exec,
++                                         QEMU_PLUGIN_CB_NO_REGS, NULL);
++}
++
++static gint cmp_tbs(gconstpointer a, gconstpointer b)
++{
++    const CtxRec *ra = a, *rb = b;
++
++    return ra->tbs < rb->tbs ? 1 : ra->tbs > rb->tbs ? -1 : 0;
++}
++
++static void plugin_exit(qemu_plugin_id_t id, void *p)
++{
++    g_autoptr(GString) out = g_string_new(NULL);
++    GList *recs = g_hash_table_get_values(ctxs);
++    GList *it;
++
++    recs = g_list_sort(recs, cmp_tbs);
++    g_string_append_printf(out,
++                           "ctxdemo: %u contexts, %" PRIu64 " context switches\n",
++                           g_hash_table_size(ctxs), switches);
++    for (it = recs; it; it = it->next) {
++        CtxRec *rec = it->data;
++
++        if (rec->ctx == QEMU_PLUGIN_CTX_UNAVAILABLE) {
++            g_string_append_printf(out,
++                                   "  ctx <unavailable>: %" PRIu64
++                                   " TB execs (%" PRIu64 " entries)\n",
++                                   rec->tbs, rec->entries);
++        } else {
++            g_string_append_printf(out,
++                                   "  ctx 0x%02" PRIx64 ": %" PRIu64
++                                   " TB execs (%" PRIu64 " entries)\n",
++                                   rec->ctx, rec->tbs, rec->entries);
++        }
++    }
++    if (unattributed) {
++        g_string_append_printf(out, "  unattributed: %" PRIu64 " TB execs\n",
++                               unattributed);
++    }
++    g_list_free(recs);
++    qemu_plugin_outs(out->str);
++}
++
++QEMU_PLUGIN_EXPORT
++int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
++                        int argc, char **argv)
++{
++    ctxs = g_hash_table_new(g_int64_hash, g_int64_equal);
++
++    qemu_plugin_register_vcpu_init_cb(id, vcpu_init);
++    qemu_plugin_register_vcpu_ctx_changed_cb(id, vcpu_ctx_changed);
++    qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
++    qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
++    return 0;
++}

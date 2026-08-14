@@ -127,6 +127,15 @@ The real feature. Requirements:
 Acceptance: two concurrently running copies of different binaries at the
 same VA base produce separately attributed coverage.
 
+**QEMU side PoC verified 2026-08-14** — see `patches/qemu/`: the
+context-change callback shape (option 2 above, drafted as an RFC in
+[QEMU-RFC-context.md](QEMU-RFC-context.md), **not sent**) implemented
+against qemu-10.2.4 with MicroBlaze enablement (RPID write path) and a
+demo plugin. A 60 s Linux boot measured **93 distinct contexts and
+137,579 context switches** with per-context TB counts. Remaining for this
+tier: the `TCGCOV2` format (#5) and the tcgcov plugin consuming the
+callback.
+
 ### Tier 4 — dynamic linking and ASLR
 
 The DYNAMIC-OBJECTS.md `r_debug`/`link_map` design applies to glibc/musl
