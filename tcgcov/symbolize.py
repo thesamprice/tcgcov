@@ -50,23 +50,33 @@ def run_addr2line(addr2line, elf, addrs):
         yield cur_addr, frames
 
 
-def iter_covered_lines(addr2line, elf, addrs, opts):
+def iter_covered_lines(addr2line, elf, addrs, opts, stats=None):
     """Yield (norm_file, line:int, function, depth:int, address) for covered/coverable.
 
     Shared core used by both the covered and coverable producers: normalize,
     drop '??' and non-source frames, parse the integer line number. `opts` is
     a paths.PathOptions bundle (see paths.path_options), so every producer
     normalizes identically and their keys stay comparable.
+
+    `stats`, if given, is a dict that accumulates why frames were dropped:
+    'no_line' ('??' or unparsable line) and 'path_filtered' (normalize_path
+    returned None). Purely diagnostic; the yield stream is unchanged.
     """
     for addr, frames in run_addr2line(addr2line, elf, addrs):
         for depth, (func, fpath, lno) in enumerate(frames):
             if func == "??":
+                if stats is not None:
+                    stats["no_line"] = stats.get("no_line", 0) + 1
                 continue
             m = LINE_RE.match(lno)
             if not m:
+                if stats is not None:
+                    stats["no_line"] = stats.get("no_line", 0) + 1
                 continue
             norm = normalize_path(fpath, opts.source_root, opts.markers,
                                   opts.roots, opts.excludes, opts.all_paths)
             if norm is None:
+                if stats is not None:
+                    stats["path_filtered"] = stats.get("path_filtered", 0) + 1
                 continue
             yield norm, int(m.group(1)), func, depth, addr

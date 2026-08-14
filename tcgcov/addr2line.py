@@ -18,6 +18,7 @@ from .format import read_cov
 from .symbolize import iter_covered_lines
 from .cliargs import add_symbolize_args
 from .paths import path_options
+from .elfinfo import elf_text_info, in_ranges
 
 
 def add_arguments(parser):
@@ -47,6 +48,12 @@ def run(args):
         print(f"{args.cov}: 0 addresses, wrote empty {args.out}", file=sys.stderr)
         return 0
 
+    exec_ranges, has_dwarf = elf_text_info(args.elf)
+    if has_dwarf is False:
+        print(f"warning: {args.elf}: no .debug_info section -- addresses "
+              f"cannot be symbolized (was the ELF built with debug info?)",
+              file=sys.stderr)
+
     # (file, line, function) -> min frame depth seen (0 == leaf/non-inlined)
     seen = {}
     sample_addr = {}
@@ -55,9 +62,12 @@ def run(args):
     # gives the block hit count without inflating by instructions-per-line.
     # Without counts mode, every address contributes 1 -> count stays 1.
     line_count = {}
+    stats = {}
+    resolved_addrs = set()
     try:
         for norm, line, func, depth, addr in iter_covered_lines(
-                addr2line, args.elf, addrs, path_options(args)):
+                addr2line, args.elf, addrs, path_options(args), stats=stats):
+            resolved_addrs.add(addr)
             key = (norm, line, func)
             if key not in seen or depth < seen[key]:
                 seen[key] = depth
@@ -80,7 +90,22 @@ def run(args):
                 "address": "0x%x" % sample_addr[key],
             }) + "\n")
 
-    print(f"{args.cov}: {len(addrs)} addrs -> {len(seen)} covered source lines "
+    breakdown = f"{args.cov}: {len(addrs)} addrs"
+    if exec_ranges is not None:
+        n_in = sum(1 for a in addrs if in_ranges(a, exec_ranges))
+        breakdown += (f": {n_in} within ELF text, {len(addrs) - n_in} outside"
+                      f", {len(resolved_addrs)} resolved to lines")
+    else:
+        breakdown += f": {len(resolved_addrs)} resolved to lines"
+    drops = []
+    if stats.get("no_line"):
+        drops.append(f"{stats['no_line']} frames without line info")
+    if stats.get("path_filtered"):
+        drops.append(f"{stats['path_filtered']} frames path-filtered")
+    if drops:
+        breakdown += " (" + ", ".join(drops) + ")"
+    print(breakdown, file=sys.stderr)
+    print(f"{args.cov}: -> {len(seen)} covered source lines "
           f"-> {args.out}", file=sys.stderr)
     return 0
 
