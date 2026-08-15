@@ -14,7 +14,8 @@
 
 NAME      := tcgcov
 SO        := lib$(NAME).so
-SRC       := $(NAME).c
+# Generic core + one file per guest-OS tag source, sharing tcgcov-internal.h.
+SRC       := $(NAME).c $(NAME)-rtems.c $(NAME)-linux.c
 
 # Point at a QEMU source tree's include/ directory, or at a bare header.
 QEMU_INCLUDE ?=
@@ -74,12 +75,12 @@ endif
 .PHONY: all clean check-header
 all: $(SO)
 
-$(SO): $(SRC)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
+$(SO): $(SRC) $(NAME)-internal.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRC) $(LIBS)
 
 # Syntax-only pass; useful in CI where linking against QEMU is not wanted.
 check-header: $(SRC)
-	$(CC) $(CFLAGS) -fsyntax-only $<
+	$(CC) $(CFLAGS) -fsyntax-only $(SRC)
 
 clean:
 	rm -f $(SO) lib$(NAME).so lib$(NAME).dylib

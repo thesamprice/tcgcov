@@ -56,57 +56,9 @@
 
 #include <qemu-plugin.h>
 
+#include "tcgcov-internal.h"
+
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
-
-/*
- * Feature gate for discontinuity callbacks (interrupt/exception notification),
- * which let the plugin invalidate a pending edge source when an asynchronous
- * event steals control between two translation blocks.
- *
- * This CANNOT be gated on QEMU_PLUGIN_VERSION. The API was added part-way
- * through version 5 without a version bump: QEMU v10.1.0 declares
- * QEMU_PLUGIN_VERSION 5 and has no qemu_plugin_register_vcpu_discon_cb, while
- * later version-5 headers do. Gating on the macro therefore breaks the build
- * against any v10.1.0-era header.
- *
- * The Makefile probes the actual header and passes -DTCGCOV_HAVE_DISCON=0/1.
- * When it is built some other way the default is 0 -- losing a refinement is
- * acceptable, failing to compile is not.
- */
-#ifndef TCGCOV_HAVE_DISCON
-#define TCGCOV_HAVE_DISCON 0
-#endif
-
-/*
- * Context-visibility API (qemu_plugin_vcpu_ctx_id and the ctx-changed
- * callback): a proposed QEMU addition, present only in trees carrying the
- * tcgcov context patches (see docs/QEMU-RFC-context.md). Probed by the
- * Makefile the same way as the discon callbacks; ctx=on is refused at
- * install time when this is 0, because per-context coverage without the
- * API would silently attribute everything to one context.
- */
-#ifndef TCGCOV_HAVE_CTX
-#define TCGCOV_HAVE_CTX 0
-#endif
-
-/*
- * qemu_plugin_translate_vaddr (upstream since part-way through plugin API
- * version 5): a debug MMU walk from vCPU context, which translation-time
- * callbacks are. phys=on rests on it entirely -- no QEMU modification is
- * involved -- and is refused at install when the build lacked it.
- */
-#ifndef TCGCOV_HAVE_XLATE
-#define TCGCOV_HAVE_XLATE 0
-#endif
-
-/*
- * qemu_plugin_read_memory_vaddr (upstream since plugin API v4): the RTEMS
- * loader-generation mode (rtl_state=/rtl_debug=) reads the run-time
- * loader's r_debug and link_map chain out of guest memory with it.
- */
-#ifndef TCGCOV_HAVE_RDMEM
-#define TCGCOV_HAVE_RDMEM 0
-#endif
 
 /* ------------------------------------------------------------------ */
 /* Raw file format (TCGCOV1).                                          */
@@ -198,15 +150,11 @@ G_STATIC_ASSERT(offsetof(tcgcov_header, edge_count)      == 64);
 G_STATIC_ASSERT(offsetof(tcgcov_header, edges_offset)    == 72);
 G_STATIC_ASSERT(offsetof(tcgcov_header, edges_size)      == 80);
 
+CovState g_state;
+
 /* ------------------------------------------------------------------ */
 /* Internal data structures.                                          */
 /* ------------------------------------------------------------------ */
-
-typedef enum {
-    TCGCOV_MODE_TB = 0,            /* mode=tb           - TB starts only */
-    TCGCOV_MODE_TB_INSN,           /* mode=tb-insn      - exact, per insn */
-    TCGCOV_MODE_TB_INSN_FAST,      /* mode=tb-insn-fast - TB cb, approximate */
-} CovMode;
 
 typedef struct {
     uint64_t *items;
@@ -329,127 +277,6 @@ typedef struct {
     uint64_t count;
 } CtxTbCount;
 
-#define TCGCOV_CACHELINE 64
-
-/*
- * Per-vCPU edge-tracking state.
- *
- * Every field is written *only* by the vCPU thread whose cpu_index selects the
- * slot, and read by anyone else only from plugin_exit, when all vCPUs are
- * quiescent. That is what makes the execution fast path lock-free and
- * atomic-free: there is no cross-thread access to synchronise.
- *
- * prev_valid is false when there is no usable predecessor, which covers three
- * cases that all mean "emit nothing": (a) this is the first TB executed on the
- * vCPU, (b) the previous TB never reached its last instruction (it aborted, or
- * that instruction fell outside every filter range), and (c) the pending source
- * was invalidated by an interrupt or exception (API >= 5 only).
- *
- * The slot is padded and the array is cache-line aligned so that two vCPUs
- * updating adjacent slots do not ping-pong a shared line between cores.
- */
-typedef struct {
-    uint64_t prev_src;
-    GHashTable *edges;         /* CtxEdge* -> same, keyed on (ctx,src,dst) */
-    /*
-     * ctx=on state. cur_ctx is written by the ctx-changed callback and read
-     * by the execution callbacks - both run on this vCPU's thread, so the
-     * slot ownership rule covers them. It stays 0 with ctx off, which is
-     * what lets record_edge() use it unconditionally.
-     */
-    uint64_t cur_ctx;
-    GHashTable *ctx_tbs;       /* CtxTbCount* -> same, keyed on (ctx,tb) */
-    bool prev_valid;
-    char pad[TCGCOV_CACHELINE - 2 * sizeof(uint64_t) - 2 * sizeof(void *)
-             - sizeof(bool)];
-} VcpuState;
-
-G_STATIC_ASSERT(sizeof(VcpuState) == TCGCOV_CACHELINE);
-
-/*
- * Slot count used when the vCPU count cannot be queried, i.e. under user-mode
- * emulation, where each guest thread is a vCPU. Sized generously because the
- * table is allocated exactly once and never grown: 1024 slots is 64 KiB, which
- * is noise next to a QEMU process, and going out of bounds only costs edges
- * (never memory safety - see vcpu_slot()).
- */
-#define TCGCOV_VCPU_FALLBACK 1024
-
-typedef struct {
-    uint64_t start;
-    uint64_t end;                  /* exclusive */
-} Range;
-
-typedef struct {
-    /*
-     * Guards translation-time bookkeeping only: `blocks`, `insn_slabs`.
-     * Nothing on the execution fast path takes it.
-     */
-    GMutex lock;
-    GPtrArray *blocks;             /* of CovTb* */
-    InsnSlab *insn_slabs;          /* bump allocator for CovInsn */
-
-    char *out_path;
-    char *test_id;
-    char *bsp;
-    char *elf_path;
-    char *target_name;
-    bool system_emulation;
-
-    CovMode mode;
-    bool edges;                    /* edges=off disables the edge section */
-    bool ctx;                      /* ctx=on records per-context (TCGCOV2) */
-    bool phys;                     /* phys=on records physical addresses */
-    bool verbose;
-
-    /*
-     * phys=on: translations that failed the debug MMU walk and fell back to
-     * recording the virtual address. Incremented under `lock` (translation
-     * time only) and reported in the metadata, because an artifact silently
-     * mixing address kinds would be worse than one that says it did.
-     */
-    uint64_t phys_fail;
-
-    /*
-     * ctx=on bookkeeping, updated from the (rare) ctx-changed callback.
-     * ctx_entries maps context ID -> times switched into, guarded by `lock`
-     * because several vCPUs can switch concurrently; ctx_switches is a
-     * relaxed atomic counter.
-     */
-    GHashTable *ctx_entries;       /* uint64* key -> uint64 count in value */
-    uint64_t ctx_switches;
-
-    /*
-     * RTEMS loader-generation mode (rtl_state= + rtl_debug=): watch the
-     * run-time loader's _rtld_debug_state() notification and tag records
-     * with a generation that bumps on every completed load/unload, so the
-     * same address occupied by two objects at different times stays two
-     * records. Uses the same per-record tag as ctx=on ("ctx_kind" in the
-     * metadata says which semantics apply); needs no QEMU context API.
-     */
-    bool rtl;
-    uint64_t rtl_state_addr;       /* &_rtld_debug_state, from the base ELF */
-    uint64_t rtl_debug_addr;       /* &_rtld_debug */
-    uint64_t rtl_generation;       /* current generation, starts at 0 */
-    uint64_t rtl_events;           /* notification hits observed */
-    GString *rtl_snaps;            /* metadata JSON fragments, under lock */
-
-    /*
-     * Per-vCPU edge state, indexed by cpu_index. Allocated once at install
-     * from a fixed cap so that it is never reallocated - a reader can therefore
-     * never race a g_realloc() that frees the base pointer under it, and no
-     * lock is needed to reach a slot. `vcpu_raw` is the malloc'd block;
-     * `vcpu` is the cache-line aligned view into it.
-     */
-    void *vcpu_raw;
-    VcpuState *vcpu;
-    size_t vcpu_cap;
-
-    Range *ranges;
-    size_t range_count;
-} CovState;
-
-static CovState g_state;
 
 /* One-shot latch for the "cpu_index out of range" diagnostic. */
 static gint g_vcpu_overflow_warned;
@@ -589,7 +416,7 @@ static gboolean ctxtb_equal(gconstpointer a, gconstpointer b)
  * threads than the fallback cap) must degrade rather than scribble past the
  * end. Returns NULL in that case; the caller then simply records no edge.
  */
-static VcpuState *vcpu_slot(CovState *s, unsigned int cpu_index)
+VcpuState *vcpu_slot(CovState *s, unsigned int cpu_index)
 {
     if (G_UNLIKELY(cpu_index >= s->vcpu_cap)) {
         if (g_atomic_int_compare_and_exchange(&g_vcpu_overflow_warned, 0, 1)) {
@@ -844,56 +671,6 @@ static void vcpu_discon(qemu_plugin_id_t id, unsigned int cpu_index,
 }
 #endif
 
-#if TCGCOV_HAVE_CTX
-/*
- * Count a switch into `ctx` in the metadata table. Rare (context-switch
- * rate, not execution rate), so a mutex is fine; several vCPUs can switch
- * concurrently and the table is shared.
- */
-static void ctx_note_entry(CovState *s, uint64_t ctx)
-{
-    uint64_t *entry;
-
-    g_mutex_lock(&s->lock);
-    if (G_UNLIKELY(s->ctx_entries == NULL)) {
-        s->ctx_entries = g_hash_table_new_full(g_int64_hash, g_int64_equal,
-                                               NULL, g_free);
-    }
-    /* entry[0] is the ctx (and the key storage), entry[1] the tally. */
-    entry = g_hash_table_lookup(s->ctx_entries, &ctx);
-    if (entry == NULL) {
-        entry = g_new0(uint64_t, 2);
-        entry[0] = ctx;
-        g_hash_table_insert(s->ctx_entries, entry, entry);
-    }
-    entry[1]++;
-    g_mutex_unlock(&s->lock);
-}
-
-/*
- * The guest switched address spaces on this vCPU. Runs on the vCPU's own
- * thread (QEMU delivers it from the MMU write in translated code), so
- * writing the slot needs no synchronisation. The pending edge source is
- * invalidated: an edge from the old process's block to the new process's
- * block is not a control-flow fact about either program.
- */
-static void vcpu_ctx_changed(qemu_plugin_id_t id, unsigned int cpu_index,
-                             uint64_t ctx_id)
-{
-    CovState *s = &g_state;
-    VcpuState *v = vcpu_slot(s, cpu_index);
-
-    (void)id;
-
-    if (G_LIKELY(v != NULL)) {
-        v->cur_ctx = ctx_id;
-        v->prev_valid = false;
-    }
-    __atomic_fetch_add(&s->ctx_switches, 1, __ATOMIC_RELAXED);
-    ctx_note_entry(s, ctx_id);
-}
-#endif /* TCGCOV_HAVE_CTX */
-
 /*
  * vCPU initialization. Surfaces an undersized slot table at startup - when
  * the guest brings the vCPU online - instead of silently at the first edge
@@ -906,187 +683,11 @@ static void vcpu_init(qemu_plugin_id_t id, unsigned int cpu_index)
 
     (void)id;
     (void)v;
-#if TCGCOV_HAVE_CTX
-    /* rtl mode owns the tag itself; its generations start at 0. */
-    if (g_state.ctx && !g_state.rtl && v != NULL) {
-        v->cur_ctx = qemu_plugin_vcpu_ctx_id(cpu_index);
-        ctx_note_entry(&g_state, v->cur_ctx);
-    }
-#endif
-}
-
-#if TCGCOV_HAVE_RDMEM
-/* ------------------------------------------------------------------ */
-/* RTEMS loader-generation mode.                                      */
-/* ------------------------------------------------------------------ */
-
-static void json_escape_append(GString *out, const char *s);
-
-/*
- * Guest struct offsets for RTEMS's <link_elf.h> on an ILP32 target
- * (riscv32, microblaze): struct r_debug { int r_version; struct link_map
- * *r_map; enum r_state; } and the RTEMS link_map/section_detail layouts.
- * These are fixed by that header for 32-bit targets; a 64-bit target or a
- * changed RTEMS header needs different values (future: extract them from
- * the base image's DWARF offline and pass them as arguments).
- */
-#define RTL_RD_RMAP      4         /* r_debug.r_map */
-#define RTL_RD_RSTATE    8         /* r_debug.r_state */
-#define RTL_RT_CONSISTENT 0
-#define RTL_LM_NAME      0         /* link_map.name (char*) */
-#define RTL_LM_SECNUM    4         /* link_map.sec_num */
-#define RTL_LM_SECDETAIL 8         /* link_map.sec_detail (section_detail*) */
-#define RTL_LM_SECADDR   12        /* link_map.sec_addr[6] (rap regions) */
-#define RTL_LM_NEXT      44        /* link_map.l_next */
-#define RTL_SD_NAME      0         /* section_detail.name (char*) */
-#define RTL_SD_SIZE      8         /* section_detail.size */
-#define RTL_SD_RAPID     12        /* section_detail.rap_id */
-#define RTL_SD_STRIDE    16
-#define RTL_MAX_OBJS     64        /* chain-walk bound: a corrupt guest    */
-#define RTL_MAX_SECS     128       /*   pointer must not hang the plugin  */
-#define RTL_MAX_NAME     128
-
-static bool rtl_read(uint64_t addr, void *out, size_t len)
-{
-    g_autoptr(GByteArray) buf = g_byte_array_new();
-
-    if (!addr || !qemu_plugin_read_memory_vaddr(addr, buf, len) ||
-        buf->len < len) {
-        return false;
-    }
-    memcpy(out, buf->data, len);
-    return true;
-}
-
-static uint32_t rtl_read_u32(uint64_t addr, bool *ok)
-{
-    uint32_t v = 0;
-
-    if (!rtl_read(addr, &v, sizeof(v))) {
-        *ok = false;
-    }
-    return v;                      /* guest and host are both little-endian */
-}
-
-static void rtl_read_str(uint64_t addr, char *out, size_t cap)
-{
-    size_t i;
-
-    out[0] = '\0';
-    for (i = 0; i + 1 < cap; i++) {
-        if (!rtl_read(addr + i, &out[i], 1) || out[i] == '\0') {
-            break;
-        }
-    }
-    out[i] = '\0';
-}
-
-/*
- * Append a JSON snapshot of the loader's current link_map chain for
- * generation `gen`. Called under s->lock from the notification callback --
- * a context-switch-rate event, not an execution-rate one.
- */
-static void rtl_snapshot(CovState *s, uint64_t gen)
-{
-    static const char *rap_names[] = { "text", "const", "ctor", "dtor",
-                                       "data", "bss" };
-    bool ok = true;
-    char name[RTL_MAX_NAME];
-    uint64_t lm;
-    int objs = 0;
-
-    if (s->rtl_snaps->len) {
-        g_string_append(s->rtl_snaps, ", ");
-    }
-    g_string_append_printf(s->rtl_snaps, "\"%" PRIu64 "\": [", gen);
-
-    lm = rtl_read_u32(s->rtl_debug_addr + RTL_RD_RMAP, &ok);
-    while (ok && lm && objs < RTL_MAX_OBJS) {
-        uint32_t sec_num = rtl_read_u32(lm + RTL_LM_SECNUM, &ok);
-        uint64_t detail = rtl_read_u32(lm + RTL_LM_SECDETAIL, &ok);
-        unsigned i;
-
-        rtl_read_str(rtl_read_u32(lm + RTL_LM_NAME, &ok), name, sizeof(name));
-        if (objs) {
-            g_string_append(s->rtl_snaps, ", ");
-        }
-        g_string_append(s->rtl_snaps, "{\"object\": \"");
-        json_escape_append(s->rtl_snaps, name);
-        g_string_append(s->rtl_snaps, "\"");
-        for (i = 0; i < 6; i++) {
-            uint32_t base = rtl_read_u32(lm + RTL_LM_SECADDR + 4 * i, &ok);
-
-            if (base) {
-                g_string_append_printf(s->rtl_snaps,
-                                       ", \"%s\": \"0x%" PRIx32 "\"",
-                                       rap_names[i], base);
-            }
-        }
-        g_string_append(s->rtl_snaps, ", \"sections\": [");
-        if (sec_num > RTL_MAX_SECS) {
-            sec_num = RTL_MAX_SECS;
-        }
-        for (i = 0; ok && i < sec_num; i++) {
-            uint64_t sd = detail + (uint64_t)i * RTL_SD_STRIDE;
-
-            rtl_read_str(rtl_read_u32(sd + RTL_SD_NAME, &ok), name,
-                         sizeof(name));
-            if (i) {
-                g_string_append(s->rtl_snaps, ", ");
-            }
-            g_string_append(s->rtl_snaps, "{\"name\": \"");
-            json_escape_append(s->rtl_snaps, name);
-            g_string_append_printf(s->rtl_snaps,
-                                   "\", \"size\": %" PRIu32
-                                   ", \"rap\": %" PRIu32 "}",
-                                   rtl_read_u32(sd + RTL_SD_SIZE, &ok),
-                                   rtl_read_u32(sd + RTL_SD_RAPID, &ok));
-        }
-        g_string_append(s->rtl_snaps, "]}");
-        lm = rtl_read_u32(lm + RTL_LM_NEXT, &ok);
-        objs++;
-    }
-    g_string_append(s->rtl_snaps, "]");
-    if (!ok) {
-        g_printerr("tcgcov: rtl: truncated guest link_map walk at "
-                   "generation %" PRIu64 "\n", gen);
+    /* ASID seeding (tcgcov-linux.c); rtl mode owns the tag itself. */
+    if (g_state.ctx && !g_state.rtl) {
+        tcgcov_linux_vcpu_init(&g_state, cpu_index);
     }
 }
-
-/*
- * Execution callback on the first instruction of _rtld_debug_state(). The
- * loader sets r_state and THEN calls it, so reading r_state at function
- * entry observes the completed transition. The generation bumps only on
- * RT_CONSISTENT -- i.e. once per completed load or unload -- so records
- * tagged N were executed while snapshot N's map was live. (Constructors
- * run before the post-load RT_CONSISTENT and are tagged N-1: loudly
- * unattributed rather than silently misattributed; the R2 hooks close
- * that window.)
- */
-static void vcpu_rtl_state(unsigned int cpu_index, void *udata)
-{
-    CovState *s = &g_state;
-    VcpuState *v = vcpu_slot(s, cpu_index);
-    bool ok = true;
-    uint32_t state;
-
-    (void)udata;
-
-    state = rtl_read_u32(s->rtl_debug_addr + RTL_RD_RSTATE, &ok);
-    g_mutex_lock(&s->lock);
-    s->rtl_events++;
-    if (ok && state == RTL_RT_CONSISTENT) {
-        s->rtl_generation++;
-        rtl_snapshot(s, s->rtl_generation);
-    }
-    g_mutex_unlock(&s->lock);
-
-    if (G_LIKELY(v != NULL)) {
-        v->cur_ctx = s->rtl_generation;
-        v->prev_valid = false;     /* loader event = control discontinuity */
-    }
-}
-#endif /* TCGCOV_HAVE_RDMEM */
 
 /*
  * The address that actually goes into a record: the vaddr itself, or with
@@ -1127,22 +728,13 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
     n = qemu_plugin_tb_n_insns(tb);
 
-#if TCGCOV_HAVE_RDMEM
     /*
-     * The loader watch is registered before the filter check: coverage
-     * filters must not be able to blind the generation tracking.
+     * The loader watch (tcgcov-rtems.c) is registered before the filter
+     * check: coverage filters must not blind the generation tracking.
      */
     if (s->rtl) {
-        for (size_t k = 0; k < n; k++) {
-            struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, k);
-
-            if (qemu_plugin_insn_vaddr(insn) == s->rtl_state_addr) {
-                qemu_plugin_register_vcpu_insn_exec_cb(
-                    insn, vcpu_rtl_state, QEMU_PLUGIN_CB_NO_REGS, NULL);
-            }
-        }
+        tcgcov_rtems_watch_tb(s, tb, n);
     }
-#endif
 
     /* If the TB start is outside every filter range, ignore it entirely. */
     if (!range_contains(s, tb_vaddr)) {
@@ -1269,7 +861,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
  * only string the plugin ever emits, and a QEMU plugin should not acquire a
  * dependency for eight lines of escaping.
  */
-static void json_escape_append(GString *out, const char *s)
+void json_escape_append(GString *out, const char *s)
 {
     const unsigned char *p = (const unsigned char *)(s ? s : "");
 
@@ -2200,7 +1792,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
             g_printerr("tcgcov: refusing to start\n");
             return -1;
         }
-        qemu_plugin_register_vcpu_ctx_changed_cb(id, vcpu_ctx_changed);
+        tcgcov_linux_register(id);
 #endif
     }
 

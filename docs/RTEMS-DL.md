@@ -124,6 +124,17 @@ end-to-end without touching RTEMS.
 
 ### Stage R3 — plugin observes the loader; generations go live
 
+**Verified 2026-08-15** (no-modification variant, `plugin/tcgcov-rtems.c`):
+`rtl_state=`/`rtl_debug=` watch the real `_rtld_debug_state()`; the plugin
+reads `r_state` and walks the `r_map` chain from guest memory, bumps a
+generation per `RT_CONSISTENT`, and snapshots the module map into artifact
+metadata (`rtl_generations`). On dl01: three generations (boot / module
+live / unloaded-empty-chain); the gen-1 slice with its map built **from
+the artifact's own metadata** — no GDB, no sidecar — reproduces the R0
+ground truth exactly (entry 2, loop 5, text base matching the independent
+GDB capture). Guest-OS code now lives in per-OS plugin files
+(`tcgcov-rtems.c` / `tcgcov-linux.c`) sharing `tcgcov-internal.h`.
+
 * At install: resolve the watch address from the base ELF symbol table —
   `_rtld_debug_state` for the no-modification variant, or the R2 hooks
   when present (no guest cooperation needed either way).
