@@ -38,7 +38,7 @@ class CtxFormatTest(unittest.TestCase):
     def test_magic_and_flags(self):
         with open(self.path, "rb") as f:
             data = f.read()
-        self.assertEqual(data[:8], MAGIC_V2)
+        self.assertEqual(data[:8], MAGIC)   # one magic; version is the signal
         hdr = parse_header(data, self.path)
         self.assertEqual(hdr["version"], 2)
         self.assertTrue(hdr["flags"] & FLAG_HAS_CTX)
@@ -80,12 +80,33 @@ class CtxFormatTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "HAS_CTX"):
             parse_header(hdr + blob, "<forged>")
 
-    def test_version_magic_mismatch_rejected(self):
+    def test_legacy_magic_with_v1_rejected(self):
         blob = b"{}"
         hdr = struct.pack(HEADER_FMT, MAGIC_V2, 1, 1, HEADER_SIZE, 1,
                           FLAG_HAS_COUNTS, 0,
                           HEADER_SIZE, len(blob), 0, 0, 0, 0, 0)
-        with self.assertRaisesRegex(ValueError, "does not match"):
+        with self.assertRaisesRegex(ValueError, "legacy TCGCOV2 magic"):
+            parse_header(hdr + blob, "<forged>")
+
+    def test_legacy_magic_v2_still_reads(self):
+        # The 2026-08-14 writer used a TCGCOV2 magic; readers keep it working.
+        with open(self.path, "rb") as f:
+            data = bytearray(f.read())
+        data[:8] = MAGIC_V2
+        legacy = self.path + ".legacy"
+        with open(legacy, "wb") as f:
+            f.write(data)
+        self.addCleanup(os.unlink, legacy)
+        _meta, hdr, records, _edges = read_full(legacy)
+        self.assertEqual(hdr["version"], 2)
+        self.assertEqual(records, sorted(RECORDS))
+
+    def test_unknown_version_rejected(self):
+        blob = b"{}"
+        hdr = struct.pack(HEADER_FMT, MAGIC, 3, 1, HEADER_SIZE, 1,
+                          FLAG_HAS_COUNTS, 0,
+                          HEADER_SIZE, len(blob), 0, 0, 0, 0, 0)
+        with self.assertRaisesRegex(ValueError, "unsupported format version"):
             parse_header(hdr + blob, "<forged>")
 
 

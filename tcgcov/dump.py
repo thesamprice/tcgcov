@@ -17,7 +17,7 @@ import sys
 
 from .format import (parse_header, unpack_records, unpack_edges,
                      unpack_ctx_records, unpack_ctx_edges, REC_TYPE,
-                     HEADER_FMT, MAGIC, MAGIC_V2, FLAG_HAS_COUNTS,
+                     HEADER_FMT, MAGIC, FLAG_HAS_COUNTS,
                      FLAG_HAS_EDGES, FLAG_EDGE_COUNTS, FLAG_HAS_CTX,
                      CTX_UNAVAILABLE)
 
@@ -84,8 +84,10 @@ def write_scrubbed(src_path, dst_path):
     rec_off = meta_off + len(new_meta)
     edge_off = rec_off + len(records) if edges else 0
 
+    # Always the one magic: scrubbing a legacy TCGCOV2-magic file
+    # canonicalizes it (version 2 is the signal, and is preserved).
     header = struct.pack(
-        HEADER_FMT, MAGIC_V2 if hdr["version"] >= 2 else MAGIC,
+        HEADER_FMT, MAGIC,
         hdr["version"], hdr["endian"], hsize,
         hdr["record_type"], hdr["flags"], hdr["record_count"],
         meta_off, len(new_meta), rec_off, len(records),

@@ -71,7 +71,7 @@ the build rather than emitting an unreadable file.
 | Offset | Size | Type       | Field             | Meaning |
 |-------:|-----:|------------|-------------------|---------|
 | 0      | 8    | `char[8]`  | `magic`           | `"TCGCOV1\0"` — the ASCII bytes `54 43 47 43 4F 56 31 00`. The trailing NUL is part of the magic, not a terminator. |
-| 8      | 2    | `uint16`   | `version`         | Format version. Currently `1`. A reader should reject values it does not know. |
+| 8      | 2    | `uint16`   | `version`         | Format version: `1`, or `2` when the artifact may carry context records (§11). The magic never changes — this field is the format signal, and a reader must reject values it does not know (a version-2 file with `HAS_CTX` would mis-stride a version-1 reader). |
 | 10     | 2    | `uint16`   | `endian`          | Byte order of every multi-byte field in this file: `1` = little-endian, `2` = big-endian. The current writer always emits `1`. |
 | 12     | 4    | `uint32`   | `header_size`     | Size of this header in bytes. Always `88` for TCGCOV1. See §7. |
 | 16     | 4    | `uint32`   | `record_type`     | Granularity of the address records: `1` = `TB_ADDR` (each record is a translation-block start address), `2` = `INSN_ADDR` (each record is a single instruction address). |
@@ -102,7 +102,7 @@ TCGCOV1 — offsets `0..87` are entirely accounted for by the table above.
 | 0   | `0x1` | `HAS_COUNTS`  | Each **address** record carries an execution count and is 16 bytes instead of 8. Applies only to the address record section. |
 | 1   | `0x2` | `HAS_EDGES`   | An edge section is present. `edge_count`/`edges_offset`/`edges_size` are meaningful. |
 | 2   | `0x4` | `EDGE_COUNTS` | Each **edge** record carries a traversal count and is 24 bytes instead of 16. Only meaningful when `HAS_EDGES` is also set; readers should ignore it otherwise. |
-| 3   | `0x8` | `HAS_CTX`     | **TCGCOV2 only.** Every address and edge record is prefixed with a `uint64` address-space context ID; see §11. Illegal in a file bearing the `TCGCOV1` magic — a v1 reader would mis-stride the sections, so the magic changed with the flag. |
+| 3   | `0x8` | `HAS_CTX`     | **Version 2 only.** Every address and edge record is prefixed with a `uint64` address-space context ID; see §11. Illegal with `version = 1` — a version-1 reader would mis-stride the sections, which is exactly why the version field exists and why a reader must reject versions it does not know. |
 
 All other bits are reserved and are written as zero. A reader that encounters
 an unknown bit set should still be able to read the sections it understands,
@@ -370,7 +370,7 @@ Well-formed UTF-8 passes through unchanged.
 * `endian` describes the **file**, not the guest. A big-endian guest observed
   by a little-endian host produces `endian = 1`.
 * A reader should validate, in this order: `magic` equals the 8 magic bytes;
-  `endian` is `1` or `2`; `version` is `1`; `header_size` is at least 88.
+  `endian` is `1` or `2`; `version` is `1` or `2`; `header_size` is at least 88.
 * `header_size` is the forward-compatibility hinge. Read `header_size` bytes
   for the header, use only the first 88, and locate the metadata via
   `metadata_offset` rather than assuming it starts at 88. A future version
@@ -663,8 +663,11 @@ plugin context-visibility API (MicroBlaze: the 8-bit MMU PID in `RPID`; see
 
 ### What changes, exactly
 
-* `magic` is `"TCGCOV2\0"` and `version` is `2`. The two always change
-  together; a reader must reject a mismatch.
+* `version` is `2`. The magic stays `"TCGCOV1\0"` — the version field is
+  the format signal, and a version-1 reader rejects the file loudly
+  ("unsupported format version 2") instead of misparsing it. (A writer
+  briefly emitted a `"TCGCOV2\0"` magic on 2026-08-14; readers accept it,
+  only ever paired with version 2, and nothing writes it anymore.)
 * Flag bit 3 (`HAS_CTX`, `0x8`) may be set. When it is:
   * every **address record** gains a leading `uint64 ctx`:
     `{ ctx, addr }` (16 bytes) or `{ ctx, addr, count }` (24 bytes with
@@ -678,8 +681,9 @@ plugin context-visibility API (MicroBlaze: the 8-bit MMU PID in `RPID`; see
   context (`QEMU_PLUGIN_CTX_UNAVAILABLE`): the API existed but the target
   did not report one.
 * Everything else — header layout, endianness rules, metadata encoding,
-  section bounds discipline — is unchanged. A TCGCOV2 file **without**
-  `HAS_CTX` is byte-for-byte a TCGCOV1 file with the new magic, and is legal.
+  section bounds discipline — is unchanged. A version-2 file **without**
+  `HAS_CTX` is byte-for-byte a version-1 file except for the version field,
+  and is legal.
 
 ### Metadata additions
 

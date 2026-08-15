@@ -192,7 +192,9 @@ class TestHeaderValidation(unittest.TestCase):
             build_short_header_cov({"test_id": "old"}, [0x1000, 0x1004]))
 
     def test_bad_version(self):
-        self._expect_value_error(patch_header(VALID, 8, "<H", 2), "version")
+        # version 2 became legal with the context records (same layout when
+        # HAS_CTX is clear), so the unknown-version guard now starts at 3.
+        self._expect_value_error(patch_header(VALID, 8, "<H", 3), "version")
 
     def test_big_endian_says_so(self):
         e = self._expect_value_error(patch_header(VALID, 10, "<H", 2))

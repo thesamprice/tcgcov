@@ -3,8 +3,10 @@
 The on-disk layout (all little-endian):
 
     struct tcgcov_header {          # 88 bytes
-        char     magic[8];          # "TCGCOV1\0" or "TCGCOV2\0"
-        uint16_t version;           # 1 or 2, always matching the magic
+        char     magic[8];          # "TCGCOV1\0" (the version field is the
+                                    # format signal; a legacy "TCGCOV2\0"
+                                    # magic is accepted, never written)
+        uint16_t version;           # 1, or 2 when context records may appear
         uint16_t endian;            # 1 = little, 2 = big
         uint32_t header_size;
         uint32_t record_type;       # 1=TB_ADDR, 2=INSN_ADDR, 3=EDGE
@@ -49,7 +51,11 @@ import json
 import struct
 
 MAGIC = b"TCGCOV1\0"
-MAGIC_V2 = b"TCGCOV2\0"
+# One writer briefly emitted a distinct magic for version-2 files
+# (2026-08-14, same-day artifacts only). The version field was always the
+# real signal; this magic is accepted on read and never written.
+MAGIC_V2_LEGACY = b"TCGCOV2\0"
+MAGIC_V2 = MAGIC_V2_LEGACY          # backwards-compatible alias
 HEADER_FMT = "<8sHHIIIQQQQQQQQ"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)          # 88
 
@@ -99,9 +105,8 @@ def parse_header(data, path="<data>"):
 
     After this returns, the unpackers below cannot read out of bounds.
     """
-    if len(data) < 8 or data[:8] not in (MAGIC, MAGIC_V2):
+    if len(data) < 8 or data[:8] not in (MAGIC, MAGIC_V2_LEGACY):
         raise ValueError(f"{path}: not a TCGCOV file (bad magic)")
-    magic_version = 1 if data[:8] == MAGIC else 2
     if len(data) < HEADER_SIZE:
         raise ValueError(f"{path}: truncated TCGCOV header: {len(data)} "
                          f"bytes, need {HEADER_SIZE}")
@@ -114,11 +119,13 @@ def parse_header(data, path="<data>"):
     if endian != 1:
         raise ValueError(f"{path}: bad endian field {endian} "
                          f"(expected 1=little or 2=big)")
-    if version != magic_version:
-        raise ValueError(f"{path}: version field {version} does not match "
-                         f"the TCGCOV{magic_version} magic; the two changed "
-                         f"together and a mismatch means a corrupt or "
-                         f"hand-forged header")
+    if version not in (1, 2):
+        raise ValueError(f"{path}: unsupported format version {version} "
+                         f"(this reader knows versions 1 and 2)")
+    if data[:8] == MAGIC_V2_LEGACY and version != 2:
+        raise ValueError(f"{path}: legacy TCGCOV2 magic with version "
+                         f"{version}; that writer only ever emitted "
+                         f"version 2, so this header is corrupt or forged")
 
     hdr = dict(zip(HEADER_FIELDS, struct.unpack(HEADER_FMT,
                                                 data[:HEADER_SIZE])))
@@ -343,7 +350,7 @@ def write_cov(path, meta, records, edges=None, record_type=1, ctx=False):
         flags |= FLAG_HAS_CTX
         records = sorted(records)
         edges = sorted(edges) if edges else edges
-    magic, version = (MAGIC_V2, 2) if ctx else (MAGIC, 1)
+    magic, version = MAGIC, (2 if ctx else 1)
     rec_words, edge_words = (3, 4) if ctx else (2, 3)
     records_off = HEADER_SIZE + len(blob)
     records_size = len(records) * 8 * rec_words

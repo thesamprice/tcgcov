@@ -104,7 +104,6 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 /* ------------------------------------------------------------------ */
 
 #define TCGCOV_MAGIC "TCGCOV1\0"   /* 8 bytes including the NUL */
-#define TCGCOV_MAGIC_V2 "TCGCOV2\0" /* ctx-bearing artifacts (ctx=on) */
 
 enum {
     TCGCOV_REC_TB_ADDR   = 1,      /* records are TB start addresses */
@@ -133,10 +132,10 @@ enum {
      */
     TCGCOV_FLAG_EDGE_COUNTS = 0x4,
     /*
-     * TCGCOV2 only: every address record is prefixed with a uint64 ctx
+     * Version 2 only: every address record is prefixed with a uint64 ctx
      * (address-space context ID) and every edge record likewise; records
-     * sort by (ctx, addr), edges by (ctx, src, dst). Never set in a file
-     * bearing the TCGCOV1 magic.
+     * sort by (ctx, addr), edges by (ctx, src, dst). Never set in a
+     * version-1 file, whose reader would mis-stride the sections.
      */
     TCGCOV_FLAG_HAS_CTX     = 0x8,
 };
@@ -1589,7 +1588,13 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
     meta_size = strlen(meta);
 
     memset(&h, 0, sizeof(h));
-    memcpy(h.magic, s->ctx ? TCGCOV_MAGIC_V2 : TCGCOV_MAGIC, 8);
+    /*
+     * The magic never changes; the version field is the format signal.
+     * Version 2 (ctx=on) restructures the record arrays, so a version-1
+     * reader must reject it -- which the version check does loudly, with
+     * a better message than a magic mismatch would produce.
+     */
+    memcpy(h.magic, TCGCOV_MAGIC, 8);
     h.version = s->ctx ? 2 : 1;
     h.endian = 1;                          /* file is written little-endian */
     h.header_size = (uint32_t)sizeof(h);
