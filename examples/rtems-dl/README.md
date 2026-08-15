@@ -111,3 +111,43 @@ running constructors — so ctor coverage lands one generation early,
 where it shows up as unattributed rather than silently wrong. The
 optional `rtems_rtl_debugger_load/unload` hooks (DYNAMIC-OBJECTS §5)
 close that window; nothing in these examples needed them.
+
+---
+
+# Stage R1 + the cross-object reuse fixture
+
+Measured 2026-08-15. `rtl-map-dump.c` is the R1 deliverable: ~50 lines of
+**application-side** code (public RTL API only — still zero RTEMS
+modifications) that prints every loaded object's per-section *runtime*
+placement between markers:
+
+    RTLMAP A-LOADED OBJ /pay_a.o SEC .text.spin 0x8004a700 78 EXEC
+    ...
+
+That is ground truth the `link_map` cannot give (it has only aggregate
+region bases) — and it validated the metadata reconstruction: RTL placed
+the rap-text sections exactly contiguously, as the plugin's
+sequential-offset assumption predicts.
+
+`reuse-init.c` + `pay_a.c`/`pay_b.c` + `build-reuse-fixture.sh` are the
+different-object reuse fixture the stock dl tests never provide. The
+payloads are structurally identical (so `-O0` emits identical section
+sizes and first-fit hands B exactly A's freed block) but differ in
+constants and therefore in file, counts, and line numbers. One run under
+the plugin's rtl mode:
+
+    RTLMAP A-LOADED ... .text.spin 0x8004a700 78 EXEC
+    RTLMAP B-LOADED ... .text.spin 0x8004a700 78 EXEC     <- same addresses
+
+    generation 1 -> pay_a.c: spin loop body count 7,  pad_uncovered absent
+    generation 3 -> pay_b.c: spin loop body count 11, pad_uncovered absent
+
+The same TB address (`0x8004a716`) carries count 7 in generation 1 and 11
+in generation 3, each attributed to its own source file via maps parsed
+straight from the RTLMAP dump. The unit-test case of R4 is now also
+demonstrated live.
+
+Build notes: links against the mbv waf build tree directly (includes +
+`-B/-L` + `librtemsbsp -lrtemscpu`), with the dl-testsuite's two-pass
+`rtems-syms` link for the runtime symbol table. See the script for the
+exact recipe.

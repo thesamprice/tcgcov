@@ -87,7 +87,17 @@ The `--module-map FILE` cut of DYNAMIC-OBJECTS §7.2(a), sized honestly:
 * Explicit limitation, documented in output: valid only when no window was
   ever reused — one map, no time axis (this is what R3 removes).
 
-### Stage R1 — target-side section dumper *(small RTEMS addition, fork-first)*
+### Stage R1 — target-side section dumper *(application-side; verified)*
+
+**Verified 2026-08-15** — `examples/rtems-dl/rtl-map-dump.c`: ~50 lines of
+pure application code on the public RTL API (`rtems_rtl_lock`,
+`rtems_rtl_objects_unprotected`, `obj->sections`), so even this needs no
+RTEMS change. It prints true per-section runtime bases — which
+cross-validated the plugin's sequential-offset reconstruction — and its
+output parses directly into `modmap` maps. The same session turned the
+fixture into the live cross-object R4 acceptance: size-identical payloads
+A/B, B placed at A's exact freed addresses, one TB address carrying count
+7 (pay_a.c) in generation 1 and 11 (pay_b.c) in generation 3.
 
 `rtl list -m`-style output does not print per-section runtime bases; the
 data is in `obj->sections`. A ~30-line routine (shell command or callable
