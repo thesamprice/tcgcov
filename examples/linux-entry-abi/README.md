@@ -83,6 +83,32 @@ The five `(real-mode/phys)` sites are the exception/interrupt entry paths,
 confirmed executed at the `0x90000000` physical alias — a detail the
 coverage run surfaced that source review would miss.
 
+## Regression canary (fails on an unpatched kernel)
+
+Beyond coverage, `mb-abi-stress` asserts the bug is *absent*.
+`sp_checked_syscall()` issues a raw MicroBlaze syscall (`brki r14, 8`) and
+reads the stack pointer `r1` immediately before and after the trap in one
+asm block. The bug spills a kernel-entry callee's first argument to
+`caller_sp+4`, which on an unpatched kernel **is** `PT_R1` (the saved user
+SP) -- so a syscall silently rewrites the user SP to a syscall-argument
+value (init originally died getting `AT_FDCWD` as its SP). A mismatch is
+the bug, caught deterministically. The binary prints `CANARY PASS` + exits
+0 only if every checked syscall preserved SP; a harness keys on that.
+
+### A/B, measured 2026-08-15
+
+Same workload, same GCC 15, same Buildroot rootfs; only `entry.S` differs.
+
+| kernel | entry.S | result |
+|---|---|---|
+| **patched (v5)** | 38 `C_ARG_SIZE` reserves | boots, 60,000 SP-checked syscalls clean, **`CANARY PASS`**, exit 0 |
+| **pristine 6.12.81** | 0 reserves (stock) | **hangs at `Run /init as init process`** -- init's SP corrupted on its first syscalls, the exact PR 121432 symptom; the test binary is never reached |
+
+On the unpatched kernel the failure is so early that the system never
+reaches userspace -- which is itself the clearest possible red. The
+per-syscall SP check exists for the subtler case where a future
+regression lets init survive but still corrupts SP on some path.
+
 ## Why this matters for the patch
 
 Coverage turns "the tests pass" into "the tests pass *and executed every
