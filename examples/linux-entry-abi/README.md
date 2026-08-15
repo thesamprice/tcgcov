@@ -117,3 +117,27 @@ debugging never exercised the unaligned path — a coverage run would have
 said so in one line. The same artifact is upstreamable evidence for the
 LKML thread: a reviewer can see each reserved site was exercised, not just
 asserted.
+
+
+## The kselftest form, and what "fails on unpatched" really means
+
+`entry_abi.c` is the mergeable kselftest (TAP harness, arch-gated) that
+ships as [PATCH v6 2/2]; it asserts just the SP-preservation property.
+Its before/after behaviour was verified directly:
+
+* **fixed kernel:** `ok 1 user stack pointer preserved across ... syscalls`,
+  pass:1 (booted with `init=/usr/bin/entry_abi` so the test runs first).
+* **reverted kernel (stock entry.S, same GCC 15):** the test's own
+  `faccessat(AT_FDCWD, ...)` syscall corrupts the saved SP -- the fault
+  dump reports `r1=0xFFFFFF9C`, which is AT_FDCWD (-100), the syscall's
+  first argument written over the stack pointer -- and the process dies on
+  it (`Attempted to kill init`).
+
+So the test's syscall provably triggers the bug (no false pass -- the
+corrupted value is unmistakably the test's own argument). But note the
+honest limitation: this bug corrupts the SP of *any* process that makes a
+spilling syscall, so a reverted kernel cannot reach a working userspace at
+all -- init panics before, or as, the test runs. There is no graceful
+"not ok" to be had; the failure signal is "the system does not boot / the
+test never emits ok", which every CI records as failure. That is as strong
+as a total-boot-failure bug allows.
