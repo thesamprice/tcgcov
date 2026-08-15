@@ -55,3 +55,59 @@ by the map, not lost — they symbolize against `dl01.exe` as usual.
 One map, no time axis: valid only while no allocator range was reused.
 `modmap` refuses overlapping windows loudly. Unload/reload workloads need
 the loader-generation tagging of docs/RTEMS-DL.md stage R3.
+
+---
+
+# Stage R3/R4: loader generations — reuse, separately attributed
+
+Measured 2026-08-15. Same board and QEMU; the plugin's RTEMS mode
+(`plugin/tcgcov-rtems.c`) replaces both the GDB capture *and* the sidecar:
+
+    -plugin libtcgcov.so,out=dl09.cov,mode=tb,edges=on,\
+            rtl_state=0x<addr _rtld_debug_state>,rtl_debug=0x<addr _rtld_debug>
+
+(the two addresses come from `nm` of the base image). The plugin watches
+the loader's notification, bumps a **generation** per completed
+load/unload, tags every record with it (TCGCOV2,
+`ctx_kind: "loader-generation"`), and snapshots the module map per
+generation into `metadata.rtl_generations` — the map source is now the
+artifact itself.
+
+## dl01 (single load): the no-GDB pipeline
+
+Three generations — boot, module-live, unloaded (its snapshot correctly an
+empty chain). Slicing generation 1 with a map built from
+`rtl_generations["1"]` reproduces the R0 result exactly: entry 2, loop 5,
+text base `0x80044ae0` identical to the independent GDB capture above.
+
+## dl09 (address reuse): the R4 acceptance
+
+dl09 loads o1–o5, runs them, unloads all, and repeats — four cycles, and
+RTL's allocator hands back the **identical addresses** every cycle:
+
+    o1 window [0x800523c0,0x8005254e):
+      gen  5: 14 addrs, 14 execs      gen 25: 14 addrs, 14 execs
+      gen 15: 14 addrs, 14 execs      gen 35: 14 addrs, 14 execs
+
+Four separate lifetimes of the same address range, kept apart by the
+generation tag. Per-lifetime slices symbolize to identical, correct
+coverage (12 lines of `dl09-o1.c`, each count 1); a TCGCOV1 artifact
+would have recorded count 4 per address with the lifetimes
+unrecoverable. And the guard holds: feeding two lifetimes' windows to
+`modmap` as one map is refused —
+
+    error: windows overlap: ... A single map cannot describe reused
+    address ranges; capture one map per loader generation instead.
+
+The stock dl tests only ever reuse a range with the *same* object;
+the harder different-object case is pinned by a format-level unit test
+(`tests/test_modmap.py::GenerationReuseTest`): same address, counts 5
+and 7 in two generations, each attributed to its own object's ELF.
+
+## Constructor caveat (the R2 hooks' remaining value)
+
+Generations bump at `RT_CONSISTENT`, which the loader signals *after*
+running constructors — so ctor coverage lands one generation early,
+where it shows up as unattributed rather than silently wrong. The
+optional `rtems_rtl_debugger_load/unload` hooks (DYNAMIC-OBJECTS §5)
+close that window; nothing in these examples needed them.

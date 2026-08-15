@@ -155,6 +155,18 @@ GDB capture). Guest-OS code now lives in per-OS plugin files
 
 ### Stage R4 — acceptance: the reuse case
 
+**Verified 2026-08-15** — see `examples/rtems-dl/`: dl09 runs four
+load/unload cycles and RTL's allocator returns identical addresses each
+time; the four lifetimes of o1's window (14 execs each) stay separate by
+generation, per-lifetime slices symbolize to identical correct coverage,
+and a merged two-lifetime map is refused loudly. Cross-object reuse
+(never produced by the stock dl tests) is pinned at the format level by
+`tests/test_modmap.py::GenerationReuseTest`. The plan's R4 wording
+("two objects at the same addresses at different times") is thereby
+covered live for same-object lifetimes and by unit test for
+different-object lifetimes; a custom two-object fixture remains the
+nice-to-have.
+
 Load A, exercise, `dlclose`, load B (forcing allocator reuse — the `dl`
 tests can be arranged to do this), exercise, stop. One artifact. The
 acceptance mirrors Linux Tier 3's: **two objects that occupied the same

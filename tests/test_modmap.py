@@ -97,5 +97,65 @@ class ModMapTest(unittest.TestCase):
                 load_map(self.map_path)
 
 
+
+class GenerationReuseTest(unittest.TestCase):
+    """Cross-object temporal reuse: object A's window is reused by object B
+    after an unload; per-generation slicing attributes each correctly, and a
+    merged map is refused. (The stock RTEMS dl tests reuse addresses only
+    with the same object -- examples/rtems-dl covers that live; this pins
+    the harder different-object case at the format level.)"""
+
+    BASE = 0x80050000
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.cov = os.path.join(self.dir.name, "in.cov")
+        # gen 1: object A live at BASE; gen 3: object B live at BASE.
+        records = [
+            (1, self.BASE + 0x10, 5),      # A's code
+            (1, self.BASE + 0x20, 2),
+            (3, self.BASE + 0x10, 7),      # B's code, SAME address
+            (3, self.BASE + 0x40, 1),
+        ]
+        write_cov(self.cov, {"ctx_kind": "loader-generation"}, records,
+                  ctx=True)
+
+    def _map(self, obj, size):
+        p = os.path.join(self.dir.name, obj + ".json")
+        with open(p, "w") as f:
+            json.dump([{"object": obj, "sections":
+                        [{"name": ".text", "addr": self.BASE,
+                          "size": size}]}], f)
+        return p
+
+    def test_per_generation_slices(self):
+        from tcgcov.format import read_all
+        wa = load_map(self._map("a.o", 0x30))
+        out_a, m_a, _ = slice_cov(self.cov, wa,
+                                  os.path.join(self.dir.name, "a"), ctx=1)
+        self.assertEqual(m_a, 2)
+        _m, addrs, counts, _e = read_all(out_a[0]["out"])
+        self.assertEqual(counts[0x10], 5)          # A's count, not 12
+
+        wb = load_map(self._map("b.o", 0x50))
+        out_b, m_b, _ = slice_cov(self.cov, wb,
+                                  os.path.join(self.dir.name, "b"), ctx=3)
+        self.assertEqual(m_b, 2)
+        _m, addrs, counts, _e = read_all(out_b[0]["out"])
+        self.assertEqual(counts[0x10], 7)          # B's count at the SAME addr
+        self.assertEqual(counts[0x40], 1)
+
+    def test_merged_lifetimes_refused(self):
+        both = os.path.join(self.dir.name, "both.json")
+        with open(both, "w") as f:
+            json.dump([
+                {"object": "a.o", "sections":
+                 [{"name": ".text", "addr": self.BASE, "size": 0x30}]},
+                {"object": "b.o", "sections":
+                 [{"name": ".text", "addr": self.BASE, "size": 0x50}]}], f)
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            load_map(both)
+
 if __name__ == "__main__":
     unittest.main()
