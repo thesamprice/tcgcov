@@ -157,8 +157,8 @@ full attribution. This tier should not start until Tier 3's format exists.
 
 | mod | needed by | upstream posture |
 |---|---|---|
-| context/ASID visibility for plugins (register coverage or new callback) | Tier 3 | RFC to qemu-devel; generic API, per-target enablement |
-| guest-physical address for *instructions* (`qemu_plugin_insn_phys()` — mem ops have `qemu_plugin_hwaddr`, insns do not) | optional; dedups same-code-different-VA and helps L1 | small, self-contained |
+| context/ASID visibility for plugins (register coverage or new callback) | Tier 3 | RFC to qemu-devel; generic API, per-target enablement. **PoC implemented and Tier 3 verified** (see §3); RFC still draft, not sent |
+| guest-physical address for *instructions* | optional; dedups same-code-different-VA | **resolved 2026-08-14 with no QEMU mod**: `qemu_plugin_translate_vaddr()` (API v5, QEMU ≥ 10.1) called at translation time is sufficient — the plugin's `phys=on` does exactly this. Verified: 0 translation failures over a full boot, direct-map symbol check, kernel symbolization via rebase (`examples/linux-phys/`). Caveat: does **not** help kernel-module attribution (vmalloc text is physically scattered); the Tier-1 virtual window rebase remains right there |
 | none | Tiers 0–2 | — |
 
 ## 5. Non-goals

@@ -319,7 +319,7 @@ keys it does not know.
 | `test_id`          | string    | Free-form metadata string supplied via the `test_id=` plugin argument. Empty when not given. Opaque to the format. |
 | `bsp`              | string    | Free-form metadata string supplied via the `bsp=` plugin argument. Empty when not given. Opaque to the format. |
 | `elf`              | string    | Path to the guest ELF, supplied via the `elf=` plugin argument, for offline symbolization. Empty when not given. |
-| `address_kind`     | string    | Always `"vaddr"` in version 1: addresses are guest virtual addresses. |
+| `address_kind`     | string    | `"vaddr"` (guest virtual, the default) or `"paddr"` (guest physical, written by `phys=on`; a `phys_translate_failures` count accompanies it — non-zero means that many records fell back to the virtual address). |
 | `counts_enabled`   | boolean   | Mirrors the `HAS_COUNTS` flag. Always `true` from the current producer; older files may have `false`. |
 | `record_count`     | number    | Mirrors `header.record_count`. |
 | `edges_enabled`    | boolean   | Mirrors the `HAS_EDGES` flag. `true` from the current producer unless it was run with `edges=off`. |
@@ -590,6 +590,7 @@ For reference, the plugin arguments that shape the output:
 | `mode=tb-insn-fast` | —         | `record_type = 2`, but instruction addresses are expanded from a single per-block callback. `insn_fidelity = "tb-approx"`; **over-reports instructions after an aborted block**. See §4.1. |
 | `edges=`       | **on**         | `edges=off` clears `HAS_EDGES` and omits the edge section. |
 | `ctx=`         | off            | `ctx=on` records per-address-space-context and writes a **TCGCOV2** file with `HAS_CTX`; see §11. Requires a plugin built against a QEMU with the context-visibility API, and `mode=tb` or `mode=tb-insn-fast` (fails the launch otherwise). |
+| `phys=`        | off            | `phys=on` records guest-**physical** addresses (`metadata.address_kind = "paddr"`), translated once per address at translation time via `qemu_plugin_translate_vaddr` (plugin API v5). Filter ranges still match virtual addresses. Requires system emulation and a v5+ header (fails the launch otherwise). |
 | `filter=A-B[,C-D...]` | none    | Only record addresses in `[start, end)`. Values accept `0x` hex. Recorded in `metadata.filters`. |
 | `elf=PATH`     | none           | Recorded in `metadata.elf` for offline symbolization. JSON-escaped, so any path is safe; see §6.1. |
 | `test_id=STR`  | none           | Free-form metadata string. JSON-escaped; see §6.1. |

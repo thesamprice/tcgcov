@@ -89,6 +89,16 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define TCGCOV_HAVE_CTX 0
 #endif
 
+/*
+ * qemu_plugin_translate_vaddr (upstream since part-way through plugin API
+ * version 5): a debug MMU walk from vCPU context, which translation-time
+ * callbacks are. phys=on rests on it entirely -- no QEMU modification is
+ * involved -- and is refused at install when the build lacked it.
+ */
+#ifndef TCGCOV_HAVE_XLATE
+#define TCGCOV_HAVE_XLATE 0
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Raw file format (TCGCOV1).                                          */
 /* ------------------------------------------------------------------ */
@@ -381,7 +391,16 @@ typedef struct {
     CovMode mode;
     bool edges;                    /* edges=off disables the edge section */
     bool ctx;                      /* ctx=on records per-context (TCGCOV2) */
+    bool phys;                     /* phys=on records physical addresses */
     bool verbose;
+
+    /*
+     * phys=on: translations that failed the debug MMU walk and fell back to
+     * recording the virtual address. Incremented under `lock` (translation
+     * time only) and reported in the metadata, because an artifact silently
+     * mixing address kinds would be worse than one that says it did.
+     */
+    uint64_t phys_fail;
 
     /*
      * ctx=on bookkeeping, updated from the (rare) ctx-changed callback.
@@ -872,6 +891,32 @@ static void vcpu_init(qemu_plugin_id_t id, unsigned int cpu_index)
 #endif
 }
 
+/*
+ * The address that actually goes into a record: the vaddr itself, or with
+ * phys=on its physical translation. Called only at translation time (under
+ * s->lock), where the code's page is necessarily mapped -- the CPU just
+ * fetched it -- so failure is rare (e.g. the mapping vanished between fetch
+ * and callback); it degrades to the vaddr and is counted, never dropped.
+ *
+ * Filter ranges are always applied to the VIRTUAL address, before this
+ * substitution: filters describe the guest's memory map as the user sees it.
+ */
+static uint64_t cov_addr(CovState *s, uint64_t vaddr)
+{
+#if TCGCOV_HAVE_XLATE
+    uint64_t hw;
+
+    if (!s->phys) {
+        return vaddr;
+    }
+    if (qemu_plugin_translate_vaddr(vaddr, &hw)) {
+        return hw;
+    }
+    s->phys_fail++;
+#endif
+    return vaddr;
+}
+
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     CovState *s = &g_state;
@@ -904,14 +949,16 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      */
     if (s->mode != TCGCOV_MODE_TB_INSN || s->edges) {
         ctb = g_new0(CovTb, 1);
-        ctb->tb_vaddr = tb_vaddr;
+        ctb->tb_vaddr = cov_addr(s, tb_vaddr);
         g_ptr_array_add(s->blocks, ctb);
     }
 
     /* last_insn is non-NULL only when edges are on, which guarantees ctb. */
     if (last_insn != NULL && ctb != NULL) {
-        ctb->last_insn_vaddr = qemu_plugin_insn_vaddr(last_insn);
-        last_in_range = range_contains(s, ctb->last_insn_vaddr);
+        uint64_t last_vaddr = qemu_plugin_insn_vaddr(last_insn);
+
+        last_in_range = range_contains(s, last_vaddr);
+        ctb->last_insn_vaddr = cov_addr(s, last_vaddr);
     }
 
     switch (s->mode) {
@@ -926,7 +973,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             uint64_t vaddr = qemu_plugin_insn_vaddr(insn);
 
             if (range_contains(s, vaddr)) {
-                CovInsn *ci = insn_alloc(s, vaddr);
+                CovInsn *ci = insn_alloc(s, cov_addr(s, vaddr));
 
                 qemu_plugin_register_vcpu_insn_exec_cb(insn, vcpu_insn_exec,
                                                        QEMU_PLUGIN_CB_NO_REGS,
@@ -946,7 +993,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             uint64_t vaddr = qemu_plugin_insn_vaddr(insn);
 
             if (range_contains(s, vaddr)) {
-                u64vec_push(&ctb->insns, vaddr);
+                u64vec_push(&ctb->insns, cov_addr(s, vaddr));
             }
         }
         qemu_plugin_register_vcpu_tb_exec_cb(tb,
@@ -1073,7 +1120,11 @@ static char *build_metadata_json(CovState *s, uint64_t record_count,
     json_append_str(m, "test_id", s->test_id);
     json_append_str(m, "bsp", s->bsp);
     json_append_str(m, "elf", s->elf_path);
-    json_append_str(m, "address_kind", "vaddr");
+    json_append_str(m, "address_kind", s->phys ? "paddr" : "vaddr");
+    if (s->phys) {
+        g_string_append_printf(m, "  \"phys_translate_failures\": %" PRIu64
+                               ",\n", s->phys_fail);
+    }
     /* Counts and edges are unconditional in this producer; see FORMAT.md 10. */
     g_string_append(m, "  \"counts_enabled\": true,\n");
     g_string_append_printf(m, "  \"record_count\": %" PRIu64 ",\n",
@@ -1747,6 +1798,8 @@ static bool parse_arg(CovState *s, const char *arg)
         return parse_bool_arg(k, v, &s->edges);
     } else if (g_strcmp0(k, "ctx") == 0) {
         return parse_bool_arg(k, v, &s->ctx);
+    } else if (g_strcmp0(k, "phys") == 0) {
+        return parse_bool_arg(k, v, &s->phys);
     } else if (g_strcmp0(k, "verbose") == 0) {
         return parse_bool_arg(k, v, &s->verbose);
     } else {
@@ -1820,6 +1873,28 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         }
     }
 
+    if (s->phys) {
+#if !TCGCOV_HAVE_XLATE
+        g_printerr("tcgcov: phys=on, but this plugin was built against a "
+                   "QEMU header without qemu_plugin_translate_vaddr "
+                   "(plugin API v5, QEMU >= 10.1). Rebuild against a newer "
+                   "header, or drop phys=on.\n");
+        g_printerr("tcgcov: refusing to start\n");
+        return -1;
+#else
+        if (!s->system_emulation) {
+            /*
+             * In user mode there is no guest MMU: translate_vaddr always
+             * fails and every record would silently fall back to the vaddr
+             * while the metadata claimed paddr.
+             */
+            g_printerr("tcgcov: phys=on requires system emulation\n");
+            g_printerr("tcgcov: refusing to start\n");
+            return -1;
+        }
+#endif
+    }
+
     if (s->ctx) {
 #if !TCGCOV_HAVE_CTX
         g_printerr("tcgcov: ctx=on, but this plugin was built against a "
@@ -1861,11 +1936,11 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
 
     if (s->verbose) {
         g_printerr("tcgcov: target=%s system=%d mode=%s fidelity=%s out=%s "
-                   "counts=always edges=%d ctx=%d discon=%d plugin_api=%d "
-                   "vcpu_slots=%zu filters=%zu\n",
+                   "counts=always edges=%d ctx=%d phys=%d discon=%d "
+                   "plugin_api=%d vcpu_slots=%zu filters=%zu\n",
                    s->target_name, s->system_emulation,
                    mode_name(s->mode), fidelity_name(s->mode),
-                   s->out_path, s->edges, s->ctx,
+                   s->out_path, s->edges, s->ctx, s->phys,
                    s->edges && TCGCOV_HAVE_DISCON,
                    QEMU_PLUGIN_VERSION, s->vcpu_cap, s->range_count);
     }

@@ -52,6 +52,12 @@ HAVE_CTX  := $(shell grep -qs qemu_plugin_register_vcpu_ctx_changed_cb \
                          "$(PLUGIN_HEADER)" && echo 1 || echo 0)
 CFLAGS    += -DTCGCOV_HAVE_CTX=$(HAVE_CTX)
 
+# qemu_plugin_translate_vaddr arrived part-way through plugin API version 5
+# (same story as the discon callbacks), so probe the symbol, not the version.
+HAVE_XLATE := $(shell grep -qs qemu_plugin_translate_vaddr \
+                         "$(PLUGIN_HEADER)" && echo 1 || echo 0)
+CFLAGS    += -DTCGCOV_HAVE_XLATE=$(HAVE_XLATE)
+
 UNAME_S   := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 # macOS builds the plugin as a bundle and needs undefined symbols left to the
