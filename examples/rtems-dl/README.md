@@ -178,3 +178,21 @@ per-object identity, full load-path coverage, and pre-constructor timing
 that `_rtld_debug_state()` cannot provide. The two fixture configurations
 are both one env var away: reuse needs size-identity (no ctor), the
 ordering proof needs the ctor.
+
+## The constructor window, measured (rtl_load=)
+
+The plugin grew an optional `rtl_load=<addr of rtems_rtl_debugger_load>`
+watch for guests built with the R2 hooks. Same fixture (`WITH_CTOR=1
+RTL_OVERRIDE=1`, hooks sources from the fork branch via a git worktree),
+two runs:
+
+| | ctor execs land in | that generation's map | attributable |
+|---|---|---|---|
+| `rtl_state` only | generation 0 | empty | **no** (loud: unmapped) |
+| `+ rtl_load` | generation 1 | `/pay_a.o` | **yes** |
+
+With the hook watched, `pay_a.c` lines 14/16 (`pay_ctor`) symbolize from
+the generation-1 slice — coverage of code that ran *inside* `dlopen`,
+which the dlfcn-level notification can never attribute. The extra
+generation the later RT_CONSISTENT bump creates has an identical map and
+is harmless by design.

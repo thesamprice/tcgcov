@@ -119,6 +119,13 @@ clear at the load hook while a test constructor's output follows it —
 the exact window the no-modification variant cannot close. Not submitted
 as an MR; upstreaming is a separate decision.
 
+**Plugin consumption verified too**: `rtl_load=` watches the hook and
+bumps the generation pre-ctor. Measured on the ctor fixture: with
+`rtl_state` only, constructor execs land in generation 0 (empty map,
+unattributable); with `rtl_load`, in generation 1 (map contains the
+object) and the constructor's own source lines symbolize. See
+`examples/rtems-dl/`.
+
 **A no-modification variant exists and should be tried first.** Unlike the
 `r_brk` machinery, `_rtld_debug_state()` is *real*: `dlfcn.c` calls it with
 `r_state = RT_ADD` before a load, `RT_CONSISTENT` after, `RT_DELETE` before

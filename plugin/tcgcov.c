@@ -1632,6 +1632,11 @@ static bool parse_arg(CovState *s, const char *arg)
             g_printerr("tcgcov: rtl_debug: bad address '%s'\n", v);
             return false;
         }
+    } else if (g_strcmp0(k, "rtl_load") == 0) {
+        if (!parse_addr(v, &s->rtl_load_addr)) {
+            g_printerr("tcgcov: rtl_load: bad address '%s'\n", v);
+            return false;
+        }
     } else if (g_strcmp0(k, "verbose") == 0) {
         return parse_bool_arg(k, v, &s->verbose);
     } else {
@@ -1769,6 +1774,11 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         s->ctx = true;
         s->rtl_snaps = g_string_new(NULL);
 #endif
+    } else if (s->rtl_load_addr) {
+        g_printerr("tcgcov: rtl_load= only makes sense together with "
+                   "rtl_state=/rtl_debug=\n");
+        g_printerr("tcgcov: refusing to start\n");
+        return -1;
     }
 
     if (s->ctx && !s->rtl) {

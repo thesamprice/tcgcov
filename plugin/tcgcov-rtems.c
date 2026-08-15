@@ -188,14 +188,47 @@ static void vcpu_rtl_state(unsigned int cpu_index, void *udata)
     }
 }
 
+/*
+ * Execution callback on the first instruction of rtems_rtl_debugger_load()
+ * (the optional R2 per-object hook): the object is published and its
+ * link_map entry exists, but its constructors have NOT run. Bumping the
+ * generation here means the constructors execute under a generation whose
+ * snapshot already contains their object. The later RT_CONSISTENT
+ * notification bumps again into an identical-map generation, which is
+ * harmless: generations are cheap and only their maps matter.
+ */
+static void vcpu_rtl_load(unsigned int cpu_index, void *udata)
+{
+    CovState *s = &g_state;
+    VcpuState *v = vcpu_slot(s, cpu_index);
+
+    (void)udata;
+
+    g_mutex_lock(&s->lock);
+    s->rtl_events++;
+    s->rtl_generation++;
+    rtl_snapshot(s, s->rtl_generation);
+    g_mutex_unlock(&s->lock);
+
+    if (G_LIKELY(v != NULL)) {
+        v->cur_ctx = s->rtl_generation;
+        v->prev_valid = false;
+    }
+}
+
 void tcgcov_rtems_watch_tb(CovState *s, struct qemu_plugin_tb *tb, size_t n)
 {
     for (size_t k = 0; k < n; k++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, k);
+        uint64_t vaddr = qemu_plugin_insn_vaddr(insn);
 
-        if (qemu_plugin_insn_vaddr(insn) == s->rtl_state_addr) {
+        if (vaddr == s->rtl_state_addr) {
             qemu_plugin_register_vcpu_insn_exec_cb(
                 insn, vcpu_rtl_state, QEMU_PLUGIN_CB_NO_REGS, NULL);
+        }
+        if (s->rtl_load_addr && vaddr == s->rtl_load_addr) {
+            qemu_plugin_register_vcpu_insn_exec_cb(
+                insn, vcpu_rtl_load, QEMU_PLUGIN_CB_NO_REGS, NULL);
         }
     }
 }

@@ -175,6 +175,14 @@ typedef struct {
     bool rtl;
     uint64_t rtl_state_addr;       /* &_rtld_debug_state, from the base ELF */
     uint64_t rtl_debug_addr;       /* &_rtld_debug */
+    /*
+     * Optional: &rtems_rtl_debugger_load (the R2 per-object hook, when the
+     * guest carries it). It fires BEFORE the object's constructors, so
+     * bumping the generation there puts constructor coverage in a
+     * generation whose map already contains the object -- closing the
+     * attribution window the dlfcn-level notification cannot.
+     */
+    uint64_t rtl_load_addr;
     uint64_t rtl_generation;       /* current generation, starts at 0 */
     uint64_t rtl_events;           /* notification hits observed */
     GString *rtl_snaps;            /* metadata JSON fragments, under lock */
