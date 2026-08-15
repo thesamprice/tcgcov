@@ -23,7 +23,9 @@ mkdir -p "$OUT"
 cd "$OUT"
 
 # Payloads: -O0 -g for line fidelity, function-sections like the dl tests.
-$CC $ARCH -O0 -g -ffunction-sections -fdata-sections -c "$HERE/pay_a.c" -o pay_a.o
+PAY_A_DEFS=""
+[ "${WITH_CTOR:-0}" = "1" ] && PAY_A_DEFS="-DPAY_A_WITH_CTOR"
+$CC $ARCH -O0 -g -ffunction-sections -fdata-sections $PAY_A_DEFS -c "$HERE/pay_a.c" -o pay_a.o
 $CC $ARCH -O0 -g -ffunction-sections -fdata-sections -c "$HERE/pay_b.c" -o pay_b.o
 tar cf payload.tar pay_a.o pay_b.o
 python3 - <<'EOF'
@@ -44,9 +46,21 @@ $CC $ARCH -O2 -g $INC -I"$OUT" -c "$HERE/reuse-init.c"    -o reuse-init.o
 $CC $ARCH -O2 -g $INC        -c "$HERE/rtl-map-dump.c"    -o rtl-map-dump.o
 $CC $ARCH -O2 -g             -c payload-tar.c             -o payload-tar.o
 
-$CC $LINK reuse-init.o rtl-map-dump.o payload-tar.o \
+# RTL_OVERRIDE=1: compile the (patched) libdl rtl.c/rtl-debugger.c from the
+# source tree and link them ahead of the libraries, so the archive members
+# are superseded -- validates an RTEMS-side patch without rebuilding the BSP.
+EXTRA_OBJS=""
+if [ "${RTL_OVERRIDE:-0}" = "1" ]; then
+  $CC $ARCH -O2 -g $INC -I"$SRC/cpukit/libdl" -c "$SRC/cpukit/libdl/rtl.c" \
+      -o rtl-override.o
+  $CC $ARCH -O2 -g $INC -I"$SRC/cpukit/libdl" \
+      -c "$SRC/cpukit/libdl/rtl-debugger.c" -o rtl-debugger-override.o
+  EXTRA_OBJS="rtl-override.o rtl-debugger-override.o"
+fi
+
+$CC $LINK reuse-init.o rtl-map-dump.o payload-tar.o $EXTRA_OBJS \
     -Wl,--start-group -lrtemsbsp -lrtemscpu -Wl,--end-group -o reuse.pre
 $SYMS -e -C "$CC" -c "$ARCH" -o reuse-sym.o reuse.pre
-$CC $LINK reuse-init.o rtl-map-dump.o payload-tar.o reuse-sym.o \
+$CC $LINK reuse-init.o rtl-map-dump.o payload-tar.o $EXTRA_OBJS reuse-sym.o \
     -Wl,--start-group -lrtemsbsp -lrtemscpu -Wl,--end-group -o reuse.exe
 echo "built: $OUT/reuse.exe"

@@ -151,3 +151,30 @@ Build notes: links against the mbv waf build tree directly (includes +
 `-B/-L` + `librtemsbsp -lrtemscpu`), with the dl-testsuite's two-pass
 `rtems-syms` link for the runtime symbol table. See the script for the
 exact recipe.
+
+---
+
+# Stage R2: the per-object hooks (RTEMS patch, fork-only)
+
+2026-08-15. The one RTEMS modification of the plan, prepared and verified
+but **not submitted anywhere**: branch `rtl-debugger-hooks` (d9ca18310d)
+on the GitLab fork adds `rtems_rtl_debugger_load/unload(obj)` — empty,
+`RTEMS_NO_INLINE`, per object — called from `rtl.c` after cache sync /
+before constructors, and before teardown, exactly per DYNAMIC-OBJECTS §5.
+30 inserted lines including the installed header and spec entry.
+
+Verified without rebuilding the BSP: `RTL_OVERRIDE=1` makes
+`build-reuse-fixture.sh` compile the patched `rtl.c`/`rtl-debugger.c`
+out-of-tree and link them ahead of the archives, and `WITH_CTOR=1` gives
+payload A a constructor. `verify-hooks.gdb` then breakpoints both hooks:
+
+    HOOK LOAD obj=/pay_a.o ctor_run=0     <- flag clear: hook precedes ctors
+    HOOK UNLOAD obj=/pay_a.o
+    HOOK LOAD obj=/pay_b.o ctor_run=0
+    HOOK UNLOAD obj=/pay_b.o
+
+with `pay_a: ctor ran` on the serial console after the load hook — the
+per-object identity, full load-path coverage, and pre-constructor timing
+that `_rtld_debug_state()` cannot provide. The two fixture configurations
+are both one env var away: reuse needs size-identity (no ctor), the
+ordering proof needs the ctor.

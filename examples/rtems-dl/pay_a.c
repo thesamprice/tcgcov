@@ -5,6 +5,17 @@
 
 int pay_entry( int n );
 
+/* WITH_CTOR=1 build: validates R2 hook ordering (the load hook fires with
+   CTOR_RUN still clear, before this runs). Leave it off for the reuse run:
+   the extra sections break the size-identity that makes the allocator
+   reuse A's block for B. */
+#ifdef PAY_A_WITH_CTOR
+__attribute__(( constructor )) static void pay_ctor( void )
+{
+  printf( "pay_a: ctor ran\n" );
+}
+#endif
+
 static int spin( int n )
 {
   int s = 0;

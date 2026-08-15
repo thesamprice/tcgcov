@@ -109,6 +109,16 @@ of everything else as a debugging aid.
 ### Stage R2 — the two hooks *(the only RTEMS modification in the plan —
 optional, prepared on the fork; NOT sent anywhere without explicit approval)*
 
+**Prepared and verified 2026-08-15**: branch `rtl-debugger-hooks`
+(d9ca18310d) on the GitLab fork — header, empty noinline bodies beside
+the existing `_rtld_debug` machinery, two `rtl.c` call sites, spec entry;
+30 lines. Validated on the reuse fixture via out-of-tree recompile of the
+two patched files (`RTL_OVERRIDE=1`) and a GDB script: per-object hits in
+load/unload order with the object argument valid, and `CTOR_RUN` still
+clear at the load hook while a test constructor's output follows it —
+the exact window the no-modification variant cannot close. Not submitted
+as an MR; upstreaming is a separate decision.
+
 **A no-modification variant exists and should be tried first.** Unlike the
 `r_brk` machinery, `_rtld_debug_state()` is *real*: `dlfcn.c` calls it with
 `r_state = RT_ADD` before a load, `RT_CONSISTENT` after, `RT_DELETE` before
