@@ -58,6 +58,11 @@ HAVE_XLATE := $(shell grep -qs qemu_plugin_translate_vaddr \
                          "$(PLUGIN_HEADER)" && echo 1 || echo 0)
 CFLAGS    += -DTCGCOV_HAVE_XLATE=$(HAVE_XLATE)
 
+# Guest-memory reads (plugin API v4) power the RTEMS loader-generation mode.
+HAVE_RDMEM := $(shell grep -qs qemu_plugin_read_memory_vaddr \
+                         "$(PLUGIN_HEADER)" && echo 1 || echo 0)
+CFLAGS    += -DTCGCOV_HAVE_RDMEM=$(HAVE_RDMEM)
+
 UNAME_S   := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 # macOS builds the plugin as a bundle and needs undefined symbols left to the
