@@ -1,0 +1,2 @@
+#!/bin/sh
+[ "$1" = start ] && /usr/bin/mb-abi-stress && echo "MBSTRESS-RAN"
