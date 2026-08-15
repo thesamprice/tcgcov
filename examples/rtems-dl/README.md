@@ -1,0 +1,57 @@
+# RTEMS Stage R0: coverage of a dynamically loaded object
+
+Measured 2026-08-15 (docs/RTEMS-DL.md stage R0): RTEMS 7 `dl01` test on the
+riscv/mbv BSP (`amd-microblaze-v-generic`), QEMU 10.2.4 + tcgcov plugin,
+**zero RTEMS modifications** — the map comes from the loader's existing
+`_rtld_debug_state()` notification, which `dlopen` really does call.
+
+An RTEMS loadable object is ET_REL (libdl rejects ET_DYN outright), built
+here with function-sections: `dl01-o1.o`'s code is a 112-byte
+`.text.rtems_main`, placed at a runtime address only the loader knows.
+
+## The run
+
+    qemu-system-riscv32 -M amd-microblaze-v-generic -m 256m \
+        -display none -monitor none -serial file:serial.log -no-reboot \
+        -icount shift=0,sleep=off -s -S \
+        -plugin libtcgcov.so,out=dl01.cov,mode=tb,edges=on \
+        -device loader,file=dl01.exe,cpu-num=0 &
+    riscv-rtems7-gdb -batch -x capture-map.gdb dl01.exe > map-raw.txt
+    # ... wait for "END OF TEST" on the serial log, then SIGTERM
+
+`capture-map.gdb` breaks on `_rtld_debug_state`, skips the pre-load RT_ADD
+hit, and at the post-load RT_CONSISTENT hit walks `_rtld_debug.r_map`
+printing every object's rap-region bases and `sec_detail[]` (name/size/rap),
+then detaches so the test runs to completion. Captured here:
+
+    OBJ /dl01-o1.o
+    BASE text 0x80044ae0 const 0x80044a50 data (nil) bss (nil)
+    SEC .text.rtems_main off 0 size 112 rap 0
+
+## The pipeline
+
+    tcgcov modmap --cov dl01.cov --map dl01-map.json --out-dir mods/
+    #   dl01-o1.o:.text.rtems_main: 6 records, 3 edges
+    #   6 addrs in mapped windows, 3101 outside (base image)
+    tcgcov symbolize --cov "mods/dl01-o1.o__text.rtems_main.cov" \
+        --elf .../dl01/dl01-o1.o --section .text.rtems_main \
+        --addr2line riscv-rtems7-addr2line --all-paths --out sym.jsonl
+
+## The result, against ground truth
+
+`dl01` loads the object and calls `rtems_main` twice — once with argc=2,
+once with argc=3 — and the serial log shows exactly 2 then 3 argv lines
+printed. The coverage agrees line by line:
+
+    dl01-o1.c:43  rtems_main entry   count=2    (the two calls)
+    dl01-o1.c:46  for-loop           count=5    (2 + 3 iterations)
+    dl01-o1.c:47  loop body
+
+6/6 module addresses resolved; the 3,101 base-image addresses were fenced
+by the map, not lost — they symbolize against `dl01.exe` as usual.
+
+## Limits (why this is R0, not the destination)
+
+One map, no time axis: valid only while no allocator range was reused.
+`modmap` refuses overlapping windows loudly. Unload/reload workloads need
+the loader-generation tagging of docs/RTEMS-DL.md stage R3.

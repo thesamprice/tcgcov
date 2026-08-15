@@ -3,7 +3,7 @@
 import argparse
 
 from . import (addr2line, branches, contexts, coverable, lcov, merge, dump,
-               restrict, gap, rebase)
+               modmap, restrict, gap, rebase)
 from . import __version__
 
 # (subcommand name, module, short help). The module supplies add_arguments(p)
@@ -18,6 +18,8 @@ SUBCOMMANDS = [
      "shift a runtime-address window to link addresses (kernel modules)"),
     ("contexts", contexts,
      "list a TCGCOV2 artifact's contexts, or extract one as TCGCOV1"),
+    ("modmap", modmap,
+     "slice a .cov by a JSON module map into per-section artifacts"),
     ("lcov", lcov, "symbolized JSONL -> per-test LCOV .info"),
     ("merge", merge, "merge per-test .info -> aggregate (by source+line)"),
     ("restrict", restrict,

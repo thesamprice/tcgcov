@@ -62,6 +62,15 @@ Nothing about TCGCOV2 changes; RTEMS is just its second producer semantics.
 
 ### Stage R0 — sidecar map, load-once workloads *(no RTEMS or QEMU changes)*
 
+**Verified 2026-08-15** — see `examples/rtems-dl/`: `tcgcov modmap` landed
+(per-(object,section) slicing, loud overlap refusal), and the `dl01` test
+on the riscv/mbv BSP produced line coverage of its loaded object matching
+ground truth exactly (entry count 2 = the two calls, loop count 5 = argc
+2+3 iterations, corroborated by the serial log). The map was captured with
+zero RTEMS changes via a GDB batch script at the existing
+`_rtld_debug_state()` RT_CONSISTENT notification — which also means the R2
+no-modification variant is no longer a hypothesis.
+
 The `--module-map FILE` cut of DYNAMIC-OBJECTS §7.2(a), sized honestly:
 
 * JSON map: `[{object, file, sections: [{name, addr, size}]}, ...]`,
