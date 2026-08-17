@@ -1,3 +1,3 @@
 [{"object": "dl01-o1.o",
-  "file": "/Users/sprice5/src/rtems_builder/src/rtems/build/riscv/mbv/testsuites/libtests/dl01/dl01-o1.o",
+  "file": ".../build/riscv/mbv/testsuites/libtests/dl01/dl01-o1.o",
   "sections": [{"name": ".text.rtems_main", "addr": "0x80044ae0", "size": 112}]}]
