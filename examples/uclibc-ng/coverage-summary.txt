@@ -1,0 +1,29 @@
+uClibc-ng 1.0.55, microblazeel (static), coverage by its own test suite
+under qemu-microblazeel (linux-user, QEMU 11.0.0) + tcgcov plugin.
+Produced 2026-08-17. 115 tests, 16 subsystems. Library sources only
+(harness .c excluded). Full artifact: uclibc-ng.info + genhtml HTML.
+
+Aggregate (lcov --summary, branch coverage on):
+  lines......: 40.5%  (4893 of 12072)
+  functions..: 54.2%  (359 of 662)
+  branches...: 30.9%  (2297 of 7436)
+
+Per subsystem (covered / coverable lines):
+  string          1170/1264   92%
+  librt             21/24      87%
+  pwd_grp          113/143     79%
+  sysdeps/linux    403/550     73%
+  stdio           1135/1641    69%
+  stdlib           706/1129    62%
+  termios            8/14      57%
+  signal            24/57      42%
+  inet             511/2018    25%   (resolv.c 1212 lines, no live resolver)
+  misc             744/4729    15%   (regex 3480 lines, 2 regex tests)
+  unistd            58/503     11%
+  ------------------------------------
+  TOTAL           4893/12072   40.5%
+
+The distribution is the suite's reach, not tcgcov's: string is exercised
+hard; regex and the resolver are barely touched by their few tests, which
+is the point of measuring. Thread/locale/dlopen subdirs were not run
+(static build, no NPTL / shared objects).

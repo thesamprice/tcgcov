@@ -1,0 +1,21 @@
+#!/bin/sh
+# A uClibc-targeting compile driver built from a *glibc* MicroBlaze cross gcc.
+#
+# uClibc-ng-test assumes CROSS_COMPILE names a gcc that already defaults to
+# uClibc. A Buildroot glibc cross gcc does not, but --sysroot retargets it at
+# the static uClibc-ng we built: crt1/crti/crtn, libc.a and the uClibc headers
+# all come from the sysroot, and -idirafter fills in the kernel headers the
+# standalone uClibc install does not carry (bits/errno.h -> <linux/errno.h>).
+#
+# Static only: the standalone build ships no uClibc shared loader (its
+# microblazeel ldso mis-targets endianness), which is fine here -- qemu-user
+# runs static ET_EXEC binaries and symbolization is against each binary's own
+# DWARF. Env: CROSS_GCC, UCLIBC_SYSROOT, KERNEL_HEADERS (see env.sh).
+: "${CROSS_GCC:=microblazeel-linux-gcc}"
+: "${UCLIBC_SYSROOT:?set UCLIBC_SYSROOT (uClibc make-install sysroot)}"
+: "${KERNEL_HEADERS:=/usr/include}"
+
+exec "$CROSS_GCC" \
+  --sysroot="$UCLIBC_SYSROOT" -static -g \
+  -idirafter "$KERNEL_HEADERS" \
+  "$@"

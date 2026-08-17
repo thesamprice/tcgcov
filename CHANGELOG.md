@@ -11,6 +11,16 @@ until 1.0.
 
 ### Added
 
+- **`examples/uclibc-ng/` — a C library measured by its own test suite.**
+  uClibc-ng 1.0.55 built static for microblazeel, its 115-test upstream suite
+  run under qemu-user with the plugin, and the per-test `.cov` files merged by
+  source line into a library-only LCOV report (40.5% lines, 54.2% functions,
+  30.9% branches). Demonstrates the static-link workflow — symbolize each test
+  against its own binary, then `merge` by source identity — plus the
+  `SIMULATOR=` integration point that needs no changes to the suite. The
+  example's function column depends on a not-yet-upstreamed `addr2line`
+  determinism fix; it says so.
+
 - **Coverage of RTEMS dynamically loaded (`dlopen`'d) objects.** libdl code no
   longer resolves to nothing: it is attributed to its source object and section
   and rebased for symbolization, end to end. Three pieces, verified R0–R4

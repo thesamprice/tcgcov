@@ -1,0 +1,20 @@
+# uClibc-ng .config knobs this example depends on, on top of
+#     make ARCH=microblaze defconfig
+# Set CROSS_COMPILE=microblazeel-linux- and KERNEL_HEADERS on the make line,
+# then `make oldconfig && make && make PREFIX=<dir> install`.
+
+# microblazeel is little-endian; defconfig picks big.
+ARCH_LITTLE_ENDIAN=y
+# ARCH_BIG_ENDIAN is not set
+
+# Debug info so the library's DWARF line table exists to symbolize against.
+# DODEBUG builds the library at -O0 -g; UCLIBC_EXTRA_CFLAGS=-g also carries -g
+# into paths DODEBUG does not. -O0 gives the cleanest line mapping for a demo;
+# drop DODEBUG and keep only the -g for coverage of an -Os library.
+DODEBUG=y
+UCLIBC_EXTRA_CFLAGS="-g"
+
+# Static only. The standalone microblazeel shared loader (ld-uClibc.so) fails
+# to link -- its .S objects assemble little-endian but the ldso link defaults
+# to microblaze big-endian emulation. Static libc.a is all this example needs.
+# HAVE_SHARED is not set

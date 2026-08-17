@@ -1,0 +1,19 @@
+#!/bin/sh
+# SIMULATOR hook for uClibc-ng-test. The harness runs each test as
+#     $(SIMULATOR) $(WRAPPER) ./<binary> $(OPTS)
+# so we sit in front, name a per-test .cov after <subdir>__<binary>, and
+# forward the run unchanged. Per-test files matter: the tests are STATIC, so
+# the same libc line lives at a different address in each binary and the
+# artifacts must be merged by source line later, not by address.
+# Env: QEMU, PLUGIN, COVDIR (see env.sh).
+: "${QEMU:=qemu-microblazeel}"
+: "${PLUGIN:?set PLUGIN=/path/to/libtcgcov.so}"
+: "${COVDIR:=$PWD/cov}"
+
+bin="$1"; shift
+base=$(basename "$bin")
+sub=$(basename "$(pwd)")
+mkdir -p "$COVDIR"
+exec "$QEMU" \
+  -plugin "$PLUGIN,out=$COVDIR/${sub}__${base}.cov,mode=tb-insn,edges=on,elf=$bin" \
+  "$bin" "$@"
