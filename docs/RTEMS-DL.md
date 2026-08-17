@@ -1,10 +1,68 @@
-# Coverage of RTEMS dynamically loaded objects — execution plan
+# Coverage of RTEMS dynamically loaded objects
 
-> **STATUS: PLAN.** Design basis: [DYNAMIC-OBJECTS.md](DYNAMIC-OBJECTS.md)
-> (the RTL analysis there is verified against RTEMS source and is not
-> repeated here). This document updates its staging for what has landed in
-> tcgcov since it was written — the Linux Tier-1 module machinery and the
-> TCGCOV2 context records — both of which shorten the path considerably.
+> **STATUS: IMPLEMENTED — stages R0–R4 all verified.** RTEMS libdl
+> (`dlopen`'d `ET_REL`) code is measured, attributed to its source object and
+> section, and rebased for symbolization; overlapping address *reuse* across
+> load/unload cycles is separated by a loader **generation** tag. Verified
+> end-to-end against RTEMS 7 `dl01` (single load) and `dl09` (four load/unload
+> cycles reusing identical addresses) on the riscv/mbv BSP under QEMU. The
+> per-stage **verified** dates below are the acceptance runs; nothing here is
+> outstanding except the optional R2 fork hooks (constructor-window polish).
+>
+> Design basis: [DYNAMIC-OBJECTS.md](DYNAMIC-OBJECTS.md) (the RTL analysis
+> there is verified against RTEMS source and is not repeated here). This
+> document was written as an execution plan and every stage of it has landed;
+> it now doubles as the reference for how the shipped feature works.
+
+## How it works, in one screen
+
+Three cooperating pieces turn `dlopen`'d RTEMS code into per-source coverage,
+with **no change to RTEMS** (the R2 hooks below are optional polish):
+
+1. **The plugin watches the loader.** Give it the base image's loader symbols
+   (from `nm` of the ELF):
+
+   ```
+   -plugin libtcgcov.so,out=run.cov,mode=tb,edges=on,\
+           rtl_state=0x<&_rtld_debug_state>,rtl_debug=0x<&_rtld_debug>
+   ```
+
+   An exec callback on `_rtld_debug_state()` reads `r_debug.r_state`; on each
+   `RT_CONSISTENT` (a completed `dlopen`/`dlclose`) it **bumps a generation
+   counter** and **snapshots the `link_map` chain** — every loaded object's
+   name and per-section runtime bases — into the artifact's own metadata
+   (`rtl_generations`). Every coverage record is tagged with the generation in
+   force when it executed (`ctx_kind: "loader-generation"`). Needs
+   `qemu_plugin_read_memory_vaddr` (plugin API v4). Optionally add
+   `rtl_load=0x<&rtems_rtl_debugger_load>` (the optional R2 fork hook) to also
+   attribute code that runs *inside* `dlopen` — a constructor — which the
+   `RT_CONSISTENT` notification alone reports too late.
+
+2. **The host slices by the module map.** The map is the artifact's own
+   `metadata.rtl_generations[<gen>]` (or a hand-written / GDB-captured JSON).
+   `tcgcov modmap` cuts one `TCGCOV1` file per `(object, section)`, **rebasing**
+   each address from its runtime placement to the section's link-time offset,
+   and refuses overlapping windows loudly (one map has no time axis). `--ctx
+   <gen>` slices one generation first, so address *reuse* — object A freed,
+   object B loaded into the same block — stays correctly attributed:
+
+   ```
+   tcgcov modmap --cov run.cov --map map.json --out-dir mods/ --ctx 1
+   ```
+
+3. **Symbolize per section.** Each slice is 0-based against its section, so it
+   feeds the existing `symbolize --section` pipeline against the original `.o`:
+
+   ```
+   tcgcov symbolize --cov "mods/foo.o__text.cov" \
+       --elf .../foo.o --section .text --addr2line <target>-addr2line \
+       --all-paths --out sym.jsonl
+   ```
+
+The per-record tag is the same one `TCGCOV2` uses to separate same-base Linux
+*processes* (§2); RTEMS reuses it with the loader generation as the tag source,
+so **no new artifact format was needed**. Worked examples with ground-truth
+checks: [`examples/rtems-dl/`](../examples/rtems-dl/) (`dl01`, `dl09`).
 
 ## 0. What an RTEMS ".so" actually is
 

@@ -531,11 +531,14 @@ procedure for telling whether your profile is actually right.
 | [`docs/ARCHITECTURES.md`](docs/ARCHITECTURES.md) | **Read this before bringing tcgcov up on a new processor.** Per-profile status with the evidence behind each, known gaps per ISA, a porting checklist where every item is a bug this project shipped, and the `--arch-profile` schema. |
 | [`examples/branch-coverage/`](examples/branch-coverage/) | A worked example whose four conditionals have hand-checkable outcomes, so you can verify a report rather than just read it. Explains the `-` vs `0` BRDA distinction and why machine-level "taken" is not source-level "the `if` was true". |
 | [`docs/QEMU-CROSSCHECK.md`](docs/QEMU-CROSSCHECK.md) | The architecture profiles checked against QEMU's own target translators — a second, independent authority on what transfers control. Found ARM defects the binutils opcode tables did not. |
+| [`docs/RTEMS-DL.md`](docs/RTEMS-DL.md) | **Shipped.** Coverage of `dlopen`'d RTEMS libdl (`ET_REL`) objects — the loader-generation plugin mode, the `modmap` slicer, and how address reuse across load/unload is kept apart. Verified R0–R4 against `dl01`/`dl09`. |
+| [`docs/LINUX-VM.md`](docs/LINUX-VM.md) | Coverage of Linux guests with an MMU. What is shipped (kernel text as-is, kernel-module `rebase`, per-process `ctx=on` separation, `phys=on` records) and what is still design (`ld.so`/ASLR). |
 | [`docs/QEMU-BLOCK-SCANNING.md`](docs/QEMU-BLOCK-SCANNING.md) | **Design proposal, not implemented.** How QEMU could be taught to decode without executing, so the code inventory came from its decoders instead of from per-architecture regexes. |
-| [`docs/DYNAMIC-OBJECTS.md`](docs/DYNAMIC-OBJECTS.md) | **Design proposal, not implemented.** Coverage of `dlopen`'d objects, and why the debugger handshake RTEMS already ships is inert. |
+| [`docs/DYNAMIC-OBJECTS.md`](docs/DYNAMIC-OBJECTS.md) | The design analysis behind dynamic-object coverage. Its **RTEMS** path is now shipped (see `RTEMS-DL.md`); its **Linux `ET_DYN`/SVR4** rendezvous is still a proposal. |
 
-The two proposals are marked as such at the top of each file. Everything else
-describes shipped behaviour.
+`QEMU-BLOCK-SCANNING.md` is a proposal, and `DYNAMIC-OBJECTS.md` is half proposal
+(the Linux `ET_DYN` route); each says so at the top. Everything else describes
+shipped behaviour.
 
 ---
 
@@ -558,12 +561,17 @@ Read these before trusting a number.
   assembly, a prebuilt blob, a stripped library) is invisible. Sources that
   DWARF names but that are not on disk count toward the denominator yet cannot
   be rendered; run `genhtml --ignore-errors source`, as the driver does.
-- **Dynamically loaded code is not handled.** Code loaded at runtime (RTEMS
-  libdl `dlopen`, Linux shared objects) lands at addresses the offline
-  symbolizer knows nothing about, so it does not appear in coverage at all.
-  This needs a runtime module map; the design is written up in
-  [`docs/DYNAMIC-OBJECTS.md`](docs/DYNAMIC-OBJECTS.md) and is **not
-  implemented**.
+- **Dynamically loaded code: RTEMS yes, Linux `ld.so` not yet.** Code loaded at
+  runtime lands at addresses the static ELF does not describe, so it needs a
+  runtime module map. That map now exists for **RTEMS libdl** (`dlopen`'d
+  `ET_REL` objects): a plugin mode reads the loader's rendezvous, records a
+  per-object map into the artifact, and `tcgcov modmap` attributes and rebases
+  each object per section — with address reuse across load/unload kept apart by
+  a loader generation. See [`docs/RTEMS-DL.md`](docs/RTEMS-DL.md). Linux **kernel
+  modules** are handled by `rebase` (fixed placement), and same-VA **processes**
+  by `ctx=on`. What is **not** handled is the **Linux `ET_DYN` / `ld.so`
+  shared-library** rendezvous — no code walks a Linux dynamic linker; that route
+  stays a proposal in [`docs/DYNAMIC-OBJECTS.md`](docs/DYNAMIC-OBJECTS.md).
 - **Line coverage is not branch coverage is not MC/DC.** tcgcov does the first
   two. It does not do MC/DC and makes no certification claim.
 
@@ -682,7 +690,9 @@ Particularly useful contributions, in rough order of value:
 2. **A report from a target we have not tried** — especially one that does not
    work. The generalization away from its original target is recent and
    under-tested.
-3. Anything from [`docs/DYNAMIC-OBJECTS.md`](docs/DYNAMIC-OBJECTS.md), which is
-   a plan looking for an implementer.
+3. The **Linux `ET_DYN` / `ld.so`** route in
+   [`docs/DYNAMIC-OBJECTS.md`](docs/DYNAMIC-OBJECTS.md) — the RTEMS side of that
+   design has shipped (see [`docs/RTEMS-DL.md`](docs/RTEMS-DL.md)); the Linux
+   dynamic-linker walk is still a plan looking for an implementer.
 
 Please keep the host package free of third-party dependencies; CI enforces it.

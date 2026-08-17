@@ -1,12 +1,20 @@
 # Coverage of dynamically loaded objects
 
-> **STATUS: PLAN. Nothing described here is implemented.**
+> **STATUS: partly implemented.** The **RTEMS** dynamically-loaded-object path
+> analysed here is now **shipped and verified** — a loader-generation plugin
+> mode that watches RTL's `_rtld_debug_state()` and snapshots the module map
+> into the artifact, plus the host `tcgcov modmap` / `rebase` slicer that
+> attributes and rebases each object per section, with address reuse kept apart
+> by generation. See **[RTEMS-DL.md](RTEMS-DL.md)** for the mechanism, the exact
+> plugin options, and the `dl01`/`dl09` acceptance runs (stages R0–R4). The
+> design reasoning below is what that feature was built from.
 >
-> This document is a design and roadmap for a feature tcgcov does not have. No
-> code in this repository handles dynamically loaded objects today. Sections
-> marked **verified** were checked against real source at the versions cited;
-> sections marked **unverified** are reasoning that has not been confirmed.
-> Treat the proposed interfaces as proposals, not as anything that exists.
+> The **Linux `ET_DYN` / SVR4 `r_debug` rendezvous** (§2–§4) is **still a
+> proposal** — no code walks a Linux dynamic linker. (What the Linux side *does*
+> ship is orthogonal: per-process separation by MMU context and physical-address
+> records — see [LINUX-VM.md](LINUX-VM.md).) Sections below marked **verified**
+> were checked against real source at the versions cited; sections marked
+> **unverified** are reasoning that has not been confirmed.
 
 ---
 
@@ -349,9 +357,13 @@ implementation cost that §7 has to absorb.
 
 ---
 
-## 5. Proposed RTEMS-side hooks
+## 5. Optional RTEMS-side hooks
 
-**Proposal, not implemented, not submitted upstream.**
+**Prepared on a fork, verified, not submitted upstream** — branch
+`rtl-debugger-hooks`. These are optional polish (RTEMS-DL.md stage R2): they
+close the constructor-window gap the loader's own `RT_CONSISTENT` notification
+leaves open. The plugin consumes them via `rtl_load=`; the zero-modification
+path (`rtl_state=`/`rtl_debug=`) works without them.
 
 ### 5.1 The interface
 

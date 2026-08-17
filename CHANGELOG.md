@@ -11,6 +11,34 @@ until 1.0.
 
 ### Added
 
+- **Coverage of RTEMS dynamically loaded (`dlopen`'d) objects.** libdl code no
+  longer resolves to nothing: it is attributed to its source object and section
+  and rebased for symbolization, end to end. Three pieces, verified R0–R4
+  against RTEMS 7 `dl01`/`dl09` on the riscv/mbv BSP — see
+  [`docs/RTEMS-DL.md`](docs/RTEMS-DL.md) and [`examples/rtems-dl/`](examples/rtems-dl/):
+  - **Plugin loader-generation mode.** New arguments `rtl_state=<&_rtld_debug_state>`
+    and `rtl_debug=<&_rtld_debug>` (given together) put the plugin in RTEMS
+    loader mode: it watches the loader's rendezvous, bumps a **generation** on
+    each completed `dlopen`/`dlclose`, snapshots the `link_map` chain (object
+    names and per-section runtime bases) into artifact metadata
+    (`rtl_generations`, `ctx_kind: "loader-generation"`), and tags every record
+    with the generation in force. Address *reuse* across load/unload — the same
+    address carrying two different objects over time — is thereby kept apart.
+    Requires `qemu_plugin_read_memory_vaddr` (plugin API v4). Optional
+    `rtl_load=<&rtems_rtl_debugger_load>` (a 30-line RTEMS fork hook) also
+    attributes code that runs inside `dlopen`, e.g. a constructor.
+  - **`tcgcov modmap`.** Slices a `.cov` by a JSON module map — which can be the
+    artifact's own `rtl_generations` metadata — into one artifact per
+    `(object, section)`, rebased to each section's link-time offset for
+    `symbolize --section`. Refuses overlapping windows (one map has no time
+    axis); `--ctx <gen>` slices a single loader generation first. Always reports
+    how many base-image addresses were not attributed.
+  - **`tcgcov rebase`.** The single-window generalization for fixed placement
+    (Linux kernel modules): shift records in `[base, base+size)` by `to - base`.
+  Note: the **Linux `ET_DYN` / `ld.so`** shared-library rendezvous remains a
+  design proposal ([`docs/DYNAMIC-OBJECTS.md`](docs/DYNAMIC-OBJECTS.md)); this
+  release ships the RTEMS `ET_REL` path only.
+
 - `tcgcov dump --scrub` and `--scrub-out FILE` redact the absolute ELF path an
   artifact embeds, so a `.cov` can be attached to a bug report without
   disclosing the filesystem layout of the machine that produced it. The

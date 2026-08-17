@@ -1,11 +1,17 @@
 # Coverage of Linux guests with virtual memory
 
-> **STATUS: PLAN, with one measured experiment.**
+> **STATUS: partly implemented.** Shipped and verified: kernel text as-is (L0),
+> kernel-module `rebase` (L1), physical-address records (`phys=on`), and
+> per-process separation by MMU context (`ctx=on`, L2 — which depends on a
+> QEMU context-visibility callback that is not yet upstream, see
+> [QEMU-RFC-context.md](QEMU-RFC-context.md)). Still design: the **`ld.so` /
+> ASLR** dynamic-linker walk (L3). Note this is *process* and *module*
+> attribution; coverage of `dlopen`'d **RTEMS** objects is a separate, shipped
+> feature in [RTEMS-DL.md](RTEMS-DL.md).
 >
 > Sections marked **verified** were run on 2026-08-14 against real artifacts
-> (QEMU 11.0.2, a Buildroot `qemu_microblazeel_mmu` Linux 6.12.81 guest,
-> tcgcov main at the time of writing). Everything else is design. Proposed
-> interfaces are proposals.
+> (QEMU 11.0.2, a Buildroot `qemu_microblazeel_mmu` Linux 6.12.81 guest).
+> Sections still marked design are proposals.
 
 ---
 
