@@ -7,7 +7,7 @@ young, both changed during the extraction, and [`docs/QEMU-BLOCK-SCANNING.md`](d
 proposes changing them further. Expect breaking changes between minor versions
 until 1.0.
 
-## Unreleased
+## 0.2.0 — 2026-08-17
 
 ### Added
 

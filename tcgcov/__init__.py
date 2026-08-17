@@ -20,7 +20,7 @@ from .paths import normalize_path, path_options, PathOptions, PRESETS
 from .symbolize import run_addr2line, iter_covered_lines
 from .cfg import analyze, get_profile, load_profile_file, ARCH_PROFILES
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "read_cov", "read_edges", "read_all", "normalize_path", "path_options",
