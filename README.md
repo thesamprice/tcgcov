@@ -415,14 +415,14 @@ With **none** of these given, the tools keep absolute paths and print a warning
 rather than dropping everything — a report you cannot merge is better than a
 silently empty one.
 
-### One-command driver
+### One command: `tcgcov report`
 
-`tcgcov-report.sh` runs the whole chain over a directory of `.cov` files. It
-reads each binary's path from the artifact's own metadata, so there is no
-manifest to maintain:
+`tcgcov report` runs the whole chain over a directory of `.cov` files — every
+step above, in order, with one set of options. It reads each binary's path from
+the artifact's own metadata, so there is no manifest to maintain:
 
 ```bash
-./tcgcov-report.sh --raw-dir coverage/raw --out-dir coverage \
+tcgcov report --raw-dir coverage/raw --out-dir coverage \
   --source-root /path/to/src \
   --toolchain-prefix riscv64-unknown-elf- --arch riscv
 ```
@@ -434,13 +434,59 @@ coverage/symbolized/*.jsonl
 coverage/coverable/*.jsonl
 coverage/branches/*.jsonl
 coverage/lcov/per-test/*.info
-coverage/lcov/aggregate-<arch>.info
-coverage/html/index.html
+coverage/lcov/aggregate-<arch>.info      <- the report
 ```
 
-The arch label defaults to the target recorded by the plugin, and an empty
-`--toolchain-prefix` uses the host toolchain (for measuring host binaries under
-QEMU user-mode or a host-targeted image).
+Add `--html` for `coverage/html/index.html` as well (that needs `genhtml` from
+lcov installed; the `.info` does not).
+
+This is the command to use for a report. It is not a convenience wrapper over a
+pipeline you were otherwise expected to assemble: **every producer must be given
+the same path options or the covered and coverable sides derive different keys
+and the merged percentage is wrong**, and getting that right by hand, for every
+artifact, is the part that quietly goes wrong. Here they are given once.
+
+What it does that a shell loop would not:
+
+- **The arch label defaults to the target the plugin recorded**, and an empty
+  `--toolchain-prefix` uses the host toolchain (for measuring host binaries
+  under QEMU user-mode, or a host-targeted image).
+- **The denominator is cached per ELF**, keyed by the path options as well, so
+  a suite of 300 tests linking the same binary inventories it once — and a
+  re-run under a different `--source-root` cannot reuse an inventory built for
+  the old one.
+- **`objdump -d` runs once per ELF**, shared by the coverable and the branch
+  side rather than run by each.
+- **Artifacts are processed in parallel** (`--jobs`, defaulting to the CPU
+  count), with each artifact's output kept together rather than interleaved.
+- **A missing ELF is skipped with a warning, not a silent zero**, and a run in
+  which *every* artifact was skipped is an error rather than an empty `.info`
+  that reads as "this campaign covered nothing".
+- **`branches` exiting 2 — no profile for this ISA — degrades to line coverage
+  with a note**; any other failure fails the run, because silently dropping
+  branch data looks exactly like a genuine coverage regression.
+- **Slices cut by `tcgcov modmap` are analysed against their own object**, so a
+  directory of dynamically-loaded-object slices needs no per-object flags
+  (see [`docs/DYNAMIC-OBJECTS.md`](docs/DYNAMIC-OBJECTS.md)).
+
+**Where the ELF comes from.** Each artifact already carries it: the plugin's
+`elf=` argument is copied into `metadata.elf` at record time, which is why
+neither this command nor `tcgcov-report.sh` has ever needed a manifest. A slice
+cut by `tcgcov modmap` carries `module_file`/`module_section` instead and is
+used in preference, since a dynamically loaded object is symbolized against its
+own `.o` rather than the base image the slice was cut from. `--elf FILE`
+overrides all of that for every artifact — which is what you want when the
+binary that *ran* is not the binary to *symbolize against*: a stripped image
+(the DWARF lives in the unstripped copy), a source tree that has moved since
+the run, or a `dump --scrub-out` artifact whose paths were redacted. `--section`
+overrides the section the same way.
+
+With `--denominator dwarf --no-branches` it needs no target toolchain at all:
+that path reads `.debug_line` directly and never invokes `objdump` or
+`addr2line`.
+
+`tcgcov-report.sh` is still there and still works — it is now a thin wrapper
+that calls `tcgcov report --html`.
 
 ---
 

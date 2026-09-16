@@ -3,12 +3,14 @@
 import argparse
 
 from . import (addr2line, branches, contexts, coverable, lcov, merge, dump,
-               modmap, restrict, gap, rebase)
+               modmap, report, restrict, gap, rebase)
 from . import __version__
 
 # (subcommand name, module, short help). The module supplies add_arguments(p)
 # and run(args); `symbolize`/`coverable` are the covered/coverable producers.
 SUBCOMMANDS = [
+    ("report", report,
+     "the whole chain in one command: .cov artifacts -> aggregate LCOV .info"),
     ("dump", dump, "inspect a .cov artifact (header/metadata/addresses/edges)"),
     ("symbolize", addr2line, "covered .cov + ELF -> per-source-line JSONL"),
     ("coverable", coverable, "ELF -> coverable-line inventory JSONL"),

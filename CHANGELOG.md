@@ -7,6 +7,52 @@ young, both changed during the extraction, and [`docs/QEMU-BLOCK-SCANNING.md`](d
 proposes changing them further. Expect breaking changes between minor versions
 until 1.0.
 
+## Unreleased
+
+### Added
+
+- **`tcgcov report` — the whole chain in one command.** `.cov` artifacts to an
+  aggregate LCOV `.info`, running `symbolize`, `coverable`, `branches`, `lcov`
+  and `merge` with one set of options:
+
+  ```bash
+  tcgcov report --raw-dir coverage/raw --out-dir coverage \
+      --source-root /path/to/src --toolchain-prefix riscv64-unknown-elf-
+  ```
+
+  The pipeline itself is not new — `tcgcov-report.sh` has driven it all along —
+  but that script ships only in the sdist, is not installed by the wheel, and
+  needs bash. The subcommand is installed with the package and runs wherever
+  Python does. It also does what the script could not: the ELF each artifact
+  names is read without loading the artifact's records; the per-ELF denominator
+  is cached under a key that includes the path options, so a re-run with a
+  different `--source-root` cannot reuse an inventory built for the old one;
+  `objdump -d` runs once per ELF for both the coverable and the branch side;
+  and each parallel worker's output stays together instead of interleaving.
+  HTML is opt-in (`--html`), so a report no longer requires `genhtml`.
+
+  `--denominator dwarf --no-branches` needs no target toolchain at all.
+
+- **Slices from `tcgcov modmap` report with no per-object flags.** A slice
+  records the object it was cut from (`module_file`) and the section its
+  addresses are offsets into (`module_section`); `report` analyses it against
+  those rather than against the `elf` key it inherited from the base image —
+  which is the wrong binary for a dynamically loaded object. `--elf` and
+  `--section` still override, for a stripped image whose DWARF lives in an
+  unstripped copy, a moved tree, or a `dump --scrub-out` artifact.
+
+- **`format.read_metadata()`** reads an artifact's metadata by seeking to it,
+  instead of parsing every address record to reach the few hundred bytes of
+  JSON at the front. `parse_header()` takes an optional `total_size` so its
+  section-bounds checks still run when it is handed only the header.
+
+### Changed
+
+- **`tcgcov-report.sh` is now a wrapper around `tcgcov report --html`.** Every
+  option it accepted is an option of the subcommand and `JOBS` maps to
+  `--jobs`, so existing callers keep working and produce the same tree; there
+  is no longer a second implementation of the pipeline to keep in step.
+
 ## 0.2.0 — 2026-08-17
 
 ### Added
