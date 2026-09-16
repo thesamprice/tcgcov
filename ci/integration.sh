@@ -147,4 +147,56 @@ if len(lines) == len([n for n, c in lines.items() if c > 0]):
 sys.exit(1 if fail else 0)
 PY
 
+# The same measurement again, in ONE command. `tcgcov report` runs the very
+# subcommands the chain above ran by hand, so the only thing it can get wrong
+# is what it passes them -- and the way that shows up is a different set of
+# lines, which is precisely what is compared here. Branch records are extra
+# (the driver runs `branches` by default) and are not part of the comparison.
+mkdir -p raw
+cp cov.cov raw/
+run report --raw-dir raw --out-dir report --all-paths \
+  --toolchain-prefix "$TOOLPREFIX" --name integration --out report/agg.info
+
+test -s report/agg.info || { echo "FAIL: report wrote no aggregate"; exit 1; }
+test -s report/lcov/per-test/cov.info || \
+  { echo "FAIL: report wrote no per-test .info"; exit 1; }
+
+python3 - <<'PY'
+import sys
+
+def da(path):
+    """{(source file, line): count} from an LCOV .info."""
+    out, sf = {}, None
+    for raw in open(path):
+        if raw.startswith("SF:"):
+            sf = raw[3:].strip()
+        elif raw.startswith("DA:"):
+            n, _, c = raw[3:].strip().partition(",")
+            out[(sf, int(n))] = int(c)
+    return out
+
+manual, driven = da("agg.info"), da("report/agg.info")
+if not driven:
+    sys.exit("FAIL: the driven aggregate has no DA records")
+if manual != driven:
+    only_m = sorted(set(manual) - set(driven))
+    only_d = sorted(set(driven) - set(manual))
+    diff = sorted(k for k in set(manual) & set(driven)
+                  if manual[k] != driven[k])
+    print("FAIL: `tcgcov report` disagrees with the hand-run chain")
+    print(f"  only in the hand-run aggregate: {only_m[:10]}")
+    print(f"  only in the driven aggregate  : {only_d[:10]}")
+    print(f"  differing counts              : {diff[:10]}")
+    sys.exit(1)
+print(f"one-command driver matches the hand-run chain: "
+      f"{len(driven)} DA records")
+PY
+
+# A second run must reuse the cached per-ELF inventory rather than rebuild it,
+# and must still produce the same aggregate.
+run report --raw-dir raw --out-dir report --all-paths \
+  --toolchain-prefix "$TOOLPREFIX" --name integration --out report/agg2.info
+cmp -s report/agg.info report/agg2.info || \
+  { echo "FAIL: a repeated report run changed the aggregate"; exit 1; }
+
 echo "integration: PASS"

@@ -48,6 +48,7 @@ them, so a short header is a corrupt file, not an old one.
 """
 
 import json
+import os
 import struct
 
 MAGIC = b"TCGCOV1\0"
@@ -90,7 +91,7 @@ HEADER_FIELDS = (
 )
 
 
-def parse_header(data, path="<data>"):
+def parse_header(data, path="<data>", total_size=None):
     """Return the validated header as a dict, or raise ValueError.
 
     Everything the format guarantees is checked HERE, up front, because the
@@ -102,6 +103,10 @@ def parse_header(data, path="<data>"):
       * magic, endian (1 or 2), version (1), header_size (>= 88);
       * every (offset, size) section lies inside the file and after the header;
       * records_size / edges_size are whole multiples of their record stride.
+
+    `total_size` is the size of the whole file when `data` is only its leading
+    bytes -- read_metadata() below reads the header alone and must still get
+    the section-bounds checks against the real file size.
 
     After this returns, the unpackers below cannot read out of bounds.
     """
@@ -134,7 +139,7 @@ def parse_header(data, path="<data>"):
         raise ValueError(f"{path}: header_size {declared} is smaller than the "
                          f"{HEADER_SIZE}-byte TCGCOV1 header")
 
-    size = len(data)
+    size = len(data) if total_size is None else total_size
     for name in ("metadata", "records", "edges"):
         off, sz = hdr[name + "_offset"], hdr[name + "_size"]
         if not sz:
@@ -225,6 +230,28 @@ def unpack_ctx_edges(data, off, size, has_counts):
         return list(zip(flat[0::4], flat[1::4], flat[2::4], flat[3::4]))
     return [(c, s, d, 1) for c, s, d in
             zip(flat[0::3], flat[1::3], flat[2::3])]
+
+
+def read_metadata(path):
+    """Return just the metadata dict of a TCGCOV artifact.
+
+    A driver reads one field out of every artifact -- the ELF path, the target
+    name -- before doing any work, and an artifact is routinely tens of
+    megabytes of address records. read_full() would pull all of that in to
+    reach a few hundred bytes of JSON at the front, so this seeks instead.
+    """
+    with open(path, "rb") as f:
+        head = f.read(HEADER_SIZE)
+        hdr = parse_header(head, path, total_size=os.fstat(f.fileno()).st_size)
+        off, size = hdr["metadata_offset"], hdr["metadata_size"]
+        if not size:
+            return {}
+        f.seek(off)
+        raw = f.read(size)
+    if len(raw) != size:
+        raise ValueError(f"{path}: metadata section is truncated "
+                         f"({len(raw)} of {size} bytes)")
+    return json.loads(raw.decode("utf-8"))
 
 
 def read_full(path):
