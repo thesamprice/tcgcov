@@ -41,6 +41,11 @@ The split then turns one generation-tagged artifact into TCGCOV1 slices:
   never ran, so an object that was loaded but never exercised reports as 0%
   instead of being absent.
 
+Sections are symbolized by name (`addr2line -j`), so an object with several
+sections of one name (COMDAT groups, clang -fno-unique-section-names) gets a
+slice per section, each analysed against a copy of the object in which only
+that section carries the name (section_view).
+
 What could not be attributed is always reported: per unresolved object, the
 reason and the number of addresses dropped.
 """
@@ -113,6 +118,7 @@ def elf_parse(data, what="<elf>"):
             raise ElfError("%s: section headers run past end of file" % what)
         raw = [struct.unpack_from(fmt, data, e_shoff + i * e_shentsize)
                for i in range(e_shnum)]
+        hdrs = [e_shoff + i * e_shentsize for i in range(e_shnum)]
     except struct.error:
         raise ElfError("%s: truncated ELF section headers" % what)
     if e_shstrndx >= len(raw):
@@ -123,16 +129,43 @@ def elf_parse(data, what="<elf>"):
     shstr = data[so:so + ss]
 
     sections = []
-    for (nm, typ, flags, addr, off, size, link, _info, align, entsize) in raw:
+    for hdr, (nm, typ, flags, addr, off, size, link, _info, align,
+              entsize) in zip(hdrs, raw):
         if nm >= len(shstr) and nm:
             raise ElfError("%s: section name offset out of range" % what)
         end = shstr.find(b"\0", nm)
         name = shstr[nm:end if end != -1 else None].decode("utf-8", "replace")
         sections.append({"name": name, "type": typ, "flags": flags,
                          "addr": addr, "offset": off, "size": size,
-                         "align": align, "link": link, "entsize": entsize})
+                         "align": align, "link": link, "entsize": entsize,
+                         "sh_name": nm, "hdr": hdr})
     return {"class": 64 if is64 else 32, "little": ei_data == 1,
             "type": e_type, "sections": sections}
+
+
+def section_view(data, index):
+    """A copy of an ELF where section `index` alone has its name.
+
+    Every other section sharing that name is renamed by pointing its sh_name
+    one byte further into the string table (".text" -> "text"), so tools that
+    select sections by name -- `addr2line -j`, `objdump -d`'s section headers
+    -- see exactly one. Section numbers, contents and relocations are
+    untouched, and relocations (DWARF's included) refer to sections by
+    number, so the debug info still describes the right code.
+    """
+    elf = elf_parse(data)
+    secs = elf["sections"]
+    name = secs[index]["name"]
+    out = bytearray(data)
+    p = "<I" if elf["little"] else ">I"
+    for i, sec in enumerate(secs):
+        if i != index and sec["name"] == name:
+            struct.pack_into(p, out, sec["hdr"], sec["sh_name"] + 1)
+    names = [s["name"] for s in elf_parse(bytes(out))["sections"]]
+    if names.count(name) != 1:
+        raise ElfError("could not give section %d (%s) a unique name"
+                       % (index, name))
+    return bytes(out)
 
 
 def elf_symbols(path):
@@ -506,12 +539,13 @@ def _int(v):
 
 
 def object_windows(obj, cand=None):
-    """[(start, end, section_name, rap, ambiguous)] for one snapshot entry.
+    """[(start, end, section_name, rap, occurrence)] for one snapshot entry.
 
-    `ambiguous` marks a section whose name the object uses more than once
-    (COMDAT groups, a reused section attribute): a slice is symbolized by
-    section NAME, so two same-named sections cannot be told apart and must
-    not be merged onto one set of offsets.
+    `occurrence` is None for a section whose name is unique in the object,
+    else its 0-based rank among the sections sharing that name (COMDAT
+    groups, a reused section attribute, clang -fno-unique-section-names).
+    The loader appends sections in ELF index order, so rank k is the k-th
+    such section of the .o (see elf_index_for).
 
     Snapshots from this plugin version carry each section's offset from its
     region base, read from the loader's own section_detail. Older artifacts do
@@ -542,8 +576,46 @@ def object_windows(obj, cand=None):
             off = (running[rap] + a - 1) // a * a
             running[rap] = off + size
         start = bases[rap] + off
-        out.append((start, start + size, name, rap, names.count(name) > 1))
+        occ = None
+        if names.count(name) > 1:
+            occ = sum(1 for o in out if o[2] == name)
+        out.append((start, start + size, name, rap, occ))
     return out
+
+
+def elf_index_for(cand, name, occurrence, size):
+    """The .o section index of the occurrence-th loaded section `name`.
+
+    The loader places only ALLOC sections with a non-zero size, in index
+    order, so those are what the rank counts. None when the candidate does
+    not have that many, or the size disagrees -- then the sections cannot be
+    matched and their records are dropped rather than guessed.
+    """
+    try:
+        same = [(i, s) for i, s in enumerate(cand.sections())
+                if s["name"] == name and s["flags"] & _SHF_ALLOC
+                and s["size"]]
+    except (OSError, ElfError):
+        return None
+    if occurrence >= len(same) or same[occurrence][1]["size"] != size:
+        return None
+    return same[occurrence][0]
+
+
+def _write_once(path, produce):
+    """Write produce() to path unless it is there; return path.
+
+    Named by content hash by the callers, so an existing file is the same
+    bytes. Written via a temp file and rename, so a concurrent reader never
+    sees half of it.
+    """
+    if not os.path.isfile(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        with open(tmp, "wb") as f:
+            f.write(produce())
+        os.replace(tmp, path)
+    return path
 
 
 def _slug(text):
@@ -612,8 +684,12 @@ def split(cov_path, objpath, out_dir, obj_dir=None, no_verify=False,
                     "generation %s: the plugin stopped walking the loader's "
                     "object list at %d objects; later objects' executions are "
                     "reported as base image" % (g, len(objs)))
-            for s, e, sec, rap, dup in object_windows(obj, res.cand):
-                wins.append((s, e, res.cand, name, sec, rap, dup))
+            for s, e, sec, rap, occ in object_windows(obj, res.cand):
+                idx, lost = None, False
+                if occ is not None and res.cand is not None:
+                    idx = elf_index_for(res.cand, sec, occ, e - s)
+                    lost = idx is None
+                wins.append((s, e, res.cand, name, sec, rap, lost, idx))
         wins.sort(key=lambda w: w[0])
         for a, b in zip(wins, wins[1:]):
             if b[0] < a[1]:
@@ -645,15 +721,16 @@ def split(cov_path, objpath, out_dir, obj_dir=None, no_verify=False,
 
     base_recs, base_edges = {}, {}
     mods = {}            # (cand.label, section) -> {"recs", "edges", ...}
-    ambiguous = {}       # (object, section) -> records dropped
+    ambiguous = {}       # (object, section) -> records dropped (unmatched)
 
     def mod_slot(w):
-        key = (w[2].label, w[4])
+        # A same-named section is its own slot, keyed by its .o index.
+        key = (w[2].label, w[4], -1 if w[7] is None else w[7])
         slot = mods.get(key)
         if slot is None:
             slot = mods[key] = {"cand": w[2], "object": w[3], "section": w[4],
-                                "rap": w[5], "recs": {}, "edges": {},
-                                "gens": set()}
+                                "index": w[7], "rap": w[5], "recs": {},
+                                "edges": {}, "gens": set()}
         return slot
 
     for g, a, c in records:
@@ -705,47 +782,54 @@ def split(cov_path, objpath, out_dir, obj_dir=None, no_verify=False,
               record_type=rtype, edges_recorded=had_edges)
 
     modules = []
-    for (label, sec), slot in sorted(mods.items()):
+    for (label, sec, _idx), slot in sorted(mods.items()):
         if slot["rap"] != RAP_TEXT and not slot["recs"]:
             continue
         cand = slot["cand"]
-        if cand.member is None:
+        if slot["index"] is not None:
+            # One of several same-named sections: symbolize against a view
+            # of the object in which it alone carries the name.
+            path = _write_once(
+                os.path.join(obj_dir, "%s.%s.s%d.o" % (
+                    _slug(os.path.basename(cand.member or cand.path)),
+                    cand.md5()[:8], slot["index"])),
+                lambda: section_view(cand.data(), slot["index"]))
+        elif cand.member is None:
             path = cand.path
         else:
             # Archive member: extract it once so the toolchain can read it.
-            d = os.path.join(obj_dir, _slug(os.path.basename(cand.path))
-                             + "." + cand.md5()[:8])
-            os.makedirs(d, exist_ok=True)
-            path = os.path.join(d, os.path.basename(cand.member))
-            if not os.path.isfile(path):
-                tmp = "%s.%d.tmp" % (path, os.getpid())
-                with open(tmp, "wb") as f:
-                    f.write(cand.data())
-                os.replace(tmp, path)
+            path = _write_once(
+                os.path.join(obj_dir, _slug(os.path.basename(cand.path))
+                             + "." + cand.md5()[:8],
+                             os.path.basename(cand.member)),
+                cand.data)
         m = dict(common)
+        if slot["index"] is not None:
+            m["module_section_index"] = slot["index"]
         m.update({"module": slot["object"], "module_file": path,
                   "module_section": sec, "module_md5": cand.md5(),
                   "module_generations": sorted(slot["gens"]),
                   "rebased_to": "0x0"})
         # The md5 keeps two different files apart that share a basename
         # (/a/foo.o and /b/foo.o, or foo.o rebuilt between loads).
-        out = os.path.join(out_dir, "%s.%s.%s__%s.cov" % (
+        out = os.path.join(out_dir, "%s.%s.%s__%s%s.cov" % (
             stem, _slug(os.path.basename(slot["object"])), cand.md5()[:8],
-            _slug(sec)))
+            _slug(sec), "" if slot["index"] is None
+            else ".s%d" % slot["index"]))
         write_cov(out, m, sorted(slot["recs"].items()),
                   [(s, d, c) for (s, d), c in sorted(slot["edges"].items())],
                   record_type=rtype, edges_recorded=had_edges)
         modules.append({"object": slot["object"], "file": path,
                         "source": cand.label, "md5": cand.md5(),
-                        "section": sec, "out": out,
+                        "section": sec, "index": slot["index"], "out": out,
                         "records": len(slot["recs"]),
                         "generations": sorted(slot["gens"])})
 
     return {"base": base_out, "base_records": len(base_recs),
             "modules": modules, "unresolved": unresolved,
             "warnings": sorted(warnings) + [
-                "%s: it has more than one section named %s, which cannot be "
-                "told apart when symbolizing by name; %d records dropped"
+                "%s: its sections named %s could not be matched to the "
+                "object's (count or sizes differ); %d records dropped"
                 % (o, sec, n) for (o, sec), n in sorted(ambiguous.items())],
             "crossing_edges": crossing, "unmapped_gens": sorted(unmapped_gens)}
 
@@ -780,8 +864,10 @@ def print_summary(cov, summary, out=None):
                                              summary["base"]), file=out)
     for m in summary["modules"]:
         gens = m["generations"]
+        sec = m["section"] if m.get("index") is None else "%s[#%d]" % (
+            m["section"], m["index"])
         print("  %s:%s: %d addrs over %d generation(s) -> %s  [%s md5 %s]"
-              % (m["object"], m["section"], m["records"], len(gens),
+              % (m["object"], sec, m["records"], len(gens),
                  os.path.basename(m["out"]), m["source"], m["md5"][:12]),
               file=out)
     for name, u in sorted(summary["unresolved"].items()):

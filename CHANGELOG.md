@@ -9,6 +9,19 @@ until 1.0.
 
 ## Unreleased
 
+### Added
+
+- **Objects with several sections of one name are covered** (#13). COMDAT
+  groups and clang's `-fno-unique-section-names` give a `.o` many sections
+  called `.text`; `addr2line -j .text` can only ever pick the first, so
+  their records used to be dropped with a warning. Each such section is now
+  matched to its `.o` section by rank and size (the loader places sections in
+  index order) and symbolized against a copy of the object in which only it
+  carries the name — section numbers, contents and relocations untouched, so
+  the DWARF still describes it. Verified live: `pay_a.o` rebuilt with all four
+  functions in sections named `.text` reports exactly the lines and branches
+  of the normal build, where `main` dropped 10 records.
+
 ### Fixed
 
 - **`--section` on a relocatable object now means that section only** (#12).

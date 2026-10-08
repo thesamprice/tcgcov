@@ -63,6 +63,9 @@ with **no change to RTEMS** (the R2 hooks below are optional polish):
    (so four lifetimes of one object merge, while a different object that
    reused the range stays separate), loaded-but-unexecuted code reports 0%,
    and the base image gets the rest. `tcgcov rtl-split` does the split alone.
+   Several sections sharing one name (COMDAT, clang
+   `-fno-unique-section-names`) each get their own slice, analysed against a
+   copy of the object in which only that section carries the name.
 
    The lower-level route still exists: the map is the artifact's own
    `metadata.rtl_generations[<gen>]` (or a hand-written / GDB-captured JSON), and
