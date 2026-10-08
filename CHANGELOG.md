@@ -68,12 +68,23 @@ until 1.0.
   reported on `spin()`'s loop line. Both now read only the section's own
   `Disassembly of section` block (so one shared `--disasm` capture still
   serves every section) and resolve through `addr2line -j`.
-- **The DWARF denominator says why it cannot read a `.o`.** A relocatable
-  object's line table is unrelocated (every sequence at 0, RISC-V address
-  advances and string offsets left to relocations), so `--denominator dwarf`
-  on one now fails with that reason instead of "check --source-root", and
-  the objdump/DWARF cross-check is skipped for it rather than compared
-  against garbage.
+- **The DWARF denominator reads relocatable objects** (#18). A `.o`'s line
+  table is only correct after relocation: set_address operands and string
+  offsets are zero in place, and on RISC-V every address advance inside a
+  sequence is an `ADD16`/`SUB16` pair. `read_elf` now applies the
+  relocations of `.debug_line`, `.debug_info` and `.debug_str_offsets`
+  (RISC-V absolute/ADD/SUB/SET/SET6/SUB6/ULEB128; MicroBlaze, x86-64,
+  AArch64, ARM and i386 absolute; anything else is an error, never a guess),
+  records which section each sequence's set_address points into, keeps a
+  `.o`'s address-0 rows, and looks function names up per section.
+  `--denominator dwarf --section` therefore works on a `.o` with no target
+  toolchain, and the objdump/DWARF cross-check runs on `.o` files again.
+  Verified against binutils: on 14 real riscv and MicroBlaze objects every
+  (line, address) row equals `readelf --debug-dump=decodedline`'s; per
+  section the DWARF line set equals the objdump denominator on MicroBlaze
+  and at `-O0`, and is a superset at riscv `-O2` (several rows at one
+  address, which addr2line reports once). Three small fixtures with their
+  binutils-derived expectations are in `tests/data/rtl-reloc/`.
 
 ### Added
 

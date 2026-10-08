@@ -291,6 +291,7 @@ _MICROBLAZE_WIDTHS = {
     19: 8, 20: 4, 21: 4, 22: 4, 23: 8, 24: 8,  # GOTOFF_64/32 COPY TLS...
     25: 8, 26: 8, 27: 8, 28: 8, 29: 4, 30: 8,
     31: 8, 32: 4,                              # TEXTREL_64, TEXTREL_32_LO
+    33: 0,                                     # 32_NONE (relax marker)
 }
 _WIDTHS = {EM_RISCV: _RISCV_WIDTHS, EM_MICROBLAZE: _MICROBLAZE_WIDTHS,
            EM_MICROBLAZE_OLD: _MICROBLAZE_WIDTHS}

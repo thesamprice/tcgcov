@@ -128,7 +128,9 @@ class CoverableSectionTest(Fixture):
         self.assertEqual(sorted(r["line"] for r in self.records()),
                          [20, 22, 23, 25])
 
-    def test_dwarf_denominator_refuses_a_relocatable_object(self):
+    def test_dwarf_denominator_fails_loudly_on_an_unreadable_object(self):
+        # (The DWARF path reads real .o files since #18; see
+        # test_dwarf_reloc. This one is a bare header with no sections.)
         rc = coverable.main(["--elf", self.elf, "--all-paths",
                              "--denominator", "dwarf", "--section",
                              ".text.entry", "--out", self.out])

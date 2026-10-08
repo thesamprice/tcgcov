@@ -41,7 +41,7 @@ from collections import namedtuple
 
 __all__ = ["DwarfError", "LineRow", "ElfInfo", "FunctionIndex",
            "SUPPORTED_VERSIONS", "read_elf", "parse_line_section",
-           "iter_line_rows"]
+           "iter_line_rows", "iter_line_rows_by_section"]
 
 
 class DwarfError(RuntimeError):
@@ -56,7 +56,11 @@ class DwarfError(RuntimeError):
 # One row emitted by the line-number program. `file` is the resolved absolute
 # (or comp_dir-relative, if comp_dir is unknown) source path, or None when the
 # row's file index is not in the unit's file table.
-LineRow = namedtuple("LineRow", "address file line end_sequence is_stmt")
+# `section` is the ELF section index the row's sequence belongs to, known
+# only for a relocatable object (from the relocation on its set_address);
+# None otherwise.
+LineRow = namedtuple("LineRow", "address file line end_sequence is_stmt "
+                                "section", defaults=(None,))
 
 # Line-table versions this module implements. DWARF 5 changed the header
 # shape; 2/3/4 differ only in small ways (max_ops_per_insn appeared in 4).
@@ -203,7 +207,16 @@ class _Reader:
 # ELF
 # --------------------------------------------------------------------------
 
-ElfInfo = namedtuple("ElfInfo", "path sections little is64")
+# relocatable: ET_REL (a .o / .ko), whose debug sections have been relocated
+#   in `sections` by read_elf -- every code section starts at 0 there.
+# section_names: name per section index. section_addrs: (sh_addr, sh_size)
+#   per index. line_sections: .debug_line offset -> the section index an
+#   address operand there was relocated against (set_address -> section).
+# machine: e_machine.
+ElfInfo = namedtuple("ElfInfo", "path sections little is64 relocatable "
+                                "section_names section_addrs line_sections "
+                                "machine",
+                     defaults=(False, (), (), None, 0))
 
 
 def _string_at(table, offset):
@@ -256,6 +269,7 @@ def read_elf(path, wanted=_WANTED_SECTIONS):
     little = ei_data == 1
     prefix = "<" if little else ">"
 
+    e_type, e_machine = struct.unpack_from(prefix + "HH", data, 16)
     if is64:
         e_shoff = struct.unpack_from(prefix + "Q", data, 0x28)[0]
         e_shentsize, e_shnum, e_shstrndx = struct.unpack_from(
@@ -275,12 +289,15 @@ def read_elf(path, wanted=_WANTED_SECTIONS):
             raise DwarfError("%s: section header %d out of range"
                              % (path, index))
         if is64:
-            (sh_name, sh_type, sh_flags, _addr, sh_offset, sh_size) = \
-                struct.unpack_from(prefix + "IIQQQQ", data, off)
+            (sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size,
+             sh_link, sh_info) = struct.unpack_from(prefix + "IIQQQQII",
+                                                    data, off)
         else:
-            (sh_name, sh_type, sh_flags, _addr, sh_offset, sh_size) = \
-                struct.unpack_from(prefix + "IIIIII", data, off)
-        return sh_name, sh_type, sh_flags, sh_offset, sh_size
+            (sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size,
+             sh_link, sh_info) = struct.unpack_from(prefix + "IIIIIIII",
+                                                    data, off)
+        return (sh_name, sh_type, sh_flags, sh_offset, sh_size, sh_addr,
+                sh_link, sh_info)
 
     # e_shnum == 0 / e_shstrndx == SHN_XINDEX push the real values into
     # section 0. Rare, but produced by linkers on very large images.
@@ -294,19 +311,23 @@ def read_elf(path, wanted=_WANTED_SECTIONS):
     if e_shstrndx >= e_shnum:
         raise DwarfError("%s: bad section-name string table index" % path)
 
-    _n, _t, _f, str_off, str_size = shdr(e_shstrndx)
+    str_off, str_size = shdr(e_shstrndx)[3:5]
     shstrtab = data[str_off:str_off + str_size]
 
     wanted = set(wanted)
     # ".zdebug_x" is the legacy compressed spelling of ".debug_x".
     zwanted = {".z" + n[1:]: n for n in wanted if n.startswith(".debug")}
     sections = {}
+    headers = [shdr(i) for i in range(e_shnum)]
+    names = [_string_at(shstrtab, h[0]) for h in headers]
+    index_of = {}
     for i in range(e_shnum):
-        sh_name, sh_type, sh_flags, sh_offset, sh_size = shdr(i)
-        name = _string_at(shstrtab, sh_name)
+        sh_name, sh_type, sh_flags, sh_offset, sh_size = headers[i][:5]
+        name = names[i]
         key = name if name in wanted else zwanted.get(name)
         if key is None or sh_type == _SHT_NOBITS:
             continue
+        index_of[key] = i
         raw = data[sh_offset:sh_offset + sh_size]
         if sh_flags & _SHF_COMPRESSED or name.startswith(".zdebug"):
             try:
@@ -315,7 +336,178 @@ def read_elf(path, wanted=_WANTED_SECTIONS):
                 raise DwarfError("%s: %s: decompression failed (%s)"
                                  % (path, name, e))
         sections[key] = raw
-    return ElfInfo(path, sections, little, is64)
+
+    line_sections = None
+    relocatable = e_type == _ET_REL
+    if relocatable:
+        line_sections = _relocate_debug(path, data, headers, names, index_of,
+                                        sections, little, is64, e_machine)
+    return ElfInfo(path, sections, little, is64, relocatable, tuple(names),
+                   tuple((h[5], h[4]) for h in headers), line_sections,
+                   e_machine)
+
+
+# --------------------------------------------------------------------------
+# Relocations (relocatable objects only)
+# --------------------------------------------------------------------------
+#
+# A .o's debug sections are incomplete until relocated: addresses in the line
+# table (DW_LNE_set_address) and string offsets (DW_FORM_strp/line_strp) are
+# zero in place, and on RISC-V every address advance inside a sequence is an
+# ADD/SUB relocation pair because of linker relaxation. Section symbols and
+# local labels in a .o are section-relative, so applying S + A yields offsets
+# into the target section -- exactly the 0-based addresses `addr2line -j`
+# works in. Only the types debug sections use are implemented; any other is
+# an error, never a guess.
+
+_ET_REL = 1
+_SHT_RELA, _SHT_REL = 4, 9
+_SHF_ALLOC_FLAG = 0x2
+_RELOCATED = (".debug_line", ".debug_info", ".debug_str_offsets")
+
+_ABS, _ADD, _SUB, _SET, _SET6, _SUB6, _SET_ULEB, _SUB_ULEB = range(8)
+# e_machine -> {r_type: (operation, width)}; width in bytes.
+_RELOC_OPS = {
+    243: {                                        # RISC-V
+        0: None, 1: (_ABS, 4), 2: (_ABS, 8),
+        33: (_ADD, 1), 34: (_ADD, 2), 35: (_ADD, 4), 36: (_ADD, 8),
+        37: (_SUB, 1), 38: (_SUB, 2), 39: (_SUB, 4), 40: (_SUB, 8),
+        43: None, 51: None,                       # ALIGN, RELAX markers
+        52: (_SUB6, 1), 53: (_SET6, 1), 54: (_SET, 1), 55: (_SET, 2),
+        56: (_SET, 4), 60: (_SET_ULEB, 0), 61: (_SUB_ULEB, 0),
+    },
+    # MicroBlaze: 9/33 are 64_NONE/32_NONE, relaxation markers that write
+    # nothing.
+    189: {0: None, 1: (_ABS, 4), 9: None, 33: None},
+    0xBAAB: {0: None, 1: (_ABS, 4), 9: None, 33: None},
+    62: {0: None, 1: (_ABS, 8), 10: (_ABS, 4), 11: (_ABS, 4)},  # x86-64
+    183: {0: None, 257: (_ABS, 8), 258: (_ABS, 4), 259: (_ABS, 2)},  # AArch64
+    40: {0: None, 2: (_ABS, 4)},                  # ARM (REL)
+    3: {0: None, 1: (_ABS, 4)},                   # i386 (REL)
+}
+
+
+def _uleb_len(buf, off):
+    n = 1
+    while off + n - 1 < len(buf) and buf[off + n - 1] & 0x80:
+        n += 1
+    return n
+
+
+def _read_uleb(buf, off, n):
+    v = 0
+    for i in range(n):
+        v |= (buf[off + i] & 0x7F) << (7 * i)
+    return v
+
+
+def _write_uleb_fixed(buf, off, n, value):
+    """Encode `value` in exactly n bytes (padding with continuation bits)."""
+    for i in range(n):
+        byte = value & 0x7F
+        value >>= 7
+        if i < n - 1:
+            byte |= 0x80
+        buf[off + i] = byte
+
+
+def _relocate_debug(path, data, headers, names, index_of, sections, little,
+                    is64, machine):
+    """Apply the relocations of the debug sections in `sections`, in place.
+
+    Returns {.debug_line offset: section index} for the absolute
+    relocations in .debug_line whose symbol lives in an allocated section:
+    the sections the line table's set_address operands point into.
+    """
+    prefix = "<" if little else ">"
+    symtab_cache = {}
+
+    def symbols(link):
+        if link not in symtab_cache:
+            off, size = headers[link][3], headers[link][4]
+            ent = 24 if is64 else 16
+            out = []
+            for o in range(off, off + size - ent + 1, ent):
+                if is64:
+                    _n, _i, _o, shndx, value, _s = struct.unpack_from(
+                        prefix + "IBBHQQ", data, o)
+                else:
+                    _n, value, _s, _i, _o, shndx = struct.unpack_from(
+                        prefix + "IIIBBH", data, o)
+                out.append((value, shndx))
+            symtab_cache[link] = out
+        return symtab_cache[link]
+
+    ops = _RELOC_OPS.get(machine)
+    line_sections = {}
+    for key in _RELOCATED:
+        target = index_of.get(key)
+        if target is None:
+            continue
+        relocs = [h for h in headers
+                  if h[1] in (_SHT_RELA, _SHT_REL) and h[7] == target]
+        if not relocs:
+            continue
+        if ops is None:
+            raise DwarfError("%s: relocatable object for ELF machine %d, "
+                             "whose relocations this reader does not know"
+                             % (path, machine))
+        buf = bytearray(sections[key])
+        for rh in relocs:
+            rela = rh[1] == _SHT_RELA
+            ent = (24 if is64 else 12) if rela else (16 if is64 else 8)
+            syms = symbols(rh[6])
+            for o in range(rh[3], rh[3] + rh[4] - ent + 1, ent):
+                if is64:
+                    r_off, r_info = struct.unpack_from(prefix + "QQ", data, o)
+                    r_sym, r_type = r_info >> 32, r_info & 0xFFFFFFFF
+                    addend = (struct.unpack_from(prefix + "q", data, o + 16)[0]
+                              if rela else None)
+                else:
+                    r_off, r_info = struct.unpack_from(prefix + "II", data, o)
+                    r_sym, r_type = r_info >> 8, r_info & 0xFF
+                    addend = (struct.unpack_from(prefix + "i", data, o + 8)[0]
+                              if rela else None)
+                if r_type not in ops:
+                    raise DwarfError(
+                        "%s: %s: relocation type %d for ELF machine %d is not "
+                        "supported" % (path, key, r_type, machine))
+                op = ops[r_type]
+                if op is None:
+                    continue
+                kind, width = op
+                value, shndx = syms[r_sym] if r_sym < len(syms) else (0, 0)
+                fmt = prefix + {1: "B", 2: "H", 4: "I", 8: "Q"}.get(width, "")
+                if kind in (_SET_ULEB, _SUB_ULEB):
+                    n = _uleb_len(buf, r_off)
+                    cur = _read_uleb(buf, r_off, n)
+                    a = addend or 0
+                    new = value + a if kind == _SET_ULEB else cur - value - a
+                    _write_uleb_fixed(buf, r_off, n, new & ((1 << (7 * n)) - 1))
+                    continue
+                if r_off + width > len(buf):
+                    raise DwarfError("%s: %s: relocation at 0x%x past the "
+                                     "section" % (path, key, r_off))
+                cur = struct.unpack_from(fmt, buf, r_off)[0]
+                a = cur if addend is None else addend
+                mask = (1 << (8 * width)) - 1
+                if kind == _ABS or kind == _SET:
+                    new = value + a
+                elif kind == _ADD:
+                    new = cur + value + a
+                elif kind == _SUB:
+                    new = cur - value - a
+                elif kind == _SET6:
+                    new = (cur & 0xC0) | ((value + a) & 0x3F)
+                else:                                   # _SUB6
+                    new = (cur & 0xC0) | ((cur - value - a) & 0x3F)
+                struct.pack_into(fmt, buf, r_off, new & mask)
+                if key == ".debug_line" and kind == _ABS and \
+                        0 < shndx < len(headers) and \
+                        headers[shndx][2] & _SHF_ALLOC_FLAG:
+                    line_sections[r_off] = shndx
+        sections[key] = bytes(buf)
+    return line_sections
 
 
 # --------------------------------------------------------------------------
@@ -340,21 +532,38 @@ class FunctionIndex:
         funcs = []
         for off in range(0, len(symtab) - entsize + 1, entsize):
             if elf.is64:
-                st_name, st_info, _other, _shndx, st_value, st_size = \
+                st_name, st_info, _other, shndx, st_value, st_size = \
                     struct.unpack_from(prefix + "IBBHQQ", symtab, off)
             else:
-                st_name, st_value, st_size, st_info, _other, _shndx = \
+                st_name, st_value, st_size, st_info, _other, shndx = \
                     struct.unpack_from(prefix + "IIIBBH", symtab, off)
             if st_info & 0xF != 2:          # STT_FUNC
                 continue
             name = _string_at(strtab, st_name)
             if name:
-                funcs.append((st_value, st_size, name))
-        funcs.sort(key=lambda f: (f[0], -f[1]))
-        self._starts = [f[0] for f in funcs]
-        self._funcs = funcs
+                funcs.append((st_value, st_size, name, shndx))
+        # In a relocatable object every section's symbols start at 0, so a
+        # function is looked up within its own section.
+        self._relocatable = getattr(elf, "relocatable", False)
+        self._by_section = {}
+        for f in funcs:
+            key = f[3] if self._relocatable else None
+            self._by_section.setdefault(key, []).append(f[:3])
+        for lst in self._by_section.values():
+            lst.sort(key=lambda f: (f[0], -f[1]))
+        self._funcs = self._by_section.get(None, [])
+        self._starts = [f[0] for f in self._funcs]
 
-    def at(self, address):
+    def at(self, address, section=None):
+        """Return the function containing `address` (in `section`, for a
+        relocatable object), or "" if none does."""
+        if self._relocatable:
+            funcs = self._by_section.get(section, [])
+            return self._lookup(funcs, [f[0] for f in funcs], address)
+        return self._lookup(self._funcs, self._starts, address)
+
+    @staticmethod
+    def _lookup(funcs, starts, address):
         """Return the function containing `address`, or "" if none does.
 
         Only symbols starting at the same address are considered as
@@ -362,12 +571,12 @@ class FunctionIndex:
         emits alongside a sized symbol); a symbol that does not span the
         address is not stretched to reach it.
         """
-        i = bisect_right(self._starts, address) - 1
+        i = bisect_right(starts, address) - 1
         if i < 0:
             return ""
-        start = self._starts[i]
-        while i >= 0 and self._starts[i] == start:
-            _s, size, name = self._funcs[i]
+        start = starts[i]
+        while i >= 0 and starts[i] == start:
+            _s, size, name = funcs[i]
             if (size and address < start + size) or \
                     (not size and address == start):
                 return name
@@ -742,9 +951,15 @@ def _resolve_file(h, index, cache):
     return path
 
 
-def _run_program(r, h):
-    """Execute one unit's line-number program, yielding every row it emits."""
+def _run_program(r, h, line_sections=None):
+    """Execute one unit's line-number program, yielding every row it emits.
+
+    line_sections (relocatable objects) maps a set_address operand's offset
+    to the section it addresses; rows carry it until the sequence ends.
+    """
     file_cache = {}
+    line_sections = line_sections or {}
+    section = None
     address = 0
     op_index = 0
     file_index = 1
@@ -761,7 +976,8 @@ def _run_program(r, h):
             op_index = total % h.max_ops
 
     def reset():
-        nonlocal address, op_index, file_index, line, is_stmt
+        nonlocal address, op_index, file_index, line, is_stmt, section
+        section = None
         address = 0
         op_index = 0
         file_index = 1
@@ -776,7 +992,7 @@ def _run_program(r, h):
             advance(adjusted // h.line_range)
             line += h.line_base + (adjusted % h.line_range)
             yield LineRow(address, _resolve_file(h, file_index, file_cache),
-                          line, False, is_stmt)
+                          line, False, is_stmt, section)
             continue
 
         if opcode == 0:                      # extended opcode
@@ -788,11 +1004,12 @@ def _run_program(r, h):
             if sub == _LNE_END_SEQUENCE:
                 yield LineRow(address,
                               _resolve_file(h, file_index, file_cache),
-                              line, True, is_stmt)
+                              line, True, is_stmt, section)
                 reset()
             elif sub == _LNE_SET_ADDRESS:
                 # The operand width comes from the operation's own length, so
                 # 4- and 8-byte targets both work without being told which.
+                section = line_sections.get(r.pos, section)
                 address = r.uint(max(length - 1, 0))
                 op_index = 0
             elif sub == _LNE_DEFINE_FILE:    # DWARF <= 4 only
@@ -810,7 +1027,7 @@ def _run_program(r, h):
         # Standard opcodes.
         if opcode == 1:                      # DW_LNS_copy
             yield LineRow(address, _resolve_file(h, file_index, file_cache),
-                          line, False, is_stmt)
+                          line, False, is_stmt, section)
         elif opcode == 2:                    # DW_LNS_advance_pc
             advance(r.uleb())
         elif opcode == 3:                    # DW_LNS_advance_line
@@ -841,7 +1058,8 @@ def _run_program(r, h):
                 r.uleb()
 
 
-def parse_line_section(data, little=True, sections=None, metadata=None):
+def parse_line_section(data, little=True, sections=None, metadata=None,
+                       line_sections=None):
     """Yield every LineRow in a `.debug_line` section, end_sequence included.
 
     `sections` supplies the string sections a DWARF 5 file table may reference
@@ -859,13 +1077,25 @@ def parse_line_section(data, little=True, sections=None, metadata=None):
             break
         h = _parse_header(r, unit_offset, little, sections, metadata)
         r.pos = h.program_start
-        for row in _run_program(r, h):
+        for row in _run_program(r, h, line_sections):
             yield row
         r.pos = h.unit_end
 
 
-def iter_line_rows(elf):
-    """Yield (address, file, line) for every real code row in an ELF.
+def iter_line_rows(elf, section=None):
+    """Yield (address, file, line) for every real code row; see below."""
+    for address, path, line, _sec in iter_line_rows_by_section(elf, section):
+        yield address, path, line
+
+
+def iter_line_rows_by_section(elf, section=None):
+    """Yield (address, file, line, section) for every real code row in an ELF.
+
+    With `section`, only that section's rows, its addresses 0-based offsets
+    into it -- the space `addr2line -j SECTION` works in. In a relocatable
+    object each row's section comes from its sequence's relocated
+    set_address; in a linked image, from the section's address range. The
+    fourth field is the row's section index (relocatable objects; else None).
 
     `elf` is a path or an ElfInfo. Rows are filtered exactly the way the
     coverable denominator needs them:
@@ -873,7 +1103,8 @@ def iter_line_rows(elf):
       * `end_sequence` rows are dropped -- they mark the byte AFTER the last
         instruction of a sequence, so their address belongs to no instruction.
       * address 0 rows are dropped -- that is what a garbage-collected or
-        unallocated section relocates to, not real code.
+        unallocated section relocates to, not real code. Not in a
+        relocatable object, where every section's first instruction is at 0.
       * LINE 0 rows are dropped. DWARF line 0 means "compiler-generated code
         belonging to no source line", and `addr2line` renders it as `file:?`,
         which the covered side already discards (its line regex needs a
@@ -889,8 +1120,27 @@ def iter_line_rows(elf):
         raise DwarfError("%s: no .debug_line section (build with -g?)"
                          % elf.path)
     metadata = _unit_metadata(elf)
-    for row in parse_line_section(data, elf.little, elf.sections, metadata):
-        if row.end_sequence or not row.address or not row.line \
-                or row.file is None:
+    want, base, end = None, 0, None
+    if section is not None:
+        if section not in elf.section_names:
+            raise DwarfError("%s: no section %s" % (elf.path, section))
+        if elf.section_names.count(section) > 1:
+            raise DwarfError("%s: several sections are named %s"
+                             % (elf.path, section))
+        want = elf.section_names.index(section)
+        if not elf.relocatable:
+            base, size = elf.section_addrs[want]
+            end = base + size
+    for row in parse_line_section(data, elf.little, elf.sections, metadata,
+                                  elf.line_sections):
+        if row.end_sequence or not row.line or row.file is None:
             continue
-        yield row.address, row.file, row.line
+        if not row.address and not elf.relocatable:
+            continue
+        if want is not None:
+            if elf.relocatable:
+                if row.section != want:
+                    continue
+            elif not base <= row.address < end:
+                continue
+        yield row.address - base, row.file, row.line, row.section

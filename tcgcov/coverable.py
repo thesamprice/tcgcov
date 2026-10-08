@@ -15,8 +15,9 @@ Two denominator sources, selected with --denominator:
 
   dwarf    Read `.debug_line` directly (tcgcov.dwarfline, pure stdlib): the
            line-number program already maps code addresses to (file, line) for
-           all code, executed or not. No objdump, no addr2line, no
-           architecture knowledge. Slightly less conservative -- a line-table
+           all code, executed or not. No objdump, no addr2line. A relocatable
+           object (.o, .ko) is relocated first, and --section keeps the rows of
+           that section's sequences. Slightly less conservative -- a line-table
            row is not proof that an instruction was emitted at that address --
            and it does not see inlined CALL SITES, which addr2line -i reports
            as extra frames. On a real picolibc image the DWARF denominator was
@@ -149,41 +150,22 @@ def dwarf_inventory(args, opts):
     from `.symtab` (the line table has none); they only feed LCOV FN records,
     never the line denominator.
     """
-    if getattr(args, "section", None) or _is_relocatable(args.elf):
-        # A .o's line table is unrelocated: every sequence starts at 0,
-        # address advances (RISC-V ADD/SUB pairs) and string offsets are
-        # filled in by relocations this reader does not apply, and nothing
-        # says which section a sequence belongs to. Its rows would be wrong
-        # or empty, so say why instead of "check --source-root".
-        raise RuntimeError(
-            f"{args.elf}: the DWARF denominator does not support relocatable "
-            f"objects or --section (the line table needs relocating); use the "
-            f"objdump denominator")
+    # A relocatable object (.o, .ko) is relocated by read_elf, and its rows
+    # carry the section their sequence addresses; --section keeps one
+    # section's rows, as 0-based offsets the way `addr2line -j` reports them.
     elf = dwarfline.read_elf(args.elf)
     functions = dwarfline.FunctionIndex(elf)
     seen = {}
     rows = 0
-    for addr, path, line in dwarfline.iter_line_rows(elf):
+    for addr, path, line, sec in dwarfline.iter_line_rows_by_section(
+            elf, getattr(args, "section", None)):
         rows += 1
         norm = normalize_path(path, opts.source_root, opts.markers, opts.roots,
                               opts.excludes, opts.all_paths)
         if norm is None:
             continue
-        seen.setdefault((norm, line, functions.at(addr)), addr)
+        seen.setdefault((norm, line, functions.at(addr, sec)), addr)
     return seen, rows
-
-
-def _is_relocatable(path):
-    """True for an ET_REL object (a .o); False when it cannot be read."""
-    try:
-        with open(path, "rb") as f:
-            head = f.read(18)
-    except OSError:
-        return False
-    if len(head) < 18 or head[:4] != b"\x7fELF":
-        return False
-    order = "little" if head[5] == 1 else "big"
-    return int.from_bytes(head[16:18], order) == 1
 
 
 def cross_check_messages(objdump_seen, dwarf_seen):
@@ -302,11 +284,7 @@ def run(args):
             return 1
         used, detail = "dwarf", f"{rows} line-table rows"
 
-    # Nothing to cross-check a relocatable object against: the DWARF side
-    # cannot read one (see dwarf_inventory).
-    if used == "objdump" and getattr(args, "cross_check", True) \
-            and not getattr(args, "section", None) \
-            and not _is_relocatable(args.elf):
+    if used == "objdump" and getattr(args, "cross_check", True):
         try:
             other, _rows = dwarf_inventory(args, opts)
         except (OSError, RuntimeError) as e:
