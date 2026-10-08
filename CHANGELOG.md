@@ -41,6 +41,39 @@ until 1.0.
   `--section` still override, for a stripped image whose DWARF lives in an
   unstripped copy, a moved tree, or a `dump --scrub-out` artifact.
 
+- **RTEMS loaded objects found on a search path (`--obj-path`).** `report`
+  now splits an artifact recorded in the plugin's RTEMS loader mode by
+  itself: base-image addresses go to the base ELF, and each loaded object's
+  addresses go to its own `.o`, rebased per section and summed over every
+  generation it was live. Objects are found the way GDB's
+  `solib-search-path` finds shared libraries: give one or more directories
+  (repeatable, or `:`-separated), searched recursively by the loaded name's
+  relative path, then its basename, including members of `*.a` archives.
+  Each candidate is **verified** against the sections the target actually
+  loaded (name and size, standing in for the build-id a `.o` lacks); a
+  mismatching or ambiguous match fails the run, an absent one is a warning
+  with the count of records dropped. `--obj-suffix .debug` finds unstripped
+  host twins (`foo.o.debug`, `foo.debug`) of objects the target loaded
+  stripped, and the copy with DWARF wins. Loaded but never executed code
+  reports as 0% rather than being absent. The resolved file and its md5 are
+  recorded in each slice (`module_file`, `module_md5`).
+
+  ```bash
+  tcgcov report run.cov --out-dir cov --obj-path build/riscv/mbv/testsuites \
+      --toolchain-prefix riscv-rtems7-
+  ```
+
+  `tcgcov rtl-split` does just the split; **`tcgcov rtems-args IMAGE`** prints
+  the `rtl_state=…,rtl_debug=…[,rtl_load=…],elf=…` plugin options from the
+  base image's symbol table, replacing the hand-run `nm`.
+
+- **The plugin records each loaded section's true offset** (`offset` in
+  `rtl_generations`, read from the loader's `section_detail`). Host-side
+  placement no longer assumes sections are packed: const data with 8-byte
+  alignment really is padded (dl09's `.srodata.cst8` sits at 472, not 468).
+  Older artifacts without it are laid out the loader's way, aligning each
+  section to the resolved object's `sh_addralign`.
+
 - **`format.read_metadata()`** reads an artifact's metadata by seeking to it,
   instead of parsing every address record to reach the few hundred bytes of
   JSON at the front. `parse_header()` takes an optional `total_size` so its

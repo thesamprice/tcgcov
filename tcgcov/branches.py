@@ -32,7 +32,7 @@ import json
 import sys
 
 from . import cfg
-from .format import read_all
+from .format import FLAG_HAS_EDGES, read_all, read_full
 from .symbolize import iter_covered_lines
 from .cliargs import add_symbolize_args
 from .paths import path_options
@@ -183,7 +183,9 @@ def run(args):
             print(f"error: {ex}", file=sys.stderr)
             return 1
         meta = meta or m
-        if not e:
+        if not e and not read_full(path)[1]["flags"] & FLAG_HAS_EDGES:
+            # An edges=on slice can legitimately hold none of its own (a
+            # straight-line function); only a run without edges is suspect.
             print(f"warning: {path} has no EDGE records (plugin run with "
                   f"edges=off?)", file=sys.stderr)
         edges.extend(e)

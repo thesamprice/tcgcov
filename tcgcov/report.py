@@ -15,6 +15,11 @@ A slice cut by `tcgcov modmap` carries its own object and section instead, and
 is analysed against those, so a directory of dynamically-loaded-object slices
 reports with no per-object flags either.
 
+An artifact recorded in the plugin's RTEMS loader mode is split first (see
+`tcgcov rtl-split`): its base-image addresses are reported against the base
+ELF, and its dynamically loaded objects against their own `.o` files, found
+on --obj-path and checked against the sections the target actually loaded.
+
 The path-selection options are the reason this command exists rather than a
 README recipe: the covered and the coverable side must be normalized
 IDENTICALLY or the join in `lcov` silently compares two different key spaces
@@ -43,6 +48,7 @@ from . import cfg
 from . import coverable as coverable_mod
 from . import lcov as lcov_mod
 from . import merge as merge_mod
+from . import rtl as rtl_mod
 from .cliargs import add_symbolize_args
 from .coverable import DENOMINATOR_SOURCES
 from .format import read_metadata
@@ -75,6 +81,7 @@ def add_arguments(parser):
                              "`dump --scrub-out` copy whose paths were "
                              "redacted")
     add_symbolize_args(parser)
+    rtl_mod.add_obj_path_args(parser)
     parser.add_argument("--objdump", help="explicit objdump path")
     parser.add_argument("--denominator", choices=DENOMINATOR_SOURCES,
                         default="auto",
@@ -216,6 +223,10 @@ def _target_of(args, meta):
     of. Preferring the module keys is what lets a directory of slices be
     reported with no per-object flags at all; --elf/--section still win.
     """
+    if meta.get("rtl_split_from") and meta.get("module_file"):
+        # Cut by this run's RTEMS split: the object was resolved and verified
+        # on --obj-path, and --elf/--section describe the base image.
+        return meta["module_file"], meta.get("module_section") or ""
     elf = args.elf or meta.get("module_file") or meta.get("elf", "")
     section = args.section or meta.get("module_section") or ""
     return elf, section
@@ -458,6 +469,48 @@ def _run_all(covs, run, jobs):
     return outcomes
 
 
+def _split_rtl(args, covs):
+    """Replace each RTEMS loader-generation artifact by its split slices.
+
+    The base-image slice and every per-object slice then run through the
+    ordinary per-artifact pipeline. An object that is on --obj-path but does
+    not match what the target loaded is an error (it would be reported
+    against the wrong source); one that is simply absent is a warning.
+    """
+    objpath = None
+    if args.obj_path:
+        objpath = rtl_mod.ObjectPath(rtl_mod.split_path_args(args.obj_path),
+                                     args.obj_suffix)
+    out, conflicts, missing = [], 0, 0
+    names = _base_names(covs)
+    for cov in covs:
+        if not rtl_mod.is_rtl_artifact(read_metadata(cov)):
+            out.append(cov)
+            continue
+        summary = rtl_mod.split(
+            cov, objpath, os.path.join(args.out_dir, "rtl", names[cov]),
+            obj_dir=os.path.join(args.out_dir, "rtl", "objs"),
+            no_verify=args.obj_no_verify, stem=names[cov])
+        rtl_mod.print_summary(cov, summary)
+        for u in summary["unresolved"].values():
+            if u["kind"] == "conflict":
+                conflicts += 1
+            else:
+                missing += 1
+        out.append(summary["base"])
+        out += [m["out"] for m in summary["modules"]]
+    if missing and not args.obj_path:
+        print("note: loaded-object coverage was not attributed; pass "
+              "--obj-path DIR with the host copies of the loaded .o files",
+              file=sys.stderr)
+    if conflicts:
+        raise ValueError("%d loaded object(s) matched no file on --obj-path "
+                         "consistently (see above); fix the path, or pass "
+                         "--obj-no-verify to accept the first candidate"
+                         % conflicts)
+    return out
+
+
 def _genhtml(args, agg, branch_coverage):
     """Render the aggregate, from the source root so relative SF paths resolve."""
     html_dir = args.html or os.path.join(args.out_dir, "html")
@@ -491,6 +544,12 @@ def run(args):
     if not covs:
         where = ", ".join(args.raw_dir) or "the arguments"
         print("error: no .cov artifacts in %s" % where, file=sys.stderr)
+        return 1
+
+    try:
+        covs = _split_rtl(args, covs)
+    except (OSError, ValueError) as e:
+        print("error: %s" % e, file=sys.stderr)
         return 1
 
     # Default the arch label to the target the plugin recorded.

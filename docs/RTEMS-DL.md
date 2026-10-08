@@ -19,18 +19,18 @@
 Three cooperating pieces turn `dlopen`'d RTEMS code into per-source coverage,
 with **no change to RTEMS** (the R2 hooks below are optional polish):
 
-1. **The plugin watches the loader.** Give it the base image's loader symbols
-   (from `nm` of the ELF):
+1. **The plugin watches the loader.** Give it the base image's loader symbols;
+   `tcgcov rtems-args` reads them from the ELF:
 
    ```
-   -plugin libtcgcov.so,out=run.cov,mode=tb,edges=on,\
-           rtl_state=0x<&_rtld_debug_state>,rtl_debug=0x<&_rtld_debug>
+   -plugin libtcgcov.so,out=run.cov,mode=tb,edges=on,$(tcgcov rtems-args dl09.exe)
+   # = rtl_state=0x<&_rtld_debug_state>,rtl_debug=0x<&_rtld_debug>,elf=dl09.exe
    ```
 
    An exec callback on `_rtld_debug_state()` reads `r_debug.r_state`; on each
    `RT_CONSISTENT` (a completed `dlopen`/`dlclose`) it **bumps a generation
    counter** and **snapshots the `link_map` chain** — every loaded object's
-   name and per-section runtime bases — into the artifact's own metadata
+   name, region bases and each section's offset — into the artifact's own metadata
    (`rtl_generations`). Every coverage record is tagged with the generation in
    force when it executed (`ctx_kind: "loader-generation"`). Needs
    `qemu_plugin_read_memory_vaddr` (plugin API v4). Optionally add
@@ -38,8 +38,29 @@ with **no change to RTEMS** (the R2 hooks below are optional polish):
    attribute code that runs *inside* `dlopen` — a constructor — which the
    `RT_CONSISTENT` notification alone reports too late.
 
-2. **The host slices by the module map.** The map is the artifact's own
-   `metadata.rtl_generations[<gen>]` (or a hand-written / GDB-captured JSON).
+2. **The host finds each object and slices by the map — one command:**
+
+   ```
+   tcgcov report run.cov --out-dir cov --obj-path build/testsuites[:more]
+   ```
+
+   `--obj-path` works like GDB's `solib-search-path`: directories searched
+   recursively for the loaded name (relative path first, then basename),
+   including `*.a` archive members, since libdl records only the member name.
+   Every candidate is checked against the loader's own section table (each
+   placed section must exist with the same size, the stand-in for the
+   build-id a `.o` lacks), so a stale rebuilt `.o` is refused, not
+   symbolized against the wrong lines. Two different matching files are an
+   error; an absent object is a warning that counts what was dropped. When the
+   target loads stripped objects, the copy with DWARF is preferred, and
+   `--obj-suffix .debug` finds a twin named `foo.o.debug` or `foo.debug`.
+   Per object and section, every generation's records are rebased and summed
+   (so four lifetimes of one object merge, while a different object that
+   reused the range stays separate), loaded-but-unexecuted code reports 0%,
+   and the base image gets the rest. `tcgcov rtl-split` does the split alone.
+
+   The lower-level route still exists: the map is the artifact's own
+   `metadata.rtl_generations[<gen>]` (or a hand-written / GDB-captured JSON), and
    `tcgcov modmap` cuts one `TCGCOV1` file per `(object, section)`, **rebasing**
    each address from its runtime placement to the section's link-time offset,
    and refuses overlapping windows loudly (one map has no time axis). `--ctx
@@ -50,8 +71,9 @@ with **no change to RTEMS** (the R2 hooks below are optional polish):
    tcgcov modmap --cov run.cov --map map.json --out-dir mods/ --ctx 1
    ```
 
-3. **Symbolize per section.** Each slice is 0-based against its section, so it
-   feeds the existing `symbolize --section` pipeline against the original `.o`:
+3. **Symbolize per section** (what `report` does for each slice). Each slice
+   is 0-based against its section, so it feeds the existing `symbolize
+   --section` pipeline against the original `.o`:
 
    ```
    tcgcov symbolize --cov "mods/foo.o__text.cov" \
@@ -63,6 +85,17 @@ The per-record tag is the same one `TCGCOV2` uses to separate same-base Linux
 *processes* (§2); RTEMS reuses it with the loader generation as the tag source,
 so **no new artifact format was needed**. Worked examples with ground-truth
 checks: [`examples/rtems-dl/`](../examples/rtems-dl/) (`dl01`, `dl09`).
+
+## Compared with GDB
+
+| | GDB (svr4 solib) | tcgcov RTEMS mode |
+|---|---|---|
+| load event | breakpoint at `r_debug.r_brk` (or glibc's stap probes) | exec callback on `_rtld_debug_state()`; optional `rtems_rtl_debugger_load` hook plays the probes' role |
+| hook addresses | read from the ELF it has loaded | read from the ELF by `tcgcov rtems-args` |
+| object list | walks `r_map` with DWARF struct layouts | walks `r_map` with fixed ILP32 offsets (`tcgcov-rtems.c`) |
+| section placement | `l_addr` for ET_DYN; ET_REL needs `add-symbol-file -s` per section by hand | per section, from the loader's own `section_detail` offsets |
+| address reuse | not handled: only the current map exists | one snapshot per generation; records tagged with theirs |
+| name → host file | `sysroot` + `solib-search-path`, basename fallback, build-id check | `--obj-path` (recursive, archives), `--obj-suffix`, section name/size check |
 
 ## 0. What an RTEMS ".so" actually is
 
