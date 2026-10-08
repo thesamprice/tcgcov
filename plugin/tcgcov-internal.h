@@ -148,6 +148,15 @@ typedef struct {
     bool verbose;
 
     /*
+     * flush_at=<addr>: write the artifact when this address first executes
+     * (e.g. RTEMS _Terminate), so a guest whose shutdown crashes QEMU --
+     * cpu_abort() skips atexit -- still leaves a complete artifact. The
+     * normal exit path writes it again, superseding the flushed copy.
+     */
+    uint64_t flush_at;
+    gint flushed;                  /* atomic: the flush ran */
+
+    /*
      * phys=on: translations that failed the debug MMU walk and fell back to
      * recording the virtual address. Incremented under `lock` (translation
      * time only) and reported in the metadata, because an artifact silently

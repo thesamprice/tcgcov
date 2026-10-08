@@ -266,3 +266,38 @@ executed block, its first instruction. So a line that only appears mid-block
 can read 0 while a branch on it reads as evaluated, as `pay_a.c:41` does
 above. The default `mode=tb-insn` records every instruction; see
 `docs/ARCHITECTURES.md`.)
+
+---
+
+# MicroBlaze (issue #15)
+
+Measured 2026-10-08: the same dl01/dl09 tests built for the
+`petalogix_s3adsp1800` BSP (32-bit **little-endian** MicroBlaze), on QEMU
+11.0.2's unified MicroBlaze binary:
+
+    A=$(tcgcov rtems-args dl09.exe)   # rtl_state=…,rtl_debug=…,flush_at=<_Terminate>,elf=…
+    qemu-system-microblaze -M petalogix-s3adsp1800,endianness=little -m 256 \
+        -kernel dl09.exe -display none -serial file:dl09.serial \
+        -icount shift=0,sleep=off \
+        -plugin libtcgcov.so,out=dl09.cov,mode=tb,edges=on,$A
+    tcgcov report dl01.cov dl09.cov --out-dir cov --obj-path …/libtests \
+        --toolchain-prefix microblaze-rtems7-
+
+No layout change was needed: the plugin's `link_map` offsets are those of
+any 32-bit little-endian RTEMS target. Against the riscv ground truth:
+
+* dl01: `dl01-o1.c:43` count 2, the loop at `:46` count 5 (with branch
+  outcomes 5/2);
+* dl09: every executed line of `dl09-o1.c` at count 4, the four lifetimes;
+* the content check (#14) passes on all 11 loaded objects with no
+  "not checked" note, which validates the MicroBlaze relocation-width table.
+
+**Shutdown.** RTEMS on this board ends with `qemu: fatal: Microblaze:
+unaligned PC=ffffffff`. QEMU's abort skips the plugin's exit handler, so
+before `flush_at=` no artifact was written at all. `rtems-args` now adds
+`flush_at=<_Terminate>`, and the artifact is written as RTEMS starts
+shutting down. Stopping the run with a gdb breakpoint at `_Terminate` instead
+is unreliable: `microblaze-rtems7-gdb` set the breakpoint with the wrong byte
+order (the trap reported `0xb8870190` for `0x900187b8`), the guest ran on
+into unrelated code, and that artifact held 467 addresses executed after
+`_Terminate`.

@@ -480,6 +480,15 @@ class RtemsArgsTest(Fixture):
         rc, out, _ = self.run_args(p, "--no-load-hook")
         self.assertNotIn("rtl_load", out)
 
+    def test_terminate_becomes_flush_at(self):
+        p = self.put("img.exe", make_elf(
+            [], symbols=[("_rtld_debug_state", 0x10), ("_rtld_debug", 0x20),
+                         ("_Terminate", 0x90018778)], e_type=2))
+        rc, out, _ = self.run_args(p)
+        self.assertEqual(rc, 0)
+        self.assertIn("flush_at=0x90018778", out)
+        self.assertNotIn("flush_at", self.run_args(p, "--no-flush-at")[1])
+
     def test_image_without_libdl(self):
         p = self.put("img.exe", make_elf([], symbols=[("main", 1)]))
         rc, _out, err = self.run_args(p)

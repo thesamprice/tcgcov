@@ -174,6 +174,8 @@ Plugin arguments are `key=value`, comma-separated:
 | `elf=` | `""` | path to the ELF, copied into the artifact's metadata so the host tools need no manifest |
 | `test_id=`, `bsp=` | `""` | free-form labels (run name, board/platform) copied into the metadata |
 | `verbose=` | `off` | log a one-line summary at exit |
+| `flush_at=` | *(none)* | `0xADDR`: also write the artifact when this address first executes, for guests whose shutdown crashes QEMU (whose abort skips the normal exit write). Single-CPU machines only. `tcgcov rtems-args` sets it to RTEMS `_Terminate` |
+| `rtl_state=`, `rtl_debug=`, `rtl_load=` | *(none)* | RTEMS loader mode, see [`docs/RTEMS-DL.md`](docs/RTEMS-DL.md); `tcgcov rtems-args IMAGE` prints them |
 
 Boolean arguments accept `on`/`off`, `true`/`false`, `yes`/`no` and `1`/`0`.
 **An unknown argument, an unparseable value or a malformed `filter=` range
