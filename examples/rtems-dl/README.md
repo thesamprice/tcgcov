@@ -239,3 +239,30 @@ into `target/`, and the unstripped copies renamed `sub/dl09-oN.o.debug`:
 
 Stripping removes only sections the loader never placed, so the stripped
 copy and its twin both pass the section check, and the one with DWARF wins.
+
+## Same-named sections (issue #13)
+
+Measured 2026-10-08. GCC always names a function's section after it, so the
+duplicate case was made by hand: `pay_a.c` compiled to assembly with
+`-ffunction-sections -g`, and each `.section .text.<fn>,"ax",@progbits`
+rewritten to `.section .text,"ax",@progbits,unique,N` (what clang's
+`-fno-unique-section-names` emits). The resulting `pay_a.o` has five sections
+named `.text` (one empty); `addr2line -j .text` resolves nothing in it.
+
+RTEMS loads it the same way (`pay_a: entry(3) -> 79`), and `report` gives
+each section its own slice, keyed by section number:
+
+    /pay_a.o:.text[#4]: 4 addrs  -> reuse.pay_a.o.23f82ca7__text.s4.cov   (spin)
+    /pay_a.o:.text[#6]: 1 addrs  ...                                        (pad_called)
+    /pay_a.o:.text[#7]: 0 addrs  ...                                        (pad_uncovered)
+    /pay_a.o:.text[#9]: 5 addrs  ...                                        (pay_entry)
+
+The `pay_a.c` lines and branches are identical to the normal build's (19
+coverable lines, 9 hit, `BRDA:22` 7/1, `BRDA:41` 1/0). Before #13 the same
+artifact dropped 10 records with a warning.
+
+(All the runs on this page use `mode=tb`, which records one address per
+executed block, its first instruction. So a line that only appears mid-block
+can read 0 while a branch on it reads as evaluated, as `pay_a.c:41` does
+above. The default `mode=tb-insn` records every instruction; see
+`docs/ARCHITECTURES.md`.)

@@ -332,6 +332,19 @@ class SplitTest(Fixture):
         return rtl.run(ap.parse_args(argv))
 
 
+class SectionViewTest(unittest.TestCase):
+    def test_only_the_chosen_section_keeps_the_name(self):
+        data = make_elf([(".text", 4, 4, ALLOC | EXEC),
+                         (".data", 4, 4, ALLOC),
+                         (".text", 8, 4, ALLOC | EXEC)])
+        view = rtl.section_view(data, 3)
+        names = [s["name"] for s in rtl.elf_parse(view)["sections"]]
+        self.assertEqual(names[3], ".text")
+        self.assertEqual(names[1], "text")
+        self.assertEqual(names[2], ".data")
+        self.assertEqual(len(view), len(data))   # nothing moved
+
+
 class RtemsArgsTest(Fixture):
     def run_args(self, path, *extra):
         import argparse
@@ -405,19 +418,50 @@ class ReviewRegressionTest(Fixture):
         counts = sorted(read_all(m["out"])[2][0x10] for m in f)
         self.assertEqual(counts, [3, 5])
 
-    def test_duplicate_section_names_are_dropped_loudly(self):
-        secs = [(".text", 0x20, 4, ALLOC | EXEC), (".text", 0x20, 4,
+    def test_same_named_sections_each_get_their_own_slice(self):
+        # Issue #13: two sections both named .text (COMDAT, clang
+        # -fno-unique-section-names). Each is matched to its own .o section
+        # by rank and size, and symbolized against a view of the object in
+        # which only it carries the name.
+        secs = [(".text", 0x20, 4, ALLOC | EXEC), (".text", 0x30, 4,
                 ALLOC | EXEC)]
         self.put("d.o", make_elf(secs))
         cov = self.write_run({"1": [snap("/d.o", self.BASE, secs)]},
-                             [(1, self.BASE + 0x4, 1),
-                              (1, self.BASE + 0x24, 1)])
+                             [(1, self.BASE + 0x4, 3),          # first .text
+                              (1, self.BASE + 0x24, 5)],        # second +0x4
+                             [(1, self.BASE + 0x20, self.BASE + 0x24, 2)])
         s = self.split(cov)
-        self.assertEqual(s["modules"], [])
-        self.assertTrue(any("more than one section named .text" in w
-                            and "2 records dropped" in w
+        self.assertEqual(s["warnings"], [])
+        by = {m["index"]: m for m in s["modules"]}
+        self.assertEqual(sorted(by), [1, 2])     # .o section numbers
+        meta, _a, counts, edges = read_all(by[1]["out"])
+        self.assertEqual(counts, {0x4: 3})
+        self.assertEqual(meta["module_section_index"], 1)
+        _m, _a, counts2, edges2 = read_all(by[2]["out"])
+        self.assertEqual(counts2, {0x4: 5})       # not merged with 0x4 above
+        self.assertEqual(edges2, [(0x0, 0x4, 2)])
+        self.assertEqual(edges, [])
+        # The view names only its own section .text.
+        for idx, m in by.items():
+            names = [x["name"] for x in
+                     rtl.Candidate(m["file"]).sections()]
+            self.assertEqual(names.count(".text"), 1)
+            self.assertEqual(names[idx], ".text")
+        self.assertEqual(by[1]["md5"], by[2]["md5"])  # of the real file
+
+    def test_same_named_sections_that_do_not_match_are_dropped(self):
+        secs = [(".text", 0x20, 4, ALLOC | EXEC), (".text", 0x20, 4,
+                ALLOC | EXEC)]
+        self.put("d.o", make_elf(secs))
+        entry = snap("/d.o", self.BASE, secs + [(".text", 0x10, 4,
+                                                 ALLOC | EXEC)])
+        cov = self.write_run({"1": [entry]},
+                             [(1, self.BASE + 0x44, 1)])   # the third .text
+        s = self.split(cov, no_verify=True)
+        self.assertTrue(any("could not be matched" in w
+                            and "1 records dropped" in w
                             for w in s["warnings"]))
-        self.assertEqual(read_all(s["base"])[1], [])     # not base either
+        self.assertEqual(read_all(s["base"])[1], [])
 
     def test_exact_relative_path_beats_a_same_size_twin_elsewhere(self):
         p = self.put("tree/lib/x.o", make_elf(A_SECS))
