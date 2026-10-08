@@ -14,3 +14,6 @@ htmlcov/
 *.dSYM/
 examples/**/*.elf
 examples/**/*.o
+
+# Checked-in test fixtures (tests/data/rtl-reloc: relocatable objects).
+!tests/data/**/*.o
