@@ -212,7 +212,7 @@ class WindowsTest(unittest.TestCase):
     def test_recorded_offsets_are_used_verbatim(self):
         e = snap("a.o", 0x1000, A_SECS, const=0x2000)
         e["sections"][1]["offset"] = 0x48          # loader padded more
-        w = {n: s for s, _e, n, _r in rtl.object_windows(e)}
+        w = {n: s for s, _e, n, _r, _d in rtl.object_windows(e)}
         self.assertEqual(w[".text.g"], 0x1048)
         self.assertEqual(w[".rodata"], 0x2000)
 
@@ -224,7 +224,7 @@ class WindowsTest(unittest.TestCase):
             with open(p, "wb") as f:
                 f.write(make_elf(secs))
             e = snap("a.o", 0x1000, secs, offsets=False)
-            w = {n: s for s, _e, n, _r in
+            w = {n: s for s, _e, n, _r, _d in
                  rtl.object_windows(e, rtl.Candidate(p))}
         self.assertEqual(w[".text.b"], 0x1008)     # 6 rounded up to 8
 
@@ -363,3 +363,138 @@ class RtemsArgsTest(Fixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def extended_numbering(elf):
+    """Rewrite an ELF32 to use e_shnum=0 / e_shstrndx=SHN_XINDEX."""
+    b = bytearray(elf)
+    shoff = struct.unpack_from("<I", b, 0x20)[0]
+    shnum, shstrndx = struct.unpack_from("<HH", b, 0x30)
+    struct.pack_into("<I", b, shoff + 20, shnum)       # sh0.sh_size
+    struct.pack_into("<I", b, shoff + 24, shstrndx)    # sh0.sh_link
+    struct.pack_into("<HH", b, 0x30, 0, 0xFFFF)
+    return bytes(b)
+
+
+class ReviewRegressionTest(Fixture):
+    """One test per finding of the PR #11 review."""
+
+    BASE = 0x80050000
+
+    def write_run(self, gens, recs, edges=()):
+        cov = os.path.join(self.d, "run.cov")
+        write_cov(cov, {"ctx_kind": "loader-generation",
+                        "rtl_generations": gens}, recs, list(edges), ctx=True)
+        return cov
+
+    def split(self, cov, dirs=None, **kw):
+        return rtl.split(cov, rtl.ObjectPath(dirs or [self.d]),
+                         os.path.join(self.d, "out"), **kw)
+
+    def test_same_basename_different_files_get_separate_slices(self):
+        # Same basename AND same section names: only the file tells them apart.
+        self.put("x/foo.o", make_elf(A_SECS))
+        self.put("y/foo.o", make_elf(A_SECS, symbols=[("other", 1)]))
+        cov = self.write_run(
+            {"1": [snap("/x/foo.o", self.BASE, A_SECS),
+                   snap("/y/foo.o", self.BASE + 0x1000, A_SECS)]},
+            [(1, self.BASE + 0x10, 3), (1, self.BASE + 0x1010, 5)])
+        s = self.split(cov)
+        f = [m for m in s["modules"] if m["section"] == ".text.f"]
+        self.assertEqual(len({m["out"] for m in f}), 2)  # nothing overwritten
+        counts = sorted(read_all(m["out"])[2][0x10] for m in f)
+        self.assertEqual(counts, [3, 5])
+
+    def test_duplicate_section_names_are_dropped_loudly(self):
+        secs = [(".text", 0x20, 4, ALLOC | EXEC), (".text", 0x20, 4,
+                ALLOC | EXEC)]
+        self.put("d.o", make_elf(secs))
+        cov = self.write_run({"1": [snap("/d.o", self.BASE, secs)]},
+                             [(1, self.BASE + 0x4, 1),
+                              (1, self.BASE + 0x24, 1)])
+        s = self.split(cov)
+        self.assertEqual(s["modules"], [])
+        self.assertTrue(any("more than one section named .text" in w
+                            and "2 records dropped" in w
+                            for w in s["warnings"]))
+        self.assertEqual(read_all(s["base"])[1], [])     # not base either
+
+    def test_exact_relative_path_beats_a_same_size_twin_elsewhere(self):
+        p = self.put("tree/lib/x.o", make_elf(A_SECS))
+        self.put("tree/other-build/x.o",
+                 make_elf(A_SECS, symbols=[("different", 1)]))
+        res = rtl.resolve(rtl.ObjectPath([os.path.join(self.d, "tree")]),
+                          "/lib/x.o", snap("/lib/x.o", 0, A_SECS)["sections"])
+        self.assertIsNone(res.error)
+        self.assertEqual(res.cand.path, p)
+
+    def test_archive_with_two_members_of_one_name(self):
+        self.put("libdup.a", make_ar([("m.o", make_elf(A_SECS)),
+                                      ("m.o", make_elf(B_SECS))]))
+        res = rtl.resolve(rtl.ObjectPath([self.d]), "m.o",
+                          snap("m.o", 0, B_SECS)["sections"])
+        self.assertIsNone(res.error)
+        self.assertIn(".text.h", {s["name"] for s in res.cand.sections()})
+
+    def test_truncated_names_and_snapshots(self):
+        long_name = ".text._ZN" + "x" * 40
+        secs = [(long_name, 0x20, 4, ALLOC | EXEC)]
+        self.put("t.o", make_elf(secs))
+        entry = snap("/t.o", self.BASE, secs)
+        entry["sections"][0]["name"] = long_name[:20]
+        entry["sections"][0]["name_truncated"] = True
+        entry["truncated"], entry["sec_num"] = True, 5000
+        entry["chain_truncated"] = True
+        cov = self.write_run({"1": [entry]}, [(1, self.BASE + 4, 2)])
+        s = self.split(cov)
+        self.assertEqual([m["section"] for m in s["modules"]], [long_name])
+        self.assertTrue(any("1 of 5000 sections" in w for w in s["warnings"]))
+        self.assertTrue(any("stopped walking" in w for w in s["warnings"]))
+
+    def test_init_array_in_the_text_region_gets_no_empty_slice(self):
+        secs = [(".text.f", 0x20, 4, ALLOC | EXEC),
+                (".init_array", 0x4, 4, ALLOC | 0x1)]
+        self.put("i.o", make_elf(secs))
+        entry = snap("/i.o", self.BASE, secs)
+        entry["sections"][1]["rap"] = 0          # the loader puts it in text
+        entry["sections"][1]["offset"] = 0x20
+        cov = self.write_run({"1": [entry]}, [])
+        s = self.split(cov)
+        self.assertEqual([m["section"] for m in s["modules"]], [".text.f"])
+
+    def test_rtl_split_keeps_same_named_artifacts_apart(self):
+        self.put("objs/a.o", make_elf(A_SECS))
+        covs = []
+        for d in ("r1", "r2"):
+            os.makedirs(os.path.join(self.d, d))
+            c = os.path.join(self.d, d, "run.cov")
+            write_cov(c, {"ctx_kind": "loader-generation",
+                          "rtl_generations": {"1": [
+                              snap("/a.o", self.BASE, A_SECS)]}},
+                      [(1, self.BASE + 4, 1)], ctx=True)
+            covs.append(c)
+        stems = rtl.unique_stems(covs)
+        self.assertEqual(len(set(stems.values())), 2)
+
+    def test_extended_section_numbering(self):
+        p = self.put("e.o", extended_numbering(make_elf(A_SECS)))
+        res = rtl.resolve(rtl.ObjectPath([self.d]), "e.o",
+                          snap("e.o", 0, A_SECS)["sections"])
+        self.assertIsNone(res.error, res.error)
+        self.assertEqual(res.cand.path, p)
+
+    def test_truncated_elf_is_an_error_not_empty_names(self):
+        # Point .shstrtab past the end of the file: the headers parse, the
+        # names would silently come out empty.
+        b = bytearray(make_elf(A_SECS))
+        shoff = struct.unpack_from("<I", b, 0x20)[0]
+        shstrndx = struct.unpack_from("<H", b, 0x32)[0]
+        struct.pack_into("<I", b, shoff + 40 * shstrndx + 16, len(b) - 4)
+        with self.assertRaises(rtl.ElfError):
+            rtl.elf_parse(bytes(b))
+
+    def test_thin_archive_is_reported(self):
+        self.put("thin.a", b"!<thin>\n")
+        op = rtl.ObjectPath([self.d])
+        self.assertEqual(op.candidates("x.o"), [])
+        self.assertTrue(any("thin archive" in w for w in op.skipped))

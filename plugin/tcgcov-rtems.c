@@ -44,9 +44,9 @@
 #define RTL_SD_SIZE      8         /* section_detail.size */
 #define RTL_SD_RAPID     12        /* section_detail.rap_id */
 #define RTL_SD_STRIDE    16
-#define RTL_MAX_OBJS     64        /* chain-walk bound: a corrupt guest    */
-#define RTL_MAX_SECS     128       /*   pointer must not hang the plugin  */
-#define RTL_MAX_NAME     128
+#define RTL_MAX_OBJS     1024      /* chain-walk bound: a corrupt guest    */
+#define RTL_MAX_SECS     4096      /*   pointer must not hang the plugin; */
+#define RTL_MAX_NAME     512       /*   hitting one is flagged, not silent */
 
 static bool rtl_read(uint64_t addr, void *out, size_t len)
 {
@@ -70,17 +70,20 @@ static uint32_t rtl_read_u32(uint64_t addr, bool *ok)
     return v;                      /* guest and host are both little-endian */
 }
 
-static void rtl_read_str(uint64_t addr, char *out, size_t cap)
+/* Returns true when the string was cut at `cap` (no NUL within it). */
+static bool rtl_read_str(uint64_t addr, char *out, size_t cap)
 {
     size_t i;
 
     out[0] = '\0';
     for (i = 0; i + 1 < cap; i++) {
         if (!rtl_read(addr + i, &out[i], 1) || out[i] == '\0') {
-            break;
+            out[i] = '\0';
+            return false;
         }
     }
     out[i] = '\0';
+    return true;
 }
 
 /*
@@ -105,10 +108,13 @@ static void rtl_snapshot(CovState *s, uint64_t gen)
     lm = rtl_read_u32(s->rtl_debug_addr + RTL_RD_RMAP, &ok);
     while (ok && lm && objs < RTL_MAX_OBJS) {
         uint32_t sec_num = rtl_read_u32(lm + RTL_LM_SECNUM, &ok);
+        uint32_t recorded = sec_num;
         uint64_t detail = rtl_read_u32(lm + RTL_LM_SECDETAIL, &ok);
+        bool truncated = false;
         unsigned i;
 
-        rtl_read_str(rtl_read_u32(lm + RTL_LM_NAME, &ok), name, sizeof(name));
+        truncated |= rtl_read_str(rtl_read_u32(lm + RTL_LM_NAME, &ok), name,
+                                  sizeof(name));
         if (objs) {
             g_string_append(s->rtl_snaps, ", ");
         }
@@ -125,30 +131,47 @@ static void rtl_snapshot(CovState *s, uint64_t gen)
             }
         }
         g_string_append(s->rtl_snaps, ", \"sections\": [");
-        if (sec_num > RTL_MAX_SECS) {
-            sec_num = RTL_MAX_SECS;
+        if (recorded > RTL_MAX_SECS) {
+            recorded = RTL_MAX_SECS;
+            truncated = true;
         }
-        for (i = 0; ok && i < sec_num; i++) {
+        for (i = 0; ok && i < recorded; i++) {
             uint64_t sd = detail + (uint64_t)i * RTL_SD_STRIDE;
+            bool cut = rtl_read_str(rtl_read_u32(sd + RTL_SD_NAME, &ok), name,
+                                    sizeof(name));
 
-            rtl_read_str(rtl_read_u32(sd + RTL_SD_NAME, &ok), name,
-                         sizeof(name));
+            truncated |= cut;
             if (i) {
                 g_string_append(s->rtl_snaps, ", ");
             }
             g_string_append(s->rtl_snaps, "{\"name\": \"");
             json_escape_append(s->rtl_snaps, name);
+            if (cut) {
+                g_string_append(s->rtl_snaps, "\", \"name_truncated\": true");
+            } else {
+                g_string_append(s->rtl_snaps, "\"");
+            }
             g_string_append_printf(s->rtl_snaps,
-                                   "\", \"offset\": %" PRIu32
+                                   ", \"offset\": %" PRIu32
                                    ", \"size\": %" PRIu32
                                    ", \"rap\": %" PRIu32 "}",
                                    rtl_read_u32(sd + RTL_SD_OFFSET, &ok),
                                    rtl_read_u32(sd + RTL_SD_SIZE, &ok),
                                    rtl_read_u32(sd + RTL_SD_RAPID, &ok));
         }
-        g_string_append(s->rtl_snaps, "]}");
+        /* sec_num is the loader's own count; with "truncated" the host can
+         * tell a capped or cut snapshot from a complete one. */
+        g_string_append_printf(s->rtl_snaps, "], \"sec_num\": %" PRIu32,
+                               sec_num);
+        if (truncated || !ok) {
+            g_string_append(s->rtl_snaps, ", \"truncated\": true");
+        }
         lm = rtl_read_u32(lm + RTL_LM_NEXT, &ok);
         objs++;
+        if (ok && lm && objs == RTL_MAX_OBJS) {
+            g_string_append(s->rtl_snaps, ", \"chain_truncated\": true");
+        }
+        g_string_append(s->rtl_snaps, "}");
     }
     g_string_append(s->rtl_snaps, "]");
     if (!ok) {

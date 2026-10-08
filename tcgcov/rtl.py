@@ -17,10 +17,16 @@ the object's DWARF. This module supplies that, the way GDB's
 * Every candidate is **verified** against the snapshot: each section the
   loader placed must exist in the candidate with the same size. That is the
   check GDB does with a build-id; relocatable objects have no build-id, but
-  the loader's own section table is nearly as discriminating, and it rejects
-  the classic failure -- a rebuilt `.o` on the host that no longer matches the
-  one the target loaded -- instead of symbolizing against the wrong lines.
-  Two verified candidates with different contents are an error, not a guess.
+  the loader's own section table catches the common failures: the wrong
+  object of the same name, or a rebuilt `.o` whose code changed size.
+  Two verified candidates with different contents are an error, not a guess
+  (unless exactly one sits at the loaded name's own relative path).
+
+  Known limit: a rebuild that changes no section size -- an edited comment,
+  which shifts every line below it -- passes. The target holds the object's
+  bytes only after relocation and the plugin does not record them, so there
+  is nothing to compare contents against; each slice records the md5 of the
+  file it was resolved to (`module_md5`) so the provenance can be checked.
 
 The split then turns one generation-tagged artifact into TCGCOV1 slices:
 
@@ -46,6 +52,7 @@ import os
 import re
 import struct
 import sys
+import zlib
 
 from .format import FLAG_HAS_EDGES, read_full, write_cov
 
@@ -70,6 +77,9 @@ def elf_parse(data, what="<elf>"):
 
     Each section is a dict with name, type, flags, addr, offset, size, align,
     link, entsize. Raises ElfError on anything that is not a parseable ELF.
+    Extended section numbering (e_shnum == 0, e_shstrndx == SHN_XINDEX: the
+    real values live in section 0) is honoured, and every table read is
+    bounds-checked, so a truncated file is an error rather than empty names.
     """
     if len(data) < 52 or data[:4] != b"\x7fELF":
         raise ElfError("%s: not an ELF file" % what)
@@ -89,18 +99,33 @@ def elf_parse(data, what="<elf>"):
             e_shentsize, e_shnum, e_shstrndx = struct.unpack_from(
                 p + "HHH", data, 0x2E)
             fmt = p + "IIIIIIIIII"
-        raw = []
-        for i in range(e_shnum):
-            raw.append(struct.unpack_from(fmt, data, e_shoff + i * e_shentsize))
-        if e_shstrndx >= len(raw):
-            raise ElfError("%s: bad section-name table index" % what)
-        so, ss = raw[e_shstrndx][4], raw[e_shstrndx][5]
-        shstr = data[so:so + ss]
+        if not e_shoff:
+            return {"class": 64 if is64 else 32, "little": ei_data == 1,
+                    "type": e_type, "sections": []}
+        if e_shentsize < struct.calcsize(fmt):
+            raise ElfError("%s: bad section header size" % what)
+        sh0 = struct.unpack_from(fmt, data, e_shoff)
+        if e_shnum == 0:
+            e_shnum = sh0[5]                   # sh_size of section 0
+        if e_shstrndx == 0xFFFF:               # SHN_XINDEX
+            e_shstrndx = sh0[6]                # sh_link of section 0
+        if e_shoff + e_shnum * e_shentsize > len(data):
+            raise ElfError("%s: section headers run past end of file" % what)
+        raw = [struct.unpack_from(fmt, data, e_shoff + i * e_shentsize)
+               for i in range(e_shnum)]
     except struct.error:
         raise ElfError("%s: truncated ELF section headers" % what)
+    if e_shstrndx >= len(raw):
+        raise ElfError("%s: bad section-name table index" % what)
+    so, ss = raw[e_shstrndx][4], raw[e_shstrndx][5]
+    if so + ss > len(data):
+        raise ElfError("%s: section-name table runs past end of file" % what)
+    shstr = data[so:so + ss]
 
     sections = []
     for (nm, typ, flags, addr, off, size, link, _info, align, entsize) in raw:
+        if nm >= len(shstr) and nm:
+            raise ElfError("%s: section name offset out of range" % what)
         end = shstr.find(b"\0", nm)
         name = shstr[nm:end if end != -1 else None].decode("utf-8", "replace")
         sections.append({"name": name, "type": typ, "flags": flags,
@@ -137,29 +162,47 @@ def elf_symbols(path):
     return out
 
 
-def ar_members(data, what="<archive>"):
-    """Yield (member_name, payload_bytes) from a System V / GNU / BSD archive."""
-    if not data.startswith(b"!<arch>\n"):
+def ar_entries(f, what="<archive>"):
+    """[(member_name, data_offset, size)] of an open ar archive, by seeking.
+
+    Only the headers (and the GNU long-name table) are read, so indexing a
+    large library does not pull every member into memory. System V/GNU and
+    BSD (#1/len) naming are handled. Thin archives (!<thin>) hold no member
+    data and raise ElfError, so the caller can say so instead of the members
+    silently reading as "not found".
+    """
+    f.seek(0, os.SEEK_END)
+    total = f.tell()
+    f.seek(0)
+    magic = f.read(8)
+    if magic == b"!<thin>\n":
+        raise ElfError("%s: thin archive (members are not stored in it); "
+                       "put the member files themselves on --obj-path" % what)
+    if magic != b"!<arch>\n":
         raise ElfError("%s: not an ar archive" % what)
-    pos, longnames = 8, b""
-    while pos + 60 <= len(data):
-        hdr = data[pos:pos + 60]
+    pos, longnames, out = 8, b"", []
+    while pos + 60 <= total:
+        f.seek(pos)
+        hdr = f.read(60)
         name = hdr[:16].decode("utf-8", "replace").rstrip()
         try:
             size = int(hdr[48:58].decode().strip() or "0")
         except ValueError:
             raise ElfError("%s: corrupt member header at %d" % (what, pos))
-        body = data[pos + 60:pos + 60 + size]
-        pos += 60 + size + (size & 1)
+        body_off = pos + 60
+        if body_off + size > total:
+            raise ElfError("%s: member at %d runs past end of file"
+                           % (what, pos))
+        pos = body_off + size + (size & 1)
         if name == "//":                       # GNU long-name table
-            longnames = body
+            longnames = f.read(size)
             continue
         if name in ("/", "/SYM64/", "__.SYMDEF", "__.SYMDEF SORTED"):
             continue                           # symbol indexes
         if name.startswith("#1/"):             # BSD: name prefixes the body
             n = int(name[3:])
-            name, body = body[:n].rstrip(b"\0").decode("utf-8",
-                                                       "replace"), body[n:]
+            name = f.read(n).rstrip(b"\0").decode("utf-8", "replace")
+            body_off, size = body_off + n, size - n
         elif name.startswith("/") and name[1:].isdigit():
             off = int(name[1:])
             end = longnames.find(b"/\n", off)
@@ -167,37 +210,58 @@ def ar_members(data, what="<archive>"):
                 "utf-8", "replace")
         elif name.endswith("/"):
             name = name[:-1]
-        yield name, body
+        out.append((name, body_off, size))
+    return out
+
+
+def ar_members(data, what="<archive>"):
+    """Yield (member_name, payload_bytes) from archive bytes."""
+    import io
+    f = io.BytesIO(data)
+    for name, off, size in ar_entries(f, what):
+        yield name, data[off:off + size]
 
 
 # --- the object search path -------------------------------------------------
 
 class Candidate:
-    """One host file (or archive member) that might be a loaded object."""
+    """One host file (or archive member) that might be a loaded object.
 
-    def __init__(self, path, member=None):
+    An archive member is located by its byte range, not its name: `ar q`
+    happily stores two members with the same name, and reading "the member
+    called foo.o" would always return the first.
+    """
+
+    def __init__(self, path, member=None, span=None, exact=False):
         self.path = path
         self.member = member
+        self.span = span            # (offset, size) inside the archive
+        self.exact = exact          # found by the loaded name's relative path
         self._data = None
         self._sections = None
+        self._md5 = None
+
+    @property
+    def key(self):
+        return (os.path.realpath(self.path), self.span)
 
     @property
     def label(self):
-        return "%s(%s)" % (self.path, self.member) if self.member else self.path
+        if self.member is None:
+            return self.path
+        return "%s(%s@%d)" % (self.path, self.member, self.span[0])
 
     def data(self):
         if self._data is None:
             with open(self.path, "rb") as f:
-                raw = f.read()
-            if self.member is None:
-                self._data = raw
-            else:
-                for name, body in ar_members(raw, self.path):
-                    if name == self.member:
-                        self._data = body
-                        break
+                if self.span is None:
+                    self._data = f.read()
                 else:
-                    raise ElfError("%s: member vanished" % self.label)
+                    f.seek(self.span[0])
+                    self._data = f.read(self.span[1])
+                    if len(self._data) != self.span[1]:
+                        raise ElfError("%s: archive changed under us"
+                                       % self.label)
         return self._data
 
     def sections(self):
@@ -206,7 +270,9 @@ class Candidate:
         return self._sections
 
     def md5(self):
-        return hashlib.md5(self.data()).hexdigest()
+        if self._md5 is None:
+            self._md5 = hashlib.md5(self.data()).hexdigest()
+        return self._md5
 
     def has_debug(self):
         try:
@@ -215,6 +281,13 @@ class Candidate:
                        for s in self.sections())
         except (OSError, ElfError):
             return False
+
+    def exec_sections(self):
+        try:
+            return {s["name"] for s in self.sections()
+                    if s["flags"] & _SHF_EXECINSTR}
+        except (OSError, ElfError):
+            return set()
 
 
 def split_path_args(values):
@@ -243,8 +316,10 @@ class ObjectPath:
             if not os.path.isdir(d):
                 raise ValueError("%s: --obj-path entry is not a directory" % d)
         self._by_base = None
+        self.skipped = []           # archives that could not be indexed
 
     def _index(self):
+        """basename -> [Candidate], built on first need, headers only."""
         if self._by_base is not None:
             return self._by_base
         idx = {}
@@ -256,13 +331,13 @@ class ObjectPath:
                     if fn.endswith(".a"):
                         try:
                             with open(full, "rb") as f:
-                                members = [n for n, _b in
-                                           ar_members(f.read(), full)]
-                        except (OSError, ElfError):
+                                entries = ar_entries(f, full)
+                        except (OSError, ElfError) as e:
+                            self.skipped.append(str(e))
                             continue
-                        for m in members:
+                        for m, off, size in entries:
                             idx.setdefault(os.path.basename(m), []).append(
-                                Candidate(full, m))
+                                Candidate(full, m, (off, size)))
                     else:
                         # Any name: a suffixed debug twin need not end in .o
                         idx.setdefault(fn, []).append(Candidate(full))
@@ -279,29 +354,55 @@ class ObjectPath:
                     out.append(v)
         return out
 
-    def candidates(self, name):
-        """Exact relative-path hits first, then basename hits anywhere.
-
-        All of them, not just the first tier: an exact hit may be the
-        stripped copy the target loaded while its unstripped twin sits
-        elsewhere on the path, and resolve() needs to see both.
-        """
-        found = []
+    def exact_candidates(self, name):
+        """Files at the loaded name's path relative to each directory."""
+        out = []
         for n in self.names(name.lstrip("/")):
             for d in self.dirs:
                 p = os.path.join(d, n)
                 if n and os.path.isfile(p):
-                    found.append(Candidate(p))
+                    out.append(Candidate(p, exact=True))
+        return _dedupe(out)
+
+    def candidates(self, name):
+        """Exact relative-path hits, then basename hits anywhere on the path.
+
+        All of them: an exact hit may be the stripped copy the target loaded
+        while its unstripped twin sits elsewhere, and resolve() needs both.
+        """
+        found = self.exact_candidates(name)
         idx = self._index()
         for n in self.names(os.path.basename(name)):
             found += idx.get(n, [])
-        seen, out = set(), []
-        for c in found:
-            key = (os.path.realpath(c.path), c.member)
-            if key not in seen:
-                seen.add(key)
-                out.append(c)
-        return out
+        return _dedupe(found)
+
+
+def _dedupe(cands):
+    seen, out = set(), []
+    for c in cands:
+        if c.key not in seen:
+            seen.add(c.key)
+            out.append(c)
+    return out
+
+
+def full_name(cand, sec):
+    """The candidate's name for a snapshot section whose name was truncated.
+
+    The plugin caps guest string reads and flags a capped name; the real
+    name is the one ALLOC section of the candidate that starts with the
+    recorded prefix and has the recorded size. None when there is not
+    exactly one (or the name was not truncated).
+    """
+    if not sec.get("name_truncated") or cand is None:
+        return None
+    try:
+        hits = {s["name"] for s in cand.sections()
+                if s["flags"] & _SHF_ALLOC and s["size"] == sec["size"]
+                and s["name"].startswith(sec["name"])}
+    except (OSError, ElfError):
+        return None
+    return hits.pop() if len(hits) == 1 else None
 
 
 def verify(cand, snap_sections):
@@ -314,7 +415,7 @@ def verify(cand, snap_sections):
     except (OSError, ElfError) as e:
         return str(e)
     for sec in snap_sections:
-        sizes = have.get(sec["name"])
+        sizes = have.get(full_name(cand, sec) or sec["name"])
         if sizes is None:
             if sec["name"].startswith(".common.rtems"):
                 continue                       # synthesized by the loader
@@ -341,15 +442,8 @@ class Resolution:
         self.warning = None
 
 
-def resolve(objpath, name, snap_sections, no_verify=False):
-    """Pick the one host object that is `name` as the loader saw it."""
-    if objpath is None:
-        return Resolution(error="no --obj-path given", kind="missing")
-    cands = objpath.candidates(name)
-    if not cands:
-        return Resolution(error="not found on --obj-path", kind="missing")
-    if no_verify:
-        return Resolution(cands[0])
+def _pick(cands, snap_sections):
+    """Resolution among candidates: verify, prefer DWARF, then exact path."""
     good, bad = [], []
     for c in cands:
         why = verify(c, snap_sections)
@@ -360,19 +454,49 @@ def resolve(objpath, name, snap_sections, no_verify=False):
                           kind="conflict")
     # The target's stripped copy and the host's unstripped twin both match
     # the sections; only the one with DWARF can be symbolized, so it wins.
-    debug = [(c, w) for c, w in good if c.has_debug()]
-    good = debug or good
-    if len({c.md5() for c, _w in good}) > 1:
-        return Resolution(error="ambiguous, %d different matching files: %s"
-                          % (len(good), ", ".join(c.label for c, _w in good)),
-                          kind="conflict")
-    res = Resolution(good[0][0])
+    debug = [c for c, _w in good if c.has_debug()]
+    pool = debug or [c for c, _w in good]
+    if len({c.md5() for c in pool}) > 1:
+        # A file at the loaded name's own relative path outranks same-named
+        # files found elsewhere in the tree (another build directory, say).
+        exact = [c for c in pool if c.exact]
+        if exact and len({c.md5() for c in exact}) == 1:
+            pool = exact
+        else:
+            return Resolution(error="ambiguous, %d different matching files: "
+                              "%s" % (len(pool),
+                                      ", ".join(c.label for c in pool)),
+                              kind="conflict")
+    res = Resolution(pool[0])
     if not debug:
         res.warning = ("%s has no DWARF, so its lines cannot be symbolized "
                        "(stripped? put the unstripped copy on --obj-path, "
                        "with --obj-suffix if it is named differently)"
                        % res.cand.label)
     return res
+
+
+def resolve(objpath, name, snap_sections, no_verify=False):
+    """Pick the one host object that is `name` as the loader saw it.
+
+    A verified exact relative-path hit with DWARF settles it without
+    walking the tree; otherwise every candidate on the path is considered.
+    """
+    if objpath is None:
+        return Resolution(error="no --obj-path given", kind="missing")
+    exact = objpath.exact_candidates(name)
+    if exact and no_verify:
+        return Resolution(exact[0])
+    if exact:
+        res = _pick(exact, snap_sections)
+        if res.cand is not None and res.warning is None:
+            return res
+    cands = objpath.candidates(name)
+    if not cands:
+        return Resolution(error="not found on --obj-path", kind="missing")
+    if no_verify:
+        return Resolution(cands[0])
+    return _pick(cands, snap_sections)
 
 
 # --- windows ----------------------------------------------------------------
@@ -382,7 +506,12 @@ def _int(v):
 
 
 def object_windows(obj, cand=None):
-    """[(start, end, section_name, rap)] for one snapshot object entry.
+    """[(start, end, section_name, rap, ambiguous)] for one snapshot entry.
+
+    `ambiguous` marks a section whose name the object uses more than once
+    (COMDAT groups, a reused section attribute): a slice is symbolized by
+    section NAME, so two same-named sections cannot be told apart and must
+    not be merged onto one set of offsets.
 
     Snapshots from this plugin version carry each section's offset from its
     region base, read from the loader's own section_detail. Older artifacts do
@@ -400,18 +529,20 @@ def object_windows(obj, cand=None):
             pass
     running = [0] * len(RAP_NAMES)
     out = []
-    for sec in obj.get("sections", []):
+    names = [full_name(cand, sec) or sec["name"]
+             for sec in obj.get("sections", [])]
+    for sec, name in zip(obj.get("sections", []), names):
         rap, size = int(sec.get("rap", 0)), int(sec["size"])
         if not size or not 0 <= rap < len(RAP_NAMES) or not bases[rap]:
             continue
         if "offset" in sec:
             off = int(sec["offset"])
         else:
-            a = align.get(sec["name"], 1)
+            a = align.get(name, 1)
             off = (running[rap] + a - 1) // a * a
             running[rap] = off + size
         start = bases[rap] + off
-        out.append((start, start + size, sec["name"], rap))
+        out.append((start, start + size, name, rap, names.count(name) > 1))
     return out
 
 
@@ -430,8 +561,8 @@ def split(cov_path, objpath, out_dir, obj_dir=None, no_verify=False,
           stem=None):
     """Split one loader-generation artifact; return a summary dict.
 
-    Writes <out_dir>/<stem>.base.cov and one <stem>.<obj>__<sec>.cov per
-    executable section of each resolved object. Returns
+    Writes <out_dir>/<stem>.base.cov and one <stem>.<obj>.<md5>__<sec>.cov
+    per code section of each resolved object. Returns
       {"base": path, "modules": [{object, file, md5, section, out,
                                   records, generations}],
        "unresolved": {name: {"error", "addrs"}},
@@ -469,8 +600,20 @@ def split(cov_path, objpath, out_dir, obj_dir=None, no_verify=False,
             if res.error:
                 unresolved.setdefault(name, {"error": res.error,
                                              "kind": res.kind, "addrs": 0})
-            for s, e, sec, rap in object_windows(obj, res.cand):
-                wins.append((s, e, res.cand, name, sec, rap))
+            if obj.get("truncated"):
+                warnings.add(
+                    "%s: the plugin's snapshot of it was truncated (%s of %s "
+                    "sections recorded, or a name cut short); executions in "
+                    "unrecorded sections are reported as base image"
+                    % (name, len(obj.get("sections", [])),
+                       obj.get("sec_num", "?")))
+            if obj.get("chain_truncated"):
+                warnings.add(
+                    "generation %s: the plugin stopped walking the loader's "
+                    "object list at %d objects; later objects' executions are "
+                    "reported as base image" % (g, len(objs)))
+            for s, e, sec, rap, dup in object_windows(obj, res.cand):
+                wins.append((s, e, res.cand, name, sec, rap, dup))
         wins.sort(key=lambda w: w[0])
         for a, b in zip(wins, wins[1:]):
             if b[0] < a[1]:
@@ -502,6 +645,7 @@ def split(cov_path, objpath, out_dir, obj_dir=None, no_verify=False,
 
     base_recs, base_edges = {}, {}
     mods = {}            # (cand.label, section) -> {"recs", "edges", ...}
+    ambiguous = {}       # (object, section) -> records dropped
 
     def mod_slot(w):
         key = (w[2].label, w[4])
@@ -519,6 +663,8 @@ def split(cov_path, objpath, out_dir, obj_dir=None, no_verify=False,
             base_recs[a] = base_recs.get(a, 0) + c
         elif w[2] is None:
             unresolved[w[3]]["addrs"] += 1
+        elif w[6]:
+            ambiguous[(w[3], w[4])] = ambiguous.get((w[3], w[4]), 0) + 1
         else:
             slot = mod_slot(w)
             off = a - w[0]
@@ -530,18 +676,21 @@ def split(cov_path, objpath, out_dir, obj_dir=None, no_verify=False,
         ws, wd = window_of(g, s), window_of(g, d)
         if ws is None and wd is None:
             base_edges[(s, d)] = base_edges.get((s, d), 0) + c
-        elif ws is not None and ws is wd and ws[2] is not None:
+        elif ws is not None and ws is wd and ws[2] is not None \
+                and not ws[6]:
             slot = mod_slot(ws)
             k = (s - ws[0], d - ws[0])
             slot["edges"][k] = slot["edges"].get(k, 0) + c
         else:
             crossing += 1           # base<->module, module<->module, unresolved
 
-    # Every executable section of every resolved object gets a slice, so an
-    # object that was loaded but never ran reports 0% rather than nothing.
+    # Every code section of every resolved object gets a slice, so an object
+    # that was loaded but never ran reports 0% rather than nothing. (The text
+    # region also holds .init_array/.fini_array, which are not code.)
     for g, wins in gen_windows.items():
         for w in wins:
-            if w[2] is not None and w[5] == RAP_TEXT:
+            if (w[2] is not None and not w[6] and w[5] == RAP_TEXT
+                    and w[4] in w[2].exec_sections()):
                 mod_slot(w)
 
     rtl_keys = ("rtl_generations", "rtl_events", "ctx_enabled", "ctx_kind")
@@ -578,8 +727,11 @@ def split(cov_path, objpath, out_dir, obj_dir=None, no_verify=False,
                   "module_section": sec, "module_md5": cand.md5(),
                   "module_generations": sorted(slot["gens"]),
                   "rebased_to": "0x0"})
-        out = os.path.join(out_dir, "%s.%s__%s.cov" % (
-            stem, _slug(os.path.basename(slot["object"])), _slug(sec)))
+        # The md5 keeps two different files apart that share a basename
+        # (/a/foo.o and /b/foo.o, or foo.o rebuilt between loads).
+        out = os.path.join(out_dir, "%s.%s.%s__%s.cov" % (
+            stem, _slug(os.path.basename(slot["object"])), cand.md5()[:8],
+            _slug(sec)))
         write_cov(out, m, sorted(slot["recs"].items()),
                   [(s, d, c) for (s, d), c in sorted(slot["edges"].items())],
                   record_type=rtype, edges_recorded=had_edges)
@@ -591,8 +743,34 @@ def split(cov_path, objpath, out_dir, obj_dir=None, no_verify=False,
 
     return {"base": base_out, "base_records": len(base_recs),
             "modules": modules, "unresolved": unresolved,
-            "warnings": sorted(warnings),
+            "warnings": sorted(warnings) + [
+                "%s: it has more than one section named %s, which cannot be "
+                "told apart when symbolizing by name; %d records dropped"
+                % (o, sec, n) for (o, sec), n in sorted(ambiguous.items())],
             "crossing_edges": crossing, "unmapped_gens": sorted(unmapped_gens)}
+
+
+def unique_stems(covs):
+    """One output stem per artifact; same basenames get a path hash."""
+    by = {}
+    for c in covs:
+        by.setdefault(_slug(os.path.splitext(os.path.basename(c))[0]),
+                      []).append(c)
+    out = {}
+    for stem, paths in by.items():
+        for c in paths:
+            out[c] = stem if len(paths) == 1 else "%s.%08x" % (
+                stem, zlib.crc32(os.path.abspath(c).encode("utf-8",
+                                                           "surrogateescape"))
+                & 0xFFFFFFFF)
+    return out
+
+
+def print_skipped(objpath, out=None):
+    """Archives on the path that could not be indexed, said once."""
+    out = out or sys.stderr
+    for why in (objpath.skipped if objpath else []):
+        print("warning: --obj-path: %s" % why, file=out)
 
 
 def print_summary(cov, summary, out=None):
@@ -651,15 +829,17 @@ def run(args):
         objpath = ObjectPath(split_path_args(args.obj_path),
                              args.obj_suffix) if args.obj_path else None
         rc = 0
+        stems = unique_stems(args.cov)
         for cov in args.cov:
             summary = split(cov, objpath, args.out_dir,
-                            no_verify=args.obj_no_verify)
+                            no_verify=args.obj_no_verify, stem=stems[cov])
             print_summary(cov, summary)
             if any(u["kind"] == "conflict"
                    for u in summary["unresolved"].values()):
                 rc = 1
             elif summary["unresolved"] and rc == 0:
                 rc = 2
+        print_skipped(objpath)
     except (OSError, ValueError) as e:
         print("error: %s" % e, file=sys.stderr)
         return 1

@@ -52,7 +52,9 @@ until 1.0.
   Each candidate is **verified** against the sections the target actually
   loaded (name and size, standing in for the build-id a `.o` lacks); a
   mismatching or ambiguous match fails the run, an absent one is a warning
-  with the count of records dropped. `--obj-suffix .debug` finds unstripped
+  with the count of records dropped. A rebuild that changes no section size
+  is not detected (the target's relocated bytes are not recorded); the
+  resolved file's md5 is kept for provenance. `--obj-suffix .debug` finds unstripped
   host twins (`foo.o.debug`, `foo.debug`) of objects the target loaded
   stripped, and the copy with DWARF wins. Loaded but never executed code
   reports as 0% rather than being absent. The resolved file and its md5 are
@@ -66,6 +68,13 @@ until 1.0.
   `tcgcov rtl-split` does just the split; **`tcgcov rtems-args IMAGE`** prints
   the `rtl_state=…,rtl_debug=…[,rtl_load=…],elf=…` plugin options from the
   base image's symbol table, replacing the hand-run `nm`.
+
+- **The plugin flags incomplete snapshots.** Its guest-read caps are raised
+  (1024 objects, 4096 sections per object, 512-byte names) and hitting one is
+  now recorded (`truncated`, `name_truncated`, `chain_truncated`, plus the
+  loader's own `sec_num`), so the host warns instead of silently reporting
+  the lost sections' executions as base image. A cut-short name is matched to
+  the object's one section with that prefix and size.
 
 - **The plugin records each loaded section's true offset** (`offset` in
   `rtl_generations`, read from the loader's `section_detail`). Host-side

@@ -49,9 +49,14 @@ with **no change to RTEMS** (the R2 hooks below are optional polish):
    including `*.a` archive members, since libdl records only the member name.
    Every candidate is checked against the loader's own section table (each
    placed section must exist with the same size, the stand-in for the
-   build-id a `.o` lacks), so a stale rebuilt `.o` is refused, not
-   symbolized against the wrong lines. Two different matching files are an
-   error; an absent object is a warning that counts what was dropped. When the
+   build-id a `.o` lacks), so the wrong object, or a rebuild whose code
+   changed size, is refused rather than symbolized against the wrong lines.
+   A rebuild that changes no section size (an edited comment) is *not*
+   caught: the target's copy is relocated and the plugin records no bytes to
+   compare, so each slice carries the resolved file's md5 (`module_md5`) for
+   provenance instead. Two different matching files are an error unless
+   exactly one is at the loaded name's own relative path; an absent object is
+   a warning that counts what was dropped. When the
    target loads stripped objects, the copy with DWARF is preferred, and
    `--obj-suffix .debug` finds a twin named `foo.o.debug` or `foo.debug`.
    Per object and section, every generation's records are rebased and summed
