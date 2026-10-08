@@ -54,7 +54,8 @@ def resolve_locations(addr2line, elf, addrs, args):
     best = {}
     depths = {}
     for norm, line, func, depth, addr in iter_covered_lines(
-            addr2line, elf, addrs, path_options(args)):
+            addr2line, elf, addrs, path_options(args),
+            section=getattr(args, "section", None)):
         if addr not in depths or depth < depths[addr]:
             depths[addr] = depth
             best[addr] = (norm, line, func)
@@ -196,7 +197,11 @@ def run(args):
                 text = f.read()
         else:
             text = cfg.disassemble(objdump, args.elf)
-    except (OSError, RuntimeError) as e:
+        if args.section:
+            # The edges are offsets into this one section; in a relocatable
+            # object every other section's code sits at the same offsets.
+            text = cfg.section_text(text, args.section)
+    except (OSError, RuntimeError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 

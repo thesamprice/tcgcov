@@ -9,6 +9,26 @@ until 1.0.
 
 ## Unreleased
 
+### Fixed
+
+- **`--section` on a relocatable object now means that section only** (#12).
+  Every section of a `.o` starts at address 0, but `coverable` neither
+  restricted the disassembly to the section nor passed `-j` to addr2line,
+  and `branches` matched edges against every section's instructions. With
+  `-ffunction-sections` objects that was wrong in the aggregate, not just
+  per test: on the pay_a/pay_b fixture 7 lines per object (all of the
+  never-called `pad_uncovered()`, plus two in `pay_entry()`) were missing
+  from the denominator, overstating coverage, and `pay_entry()`'s branch was
+  reported on `spin()`'s loop line. Both now read only the section's own
+  `Disassembly of section` block (so one shared `--disasm` capture still
+  serves every section) and resolve through `addr2line -j`.
+- **The DWARF denominator says why it cannot read a `.o`.** A relocatable
+  object's line table is unrelocated (every sequence at 0, RISC-V address
+  advances and string offsets left to relocations), so `--denominator dwarf`
+  on one now fails with that reason instead of "check --source-root", and
+  the objdump/DWARF cross-check is skipped for it rather than compared
+  against garbage.
+
 ### Added
 
 - **`tcgcov report` — the whole chain in one command.** `.cov` artifacts to an
