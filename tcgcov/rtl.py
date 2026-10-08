@@ -1095,6 +1095,12 @@ def add_args_arguments(parser):
     parser.add_argument("--no-load-hook", action="store_true",
                         help="omit rtl_load= even if the image has the "
                              "rtems_rtl_debugger_load hook")
+    parser.add_argument("--no-flush-at", action="store_true",
+                        help="omit flush_at=<_Terminate>, which writes the "
+                             "artifact when RTEMS starts shutting down, so a "
+                             "BSP whose shutdown crashes QEMU (MicroBlaze "
+                             "petalogix-s3adsp1800) still leaves one. Needs a "
+                             "single-CPU machine")
 
 
 def run_args(args):
@@ -1120,6 +1126,8 @@ def run_args(args):
             "rtl_debug=0x%x" % syms["_rtld_debug"]]
     if "rtems_rtl_debugger_load" in syms and not args.no_load_hook:
         opts.append("rtl_load=0x%x" % syms["rtems_rtl_debugger_load"])
+    if "_Terminate" in syms and not args.no_flush_at:
+        opts.append("flush_at=0x%x" % syms["_Terminate"])
     opts.append("elf=%s" % os.path.abspath(args.elf))
     print(",".join(opts))
     return 0

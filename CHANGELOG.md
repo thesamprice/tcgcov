@@ -11,6 +11,21 @@ until 1.0.
 
 ### Added
 
+- **`flush_at=<addr>` plugin argument, and RTEMS dynamic-object coverage
+  verified on MicroBlaze** (#15). RTEMS on QEMU's `petalogix-s3adsp1800`
+  ends with `fatal: Microblaze: unaligned PC=ffffffff`; QEMU's abort skips
+  the plugin's exit handler, so no artifact was written. `flush_at=` writes
+  it when the given address first executes (single-CPU machines only: a
+  flush reads other vCPUs' tables), and `tcgcov rtems-args` now adds
+  `flush_at=<_Terminate>` (`--no-flush-at` to omit). With it, MicroBlaze
+  (32-bit little-endian, `-M petalogix-s3adsp1800,endianness=little`)
+  reproduces the riscv ground truth with no layout change: dl01 entry 2 and
+  loop 5, dl09's four lifetimes at count 4, and the content check passing on
+  all 11 loaded objects. On riscv nothing changes: the normal exit still
+  rewrites the artifact. (A gdb breakpoint is not a substitute: this
+  toolchain's gdb set it with the wrong byte order, and the guest ran past
+  `_Terminate` before the artifact was written.)
+
 - **Loaded code is compared byte for byte with the `.o`** (#14). The
   section-size check passed a rebuild whose code changed without changing
   any size (`s += i * 3` → `i * 5` in `pay_a.c`), and its coverage was

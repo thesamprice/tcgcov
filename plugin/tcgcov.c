@@ -715,6 +715,8 @@ static uint64_t cov_addr(CovState *s, uint64_t vaddr)
     return vaddr;
 }
 
+static void vcpu_flush(unsigned int cpu_index, void *udata);
+
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     CovState *s = &g_state;
@@ -734,6 +736,16 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      */
     if (s->rtl) {
         tcgcov_rtems_watch_tb(s, tb, n);
+    }
+    if (s->flush_at && !g_atomic_int_get(&s->flushed)) {
+        for (size_t k = 0; k < n; k++) {
+            struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, k);
+
+            if (qemu_plugin_insn_vaddr(insn) == s->flush_at) {
+                qemu_plugin_register_vcpu_insn_exec_cb(
+                    insn, vcpu_flush, QEMU_PLUGIN_CB_NO_REGS, NULL);
+            }
+        }
     }
 
     /* If the TB start is outside every filter range, ignore it entirely. */
@@ -944,6 +956,10 @@ static char *build_metadata_json(CovState *s, uint64_t record_count,
      * want them must tolerate their absence in older files.
      */
     json_append_str(m, "insn_fidelity", fidelity_name(s->mode));
+    if (s->flush_at) {
+        g_string_append_printf(m, "  \"flush_at\": \"0x%" PRIx64 "\",\n",
+                               s->flush_at);
+    }
     g_string_append_printf(m, "  \"discon_tracking\": %s,\n",
                            (s->edges && TCGCOV_HAVE_DISCON) ? "true" : "false");
     g_string_append_printf(m, "  \"ctx_enabled\": %s,\n",
@@ -1379,9 +1395,13 @@ static bool close_out(FILE *f, bool ok)
     return ok;
 }
 
-static void plugin_exit(qemu_plugin_id_t id, void *userdata)
+/*
+ * Write the artifact from the current tables. Reads and copies them under
+ * the lock and replaces the file atomically, so it is safe to run more than
+ * once: at flush_at, and again at exit.
+ */
+static void write_artifact(CovState *s)
 {
-    CovState *s = &g_state;
     GArray *pairs;
     GArray *edges;
     guint n_addrs, n_edges;
@@ -1391,9 +1411,6 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
     char *tmp = NULL;
     FILE *f;
     bool ok;
-
-    (void)id;
-    (void)userdata;
 
     g_mutex_lock(&s->lock);
     pairs = s->ctx ? collect_ctx_addrs(s) : collect_addrs(s);
@@ -1479,6 +1496,28 @@ out:
     g_free(meta);
     g_array_free(pairs, TRUE);
     g_array_free(edges, TRUE);
+}
+
+static void plugin_exit(qemu_plugin_id_t id, void *userdata)
+{
+    (void)id;
+    (void)userdata;
+    write_artifact(&g_state);
+}
+
+static void vcpu_flush(unsigned int cpu_index, void *udata)
+{
+    CovState *s = &g_state;
+
+    (void)cpu_index;
+    (void)udata;
+    if (g_atomic_int_compare_and_exchange(&s->flushed, 0, 1)) {
+        write_artifact(s);
+        if (s->verbose) {
+            g_printerr("tcgcov: flush_at 0x%" PRIx64 " reached; wrote %s\n",
+                       s->flush_at, s->out_path);
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1637,6 +1676,11 @@ static bool parse_arg(CovState *s, const char *arg)
     } else if (g_strcmp0(k, "rtl_load") == 0) {
         if (!parse_addr(v, &s->rtl_load_addr)) {
             g_printerr("tcgcov: rtl_load: bad address '%s'\n", v);
+            return false;
+        }
+    } else if (g_strcmp0(k, "flush_at") == 0) {
+        if (!parse_addr(v, &s->flush_at)) {
+            g_printerr("tcgcov: flush_at: bad address '%s'\n", v);
             return false;
         }
     } else if (g_strcmp0(k, "verbose") == 0) {
@@ -1809,6 +1853,18 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         }
         tcgcov_linux_register(id);
 #endif
+    }
+
+    /*
+     * Per-vCPU tables are written lock-free by their own vCPU; flushing
+     * from one vCPU while another runs would read a table mid-update.
+     */
+    if (s->flush_at && info->system_emulation &&
+        info->system.max_vcpus > 1) {
+        g_printerr("tcgcov: flush_at= needs a single-CPU machine "
+                   "(max_vcpus=%d)\n", info->system.max_vcpus);
+        g_printerr("tcgcov: refusing to start\n");
+        return -1;
     }
 
     if (s->edges || s->ctx) {

@@ -5,7 +5,9 @@
 
 resolves `_rtld_debug_state` and `_rtld_debug` (and the optional
 `rtems_rtl_debugger_load` hook, when the image has it) from the ELF's symbol
-table, and adds `elf=` so the artifact names its base image. This is the step
+table, adds `flush_at=` at `_Terminate` so the artifact is written as RTEMS
+starts shutting down (a BSP whose shutdown crashes QEMU still leaves one),
+and adds `elf=` so the artifact names its base image. This is the step
 GDB does for itself when it finds `_r_debug`; without it, every run needs an
 `nm` and two hand-copied addresses.
 """
