@@ -499,6 +499,7 @@ def _split_rtl(args, covs):
                 missing += 1
         out.append(summary["base"])
         out += [m["out"] for m in summary["modules"]]
+    rtl_mod.print_skipped(objpath)
     if missing and not args.obj_path:
         print("note: loaded-object coverage was not attributed; pass "
               "--obj-path DIR with the host copies of the loaded .o files",
