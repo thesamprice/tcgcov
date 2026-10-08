@@ -51,10 +51,15 @@ with **no change to RTEMS** (the R2 hooks below are optional polish):
    placed section must exist with the same size, the stand-in for the
    build-id a `.o` lacks), so the wrong object, or a rebuild whose code
    changed size, is refused rather than symbolized against the wrong lines.
-   A rebuild that changes no section size (an edited comment) is *not*
-   caught: the target's copy is relocated and the plugin records no bytes to
-   compare, so each slice carries the resolved file's md5 (`module_md5`) for
-   provenance instead. Two different matching files are an error unless
+   The plugin also records each loaded code and constant section's bytes
+   (`rtl_bytes`, once per distinct content, capped), and the host compares
+   them with the candidate's, skipping every byte a relocation may have
+   rewritten (per-type widths for RISC-V and MicroBlaze; other targets or
+   unknown relocation types are noted as unchecked, never guessed). So a
+   rebuild whose code changed at the same size is refused too. One that only
+   moved lines (an edited comment) has identical code and is accepted, which
+   is right: its DWARF maps what ran to the current source. Each slice
+   carries the resolved file's md5 (`module_md5`). Two different matching files are an error unless
    exactly one is at the loaded name's own relative path; an absent object is
    a warning that counts what was dropped. When the
    target loads stripped objects, the copy with DWARF is preferred, and

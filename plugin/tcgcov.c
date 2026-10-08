@@ -957,6 +957,8 @@ static char *build_metadata_json(CovState *s, uint64_t record_count,
                                s->rtl_events);
         g_string_append_printf(m, "  \"rtl_generations\": {%s},\n",
                                s->rtl_snaps ? s->rtl_snaps->str : "");
+        g_string_append_printf(m, "  \"rtl_bytes\": {%s},\n",
+                               s->rtl_blobs ? s->rtl_blobs->str : "");
     }
     if (s->ctx) {
         GHashTableIter it;
@@ -1773,6 +1775,9 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         s->rtl = true;
         s->ctx = true;
         s->rtl_snaps = g_string_new(NULL);
+        s->rtl_blobs = g_string_new(NULL);
+        s->rtl_blob_ids = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                                g_free, NULL);
 #endif
     } else if (s->rtl_load_addr) {
         g_printerr("tcgcov: rtl_load= only makes sense together with "

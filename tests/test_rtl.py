@@ -21,16 +21,26 @@ from tcgcov.format import FLAG_HAS_EDGES, read_all, read_full, write_cov  # noqa
 ALLOC, EXEC = 0x2, 0x4
 
 
-def make_elf(sections, symbols=(), debug=True, e_type=1):
+def make_elf(sections, symbols=(), debug=True, e_type=1, contents=None,
+             relas=(), machine=243):
     """ELF32 LE bytes: sections [(name, size, align, flags)], symbols
-    [(name, value)] (absolute), plus .debug_info when debug=True."""
+    [(name, value)] (absolute), plus .debug_info when debug=True.
+
+    contents maps a section name to its bytes (default: 0x13 filler);
+    relas is [(section_name, [(r_offset, r_type), ...])], each written as a
+    .rela.<name> table applying to the first section of that name."""
+    contents = contents or {}
     secs = [(n, sz, al, fl, 1) for n, sz, al, fl in sections]   # PROGBITS
     if debug:
         secs.append((".debug_info", 4, 1, 0, 1))
-    names = [""] + [s[0] for s in secs] + [".symtab", ".strtab", ".shstrtab"]
+    rela_names = [".rela" + n for n, _r in relas]
+    names = ([""] + [s[0] for s in secs] + rela_names
+             + [".symtab", ".strtab", ".shstrtab"])
     shstr = b"\0"
     off_of = {}
     for n in names[1:]:
+        if n in off_of:
+            continue
         off_of[n] = len(shstr)
         shstr += n.encode() + b"\0"
     strtab, syms = b"\0", [b"\0" * 16]
@@ -45,8 +55,17 @@ def make_elf(sections, symbols=(), debug=True, e_type=1):
     for n, sz, al, fl, typ in secs:
         hdrs.append(struct.pack("<10I", off_of[n], typ, fl, 0,
                                 base + len(body), sz, 0, 0, al, 0))
-        body += b"\x13" * sz
-    nsec = len(secs) + 1
+        body += contents.get(n, b"\x13" * sz)
+    symtab_idx = len(secs) + len(relas) + 1
+    for (target, entries), rname in zip(relas, rela_names):
+        data = b"".join(struct.pack("<IIi", off, typ, 0)
+                        for off, typ in entries)
+        hdrs.append(struct.pack("<10I", off_of[rname], 4, 0x40, 0,
+                                base + len(body), len(data), symtab_idx,
+                                [x[0] for x in secs].index(target) + 1,
+                                4, 12))
+        body += data
+    nsec = symtab_idx
     hdrs.append(struct.pack("<10I", off_of[".symtab"], 2, 0, 0,
                             base + len(body), len(symtab), nsec + 1, 1, 4, 16))
     body += symtab
@@ -58,7 +77,7 @@ def make_elf(sections, symbols=(), debug=True, e_type=1):
     body += shstr
     shoff = base + len(body)
     ident = b"\x7fELF\x01\x01\x01" + b"\0" * 9
-    ehdr = ident + struct.pack("<HHIIIIIHHHHHH", e_type, 243, 1, 0, 0, shoff,
+    ehdr = ident + struct.pack("<HHIIIIIHHHHHH", e_type, machine, 1, 0, 0, shoff,
                                0, 52, 0, 0, 40, len(hdrs), len(hdrs) - 1)
     return ehdr + body + b"".join(hdrs)
 
@@ -330,6 +349,100 @@ class SplitTest(Fixture):
         ap = argparse.ArgumentParser()
         rtl.add_arguments(ap)
         return rtl.run(ap.parse_args(argv))
+
+
+class ContentCheckTest(Fixture):
+    """Issue #14: same section sizes, different code."""
+
+    CODE = bytes(range(0x40))
+    SECS = [(".text.f", 0x40, 4, ALLOC | EXEC)]
+    # A CALL (8 bytes) at +0x10 and a HI20 (4 bytes) at +0x20: the bytes
+    # the loader rewrites, so they may differ from the file.
+    RELAS = [(".text.f", [(0x10, 18), (0x20, 26)])]
+
+    def loaded(self, patch=()):
+        b = bytearray(self.CODE)
+        for off, val in patch:
+            b[off] = val
+        return bytes(b)
+
+    def resolve_with(self, file_code, loaded, relas=None, machine=243):
+        self.put("f.o", make_elf(self.SECS, contents={".text.f": file_code},
+                                 relas=self.RELAS if relas is None else relas,
+                                 machine=machine))
+        sections = snap("f.o", 0, self.SECS)["sections"]
+        sections[0]["bytes"] = "id"
+        return rtl.resolve(rtl.ObjectPath([self.d]), "f.o", sections,
+                           blobs={"id": loaded})
+
+    def test_relocated_bytes_are_not_a_mismatch(self):
+        # The loader filled in the call and the address: only masked bytes.
+        res = self.resolve_with(self.CODE, self.loaded(
+            [(0x10, 0xAA), (0x17, 0xBB), (0x20, 0xCC), (0x23, 0xDD)]))
+        self.assertIsNone(res.error)
+        self.assertIsNone(res.note)
+
+    def test_changed_code_of_the_same_size_is_refused(self):
+        res = self.resolve_with(self.CODE, self.loaded([(0x1c, 0x99)]))
+        self.assertEqual(res.kind, "conflict")
+        self.assertIn(".text.f differs from what the target loaded at +0x1c",
+                      res.error)
+
+    def test_a_byte_just_past_a_relocation_is_still_checked(self):
+        res = self.resolve_with(self.CODE, self.loaded([(0x24, 0x99)]))
+        self.assertEqual(res.kind, "conflict")
+
+    def test_uleb128_relocations_mask_their_whole_encoding(self):
+        code = bytearray(self.CODE)
+        code[0x30:0x33] = b"\x80\x80\x00"                 # 3-byte ULEB
+        loaded = bytearray(code)
+        loaded[0x30:0x33] = b"\xff\xff\x01"
+        res = self.resolve_with(bytes(code), bytes(loaded),
+                                relas=[(".text.f", [(0x30, 60)])])
+        self.assertIsNone(res.error)
+
+    def test_unknown_relocation_type_is_noted_not_guessed(self):
+        res = self.resolve_with(self.CODE, self.loaded([(0x1c, 0x99)]),
+                                relas=[(".text.f", [(0x10, 250)])])
+        self.assertIsNone(res.error)              # cannot judge: not refused
+        self.assertIn("relocation type 250", res.note)
+
+    def test_unknown_architecture_is_noted(self):
+        res = self.resolve_with(self.CODE, self.loaded(), machine=62)
+        self.assertIsNone(res.error)
+        self.assertIn("no relocation table for ELF machine 62", res.note)
+
+    def test_microblaze_widths(self):
+        # R_MICROBLAZE_64 (5) covers an imm + insn pair: 8 bytes.
+        res = self.resolve_with(self.CODE, self.loaded([(0x17, 0x99)]),
+                                relas=[(".text.f", [(0x10, 5)])],
+                                machine=189)
+        self.assertIsNone(res.error)
+
+    def test_artifacts_without_bytes_are_not_checked(self):
+        self.put("f.o", make_elf(self.SECS))
+        res = rtl.resolve(rtl.ObjectPath([self.d]), "f.o",
+                          snap("f.o", 0, self.SECS)["sections"], blobs={})
+        self.assertIsNone(res.error)
+        self.assertIsNone(res.note)
+
+    def test_split_reports_a_rebuilt_object_as_a_conflict(self):
+        self.put("objs/f.o", make_elf(self.SECS,
+                                      contents={".text.f": self.CODE},
+                                      relas=self.RELAS))
+        entry = snap("/f.o", 0x80050000, self.SECS)
+        entry["sections"][0]["bytes"] = "aa"
+        import base64
+        cov = os.path.join(self.d, "run.cov")
+        write_cov(cov, {"ctx_kind": "loader-generation",
+                        "rtl_generations": {"1": [entry]},
+                        "rtl_bytes": {"aa": base64.b64encode(
+                            self.loaded([(0x1c, 0x99)])).decode()}},
+                  [(1, 0x80050004, 1)], ctx=True)
+        s = rtl.split(cov, rtl.ObjectPath([os.path.join(self.d, "objs")]),
+                      os.path.join(self.d, "out"))
+        self.assertEqual(s["unresolved"]["/f.o"]["kind"], "conflict")
+        self.assertIn("+0x1c", s["unresolved"]["/f.o"]["error"])
 
 
 class SectionViewTest(unittest.TestCase):

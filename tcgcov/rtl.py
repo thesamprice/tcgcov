@@ -22,11 +22,14 @@ the object's DWARF. This module supplies that, the way GDB's
   Two verified candidates with different contents are an error, not a guess
   (unless exactly one sits at the loaded name's own relative path).
 
-  Known limit: a rebuild that changes no section size -- an edited comment,
-  which shifts every line below it -- passes. The target holds the object's
-  bytes only after relocation and the plugin does not record them, so there
-  is nothing to compare contents against; each slice records the md5 of the
-  file it was resolved to (`module_md5`) so the provenance can be checked.
+  When the plugin recorded the loaded bytes (metadata.rtl_bytes), the
+  candidate's code and constants are also compared with them, skipping the
+  bytes each relocation may have rewritten (content_check). That refuses a
+  rebuild whose code changed without changing any size. A rebuild that only
+  moved lines (an edited comment) has identical code and is accepted: what
+  ran is what the candidate holds, and its DWARF maps that to the current
+  source. Each slice records the md5 of the file it was resolved to
+  (`module_md5`).
 
 The split then turns one generation-tagged artifact into TCGCOV1 slices:
 
@@ -93,7 +96,7 @@ def elf_parse(data, what="<elf>"):
         raise ElfError("%s: unsupported ELF class/encoding" % what)
     is64, p = ei_class == 2, "<" if ei_data == 1 else ">"
     try:
-        e_type = struct.unpack_from(p + "H", data, 16)[0]
+        e_type, e_machine = struct.unpack_from(p + "HH", data, 16)
         if is64:
             e_shoff = struct.unpack_from(p + "Q", data, 0x28)[0]
             e_shentsize, e_shnum, e_shstrndx = struct.unpack_from(
@@ -106,7 +109,7 @@ def elf_parse(data, what="<elf>"):
             fmt = p + "IIIIIIIIII"
         if not e_shoff:
             return {"class": 64 if is64 else 32, "little": ei_data == 1,
-                    "type": e_type, "sections": []}
+                    "type": e_type, "machine": e_machine, "sections": []}
         if e_shentsize < struct.calcsize(fmt):
             raise ElfError("%s: bad section header size" % what)
         sh0 = struct.unpack_from(fmt, data, e_shoff)
@@ -129,7 +132,7 @@ def elf_parse(data, what="<elf>"):
     shstr = data[so:so + ss]
 
     sections = []
-    for hdr, (nm, typ, flags, addr, off, size, link, _info, align,
+    for hdr, (nm, typ, flags, addr, off, size, link, info, align,
               entsize) in zip(hdrs, raw):
         if nm >= len(shstr) and nm:
             raise ElfError("%s: section name offset out of range" % what)
@@ -137,10 +140,11 @@ def elf_parse(data, what="<elf>"):
         name = shstr[nm:end if end != -1 else None].decode("utf-8", "replace")
         sections.append({"name": name, "type": typ, "flags": flags,
                          "addr": addr, "offset": off, "size": size,
-                         "align": align, "link": link, "entsize": entsize,
+                         "align": align, "link": link, "info": info,
+                         "entsize": entsize,
                          "sh_name": nm, "hdr": hdr})
     return {"class": 64 if is64 else 32, "little": ei_data == 1,
-            "type": e_type, "sections": sections}
+            "type": e_type, "machine": e_machine, "sections": sections}
 
 
 def section_view(data, index):
@@ -253,6 +257,134 @@ def ar_members(data, what="<archive>"):
     f = io.BytesIO(data)
     for name, off, size in ar_entries(f, what):
         yield name, data[off:off + size]
+
+
+# --- content check ------------------------------------------------------
+
+_SHT_RELA, _SHT_REL = 4, 9
+EM_RISCV, EM_MICROBLAZE, EM_MICROBLAZE_OLD = 243, 189, 0xBAAB
+_ULEB = "uleb"
+
+# Bytes each relocation type writes, from its r_offset: what the loader may
+# have changed and the content check therefore skips. Masking a whole
+# instruction (or instruction pair) is deliberate -- a little too much is
+# harmless, too little would flag every loaded object as different.
+_RISCV_WIDTHS = {
+    0: 0, 1: 4, 2: 8,                         # NONE, 32, 64
+    16: 4, 17: 4, 18: 8, 19: 8,               # BRANCH, JAL, CALL, CALL_PLT
+    20: 4, 21: 4, 22: 4, 23: 4, 24: 4, 25: 4,  # GOT/TLS/PCREL hi/lo
+    26: 4, 27: 4, 28: 4,                      # HI20, LO12_I, LO12_S
+    29: 4, 30: 4, 31: 4, 32: 4,               # TPREL_*
+    33: 1, 34: 2, 35: 4, 36: 8,               # ADD8/16/32/64
+    37: 1, 38: 2, 39: 4, 40: 8,               # SUB8/16/32/64
+    41: 4,                                    # GOT32_PCREL
+    43: 0, 51: 0,                             # ALIGN, RELAX (markers)
+    44: 2, 45: 2, 46: 2,                      # RVC_BRANCH/JUMP/LUI
+    52: 1, 53: 1, 54: 1, 55: 2, 56: 4,        # SUB6, SET6/8/16/32
+    57: 4, 59: 4,                             # 32_PCREL, PLT32
+    60: _ULEB, 61: _ULEB,                     # SET/SUB_ULEB128
+}
+_MICROBLAZE_WIDTHS = {
+    0: 0, 1: 4, 2: 4, 3: 8, 4: 4, 5: 8, 6: 4,  # NONE 32 32_PCREL 64_PCREL ...
+    7: 4, 8: 4, 9: 8, 10: 4, 11: 0, 12: 0,    # SRO32 SRW32 64_NONE ... VT*
+    13: 8, 14: 8, 15: 8, 16: 4, 17: 4, 18: 4,  # GOTPC_64 GOT_64 PLT_64 ...
+    19: 8, 20: 4, 21: 4, 22: 4, 23: 8, 24: 8,  # GOTOFF_64/32 COPY TLS...
+    25: 8, 26: 8, 27: 8, 28: 8, 29: 4, 30: 8,
+    31: 8, 32: 4,                              # TEXTREL_64, TEXTREL_32_LO
+}
+_WIDTHS = {EM_RISCV: _RISCV_WIDTHS, EM_MICROBLAZE: _MICROBLAZE_WIDTHS,
+           EM_MICROBLAZE_OLD: _MICROBLAZE_WIDTHS}
+
+
+def relocation_mask(cand, index):
+    """Set of byte offsets in section `index` its relocations may rewrite.
+
+    Raises ElfError (with the reason) when that cannot be known: an
+    architecture without a width table, or a relocation type not in it.
+    """
+    data = cand.data()
+    elf = elf_parse(data, cand.label)
+    widths = _WIDTHS.get(elf["machine"])
+    if widths is None:
+        raise ElfError("no relocation table for ELF machine %d"
+                       % elf["machine"])
+    p = "<" if elf["little"] else ">"
+    is64 = elf["class"] == 64
+    sec = elf["sections"][index]
+    body = data[sec["offset"]:sec["offset"] + sec["size"]]
+    mask = set()
+    for r in elf["sections"]:
+        # sh_info names the section a relocation table applies to.
+        if r["type"] not in (_SHT_RELA, _SHT_REL) or r["info"] != index:
+            continue
+        ent = r["entsize"] or ((24 if is64 else 12) if r["type"] == _SHT_RELA
+                               else (16 if is64 else 8))
+        for k in range(r["size"] // ent):
+            o = r["offset"] + k * ent
+            if is64:
+                r_off, r_info = struct.unpack_from(p + "QQ", data, o)
+                rtype = r_info & 0xFFFFFFFF
+            else:
+                r_off, r_info = struct.unpack_from(p + "II", data, o)
+                rtype = r_info & 0xFF
+            width = widths.get(rtype)
+            if width is None:
+                raise ElfError("relocation type %d is not in the table for "
+                               "ELF machine %d" % (rtype, elf["machine"]))
+            if width == _ULEB:
+                width = 1
+                while r_off + width - 1 < len(body) \
+                        and body[r_off + width - 1] & 0x80:
+                    width += 1
+            mask.update(range(r_off, r_off + width))
+    return body, mask
+
+
+def content_check(cand, snap_sections, blobs):
+    """(reason, note) for the candidate's code against the loaded bytes.
+
+    reason is a mismatch (the candidate is not what ran); note says what
+    could not be checked. Both None means every recorded section matched
+    outside its relocation sites. Comments and other line-table-only edits
+    leave the code identical and are not -- cannot be -- detected; that is
+    also the case in which the candidate's DWARF is still right.
+    """
+    if not blobs:
+        return None, None
+    names = [full_name(cand, sec) or sec["name"] for sec in snap_sections]
+    skipped, unchecked = 0, None
+    for k, sec in enumerate(snap_sections):
+        if sec.get("bytes_skipped"):
+            skipped += 1
+            continue
+        loaded = blobs.get(sec.get("bytes"))
+        if loaded is None:
+            continue
+        name = names[k]
+        occ = names[:k].count(name)
+        idx = elf_index_for(cand, name, occ, sec["size"])
+        if idx is None:
+            continue                  # verify() already judged the sizes
+        try:
+            body, mask = relocation_mask(cand, idx)
+        except (OSError, ElfError) as e:
+            unchecked = unchecked or str(e)
+            continue
+        if len(body) != len(loaded):
+            return "%s: %d bytes on file, %d loaded" % (
+                name, len(body), len(loaded)), None
+        for off, (a, b) in enumerate(zip(body, loaded)):
+            if a != b and off not in mask:
+                return ("%s differs from what the target loaded at +0x%x "
+                        "(same size, different code: rebuilt?)" % (name, off),
+                        None)
+    note = None
+    if unchecked:
+        note = "%s: contents not checked (%s)" % (cand.label, unchecked)
+    elif skipped:
+        note = ("%s: %d section(s) too large for the plugin to record; "
+                "their contents were not checked" % (cand.label, skipped))
+    return None, note
 
 
 # --- the object search path -------------------------------------------------
@@ -473,13 +605,16 @@ class Resolution:
     def __init__(self, cand=None, error=None, kind=None):
         self.cand, self.error, self.kind = cand, error, kind
         self.warning = None
+        self.note = None        # what verification could not check
 
 
-def _pick(cands, snap_sections):
+def _pick(cands, snap_sections, blobs=None):
     """Resolution among candidates: verify, prefer DWARF, then exact path."""
-    good, bad = [], []
+    good, bad, notes = [], [], {}
     for c in cands:
         why = verify(c, snap_sections)
+        if why is None:
+            why, notes[c.key] = content_check(c, snap_sections, blobs)
         (bad if why else good).append((c, why))
     if not good:
         return Resolution(error="no candidate matches the loaded sections: "
@@ -501,6 +636,7 @@ def _pick(cands, snap_sections):
                                       ", ".join(c.label for c in pool)),
                               kind="conflict")
     res = Resolution(pool[0])
+    res.note = notes.get(res.cand.key)
     if not debug:
         res.warning = ("%s has no DWARF, so its lines cannot be symbolized "
                        "(stripped? put the unstripped copy on --obj-path, "
@@ -509,7 +645,7 @@ def _pick(cands, snap_sections):
     return res
 
 
-def resolve(objpath, name, snap_sections, no_verify=False):
+def resolve(objpath, name, snap_sections, no_verify=False, blobs=None):
     """Pick the one host object that is `name` as the loader saw it.
 
     A verified exact relative-path hit with DWARF settles it without
@@ -521,7 +657,7 @@ def resolve(objpath, name, snap_sections, no_verify=False):
     if exact and no_verify:
         return Resolution(exact[0])
     if exact:
-        res = _pick(exact, snap_sections)
+        res = _pick(exact, snap_sections, blobs)
         if res.cand is not None and res.warning is None:
             return res
     cands = objpath.candidates(name)
@@ -529,7 +665,7 @@ def resolve(objpath, name, snap_sections, no_verify=False):
         return Resolution(error="not found on --obj-path", kind="missing")
     if no_verify:
         return Resolution(cands[0])
-    return _pick(cands, snap_sections)
+    return _pick(cands, snap_sections, blobs)
 
 
 # --- windows ----------------------------------------------------------------
@@ -602,6 +738,25 @@ def elf_index_for(cand, name, occurrence, size):
     return same[occurrence][0]
 
 
+class _Blobs(dict):
+    """metadata.rtl_bytes, base64-decoded on first use per id."""
+
+    def __init__(self, raw):
+        super().__init__()
+        self._raw = raw
+
+    def get(self, key, default=None):
+        if key not in self:
+            if key not in self._raw:
+                return default
+            import base64
+            self[key] = base64.b64decode(self._raw[key])
+        return dict.get(self, key)
+
+    def __bool__(self):
+        return bool(self._raw)
+
+
 def _write_once(path, produce):
     """Write produce() to path unless it is there; return path.
 
@@ -650,6 +805,7 @@ def split(cov_path, objpath, out_dir, obj_dir=None, no_verify=False,
     obj_dir = obj_dir or os.path.join(out_dir, "objs")
     os.makedirs(out_dir, exist_ok=True)
     gens = meta["rtl_generations"]
+    blobs = _Blobs(meta.get("rtl_bytes") or {})
 
     resolved = {}        # (name, md5-of-snapshot-sections) -> Resolution
     warnings = set()
@@ -665,10 +821,12 @@ def split(cov_path, objpath, out_dir, obj_dir=None, no_verify=False,
             res = resolved.get((name, sig))
             if res is None:
                 res = resolve(objpath, name, obj.get("sections", []),
-                              no_verify)
+                              no_verify, blobs)
                 resolved[(name, sig)] = res
             if res.warning:
                 warnings.add(res.warning)
+            if res.note:
+                warnings.add(res.note)
             if res.error:
                 unresolved.setdefault(name, {"error": res.error,
                                              "kind": res.kind, "addrs": 0})

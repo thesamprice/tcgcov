@@ -47,6 +47,8 @@
 #define RTL_MAX_OBJS     1024      /* chain-walk bound: a corrupt guest    */
 #define RTL_MAX_SECS     4096      /*   pointer must not hang the plugin; */
 #define RTL_MAX_NAME     512       /*   hitting one is flagged, not silent */
+#define RTL_MAX_BLOB     (256u * 1024u)       /* bytes recorded per section */
+#define RTL_MAX_BLOBS    (8u * 1024u * 1024u) /* ... and per run, deduped  */
 
 static bool rtl_read(uint64_t addr, void *out, size_t len)
 {
@@ -87,6 +89,45 @@ static bool rtl_read_str(uint64_t addr, char *out, size_t cap)
 }
 
 /*
+ * Record a loaded section's bytes for the host's content check (issue #14)
+ * and append `, "bytes": "<id>"` to the section entry being written. The
+ * loader has relocated the section, so a digest computed here could never be
+ * compared with the .o; the host needs the bytes, to skip the relocation
+ * sites. They are kept once per distinct content (an object reloaded at the
+ * same addresses is identical) in metadata.rtl_bytes, under per-section and
+ * per-run caps. Over a cap the entry says "bytes_skipped" instead, so the
+ * host can tell "not checked" from an old artifact.
+ */
+static void rtl_record_bytes(CovState *s, uint64_t addr, uint32_t size)
+{
+    g_autoptr(GByteArray) buf = g_byte_array_new();
+    uint64_t h = 0xcbf29ce484222325ull;          /* FNV-1a 64 */
+    char id[17];
+
+    if (size > RTL_MAX_BLOB || s->rtl_blob_bytes + size > RTL_MAX_BLOBS) {
+        g_string_append(s->rtl_snaps, ", \"bytes_skipped\": true");
+        return;
+    }
+    if (!qemu_plugin_read_memory_vaddr(addr, buf, size) || buf->len < size) {
+        g_string_append(s->rtl_snaps, ", \"bytes_skipped\": true");
+        return;
+    }
+    for (uint32_t i = 0; i < size; i++) {
+        h = (h ^ buf->data[i]) * 0x100000001b3ull;
+    }
+    snprintf(id, sizeof(id), "%016" PRIx64, h);
+    if (!g_hash_table_contains(s->rtl_blob_ids, id)) {
+        g_autofree gchar *b64 = g_base64_encode(buf->data, size);
+
+        g_hash_table_add(s->rtl_blob_ids, g_strdup(id));
+        s->rtl_blob_bytes += size;
+        g_string_append_printf(s->rtl_blobs, "%s\"%s\": \"%s\"",
+                               s->rtl_blobs->len ? ", " : "", id, b64);
+    }
+    g_string_append_printf(s->rtl_snaps, ", \"bytes\": \"%s\"", id);
+}
+
+/*
  * Append a JSON snapshot of the loader's current link_map chain for
  * generation `gen`. Called under s->lock from the notification callback --
  * a context-switch-rate event, not an execution-rate one.
@@ -121,9 +162,12 @@ static void rtl_snapshot(CovState *s, uint64_t gen)
         g_string_append(s->rtl_snaps, "{\"object\": \"");
         json_escape_append(s->rtl_snaps, name);
         g_string_append(s->rtl_snaps, "\"");
+        uint32_t bases[6];
+
         for (i = 0; i < 6; i++) {
             uint32_t base = rtl_read_u32(lm + RTL_LM_SECADDR + 4 * i, &ok);
 
+            bases[i] = base;
             if (base) {
                 g_string_append_printf(s->rtl_snaps,
                                        ", \"%s\": \"0x%" PRIx32 "\"",
@@ -151,13 +195,20 @@ static void rtl_snapshot(CovState *s, uint64_t gen)
             } else {
                 g_string_append(s->rtl_snaps, "\"");
             }
+            uint32_t off = rtl_read_u32(sd + RTL_SD_OFFSET, &ok);
+            uint32_t size = rtl_read_u32(sd + RTL_SD_SIZE, &ok);
+            uint32_t rap = rtl_read_u32(sd + RTL_SD_RAPID, &ok);
+
             g_string_append_printf(s->rtl_snaps,
                                    ", \"offset\": %" PRIu32
                                    ", \"size\": %" PRIu32
-                                   ", \"rap\": %" PRIu32 "}",
-                                   rtl_read_u32(sd + RTL_SD_OFFSET, &ok),
-                                   rtl_read_u32(sd + RTL_SD_SIZE, &ok),
-                                   rtl_read_u32(sd + RTL_SD_RAPID, &ok));
+                                   ", \"rap\": %" PRIu32,
+                                   off, size, rap);
+            /* Code and constants: what the host compares against the .o */
+            if (ok && size && rap <= 1 && bases[rap]) {
+                rtl_record_bytes(s, (uint64_t)bases[rap] + off, size);
+            }
+            g_string_append(s->rtl_snaps, "}");
         }
         /* sec_num is the loader's own count; with "truncated" the host can
          * tell a capped or cut snapshot from a complete one. */
