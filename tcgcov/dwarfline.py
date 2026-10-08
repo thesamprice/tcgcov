@@ -1088,6 +1088,17 @@ def iter_line_rows(elf, section=None):
         yield address, path, line
 
 
+def section_base(elf, section):
+    """Address a row's 0-based --section offset is relative to.
+
+    0 for a relocatable object (its symbols are section-relative too);
+    the section's sh_addr in a linked image, where symbols are absolute.
+    """
+    if section is None or elf.relocatable:
+        return 0
+    return elf.section_addrs[elf.section_names.index(section)][0]
+
+
 def iter_line_rows_by_section(elf, section=None):
     """Yield (address, file, line, section) for every real code row in an ELF.
 

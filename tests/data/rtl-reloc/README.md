@@ -9,6 +9,11 @@ path):
 | `pay_a-riscv32-O2.o` | `riscv-rtems7-gcc` 15.2 | same, `-O2` (everything inlined into `pay_entry`) |
 | `pay_a-microblaze-O0.o` | `microblaze-rtems7-gcc` 12.4 | `-O0` |
 
+`pay_a-riscv32-O0-linked.elf` is the `-O0` object linked on its own
+(`-nostdlib -Wl,--unresolved-symbols=ignore-all -Wl,-Ttext=0x80000000
+-Wl,-e,pay_entry -Wl,--build-id=none`): a linked image whose `.text` does not
+start at 0, for `--section` on an executable.
+
 `expected.json` comes from binutils, not from tcgcov: `readelf_rows` is the
 (line@address -> count) multiset of `readelf --debug-dump=decodedline`, which
 applies the relocations itself, and `objdump_lines` is each code section's

@@ -116,6 +116,16 @@ class DwarfDenominatorTest(unittest.TestCase):
             got = {(fl, ln) for fl, ln, _fn in self.inventory(f, sec)}
             self.assertLessEqual({(fl, ln) for fl, ln, _fn in lines}, got)
 
+    def test_linked_image_section_offsets_keep_their_function_names(self):
+        # Review of PR #24: in a linked image, --section rows are offsets
+        # into the section but symbols are absolute; the lookup must add
+        # the section's address back. pay_a-riscv32-O0-linked.elf is the
+        # -O0 object linked with .text at 0x80000000.
+        got = self.inventory("pay_a-riscv32-O0-linked.elf", ".text")
+        want = {tuple(x) for lines in EXPECTED["pay_a-riscv32-O0.o"]
+                ["objdump_lines"].values() for x in lines}
+        self.assertEqual(got, want)
+
     def test_function_names_are_per_section(self):
         got = self.inventory("pay_a-riscv32-O0.o", ".text.pad_uncovered")
         self.assertEqual({fn for _f, _l, fn in got}, {"pad_uncovered"})

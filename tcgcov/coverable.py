@@ -153,18 +153,22 @@ def dwarf_inventory(args, opts):
     # A relocatable object (.o, .ko) is relocated by read_elf, and its rows
     # carry the section their sequence addresses; --section keeps one
     # section's rows, as 0-based offsets the way `addr2line -j` reports them.
+    section = getattr(args, "section", None)
     elf = dwarfline.read_elf(args.elf)
     functions = dwarfline.FunctionIndex(elf)
+    # Rows come back as section offsets; a linked image's symbols are
+    # absolute, so the lookup needs the section's address added back.
+    base = dwarfline.section_base(elf, section) if section else 0
     seen = {}
     rows = 0
     for addr, path, line, sec in dwarfline.iter_line_rows_by_section(
-            elf, getattr(args, "section", None)):
+            elf, section):
         rows += 1
         norm = normalize_path(path, opts.source_root, opts.markers, opts.roots,
                               opts.excludes, opts.all_paths)
         if norm is None:
             continue
-        seen.setdefault((norm, line, functions.at(addr, sec)), addr)
+        seen.setdefault((norm, line, functions.at(addr + base, sec)), addr)
     return seen, rows
 
 
