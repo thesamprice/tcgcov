@@ -186,6 +186,9 @@ typedef struct {
     uint64_t rtl_generation;       /* current generation, starts at 0 */
     uint64_t rtl_events;           /* notification hits observed */
     GString *rtl_snaps;            /* metadata JSON fragments, under lock */
+    GString *rtl_blobs;            /* rtl_bytes: "id": "base64", under lock */
+    GHashTable *rtl_blob_ids;      /* ids already in rtl_blobs */
+    uint64_t rtl_blob_bytes;       /* raw bytes kept, against the run cap */
 
     /*
      * Per-vCPU edge state, indexed by cpu_index. Allocated once at install

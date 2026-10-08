@@ -11,6 +11,24 @@ until 1.0.
 
 ### Added
 
+- **Loaded code is compared byte for byte with the `.o`** (#14). The
+  section-size check passed a rebuild whose code changed without changing
+  any size (`s += i * 3` → `i * 5` in `pay_a.c`), and its coverage was
+  then reported against the wrong code. The plugin now records each loaded
+  code and constant section's bytes (`metadata.rtl_bytes`, keyed by content
+  so reloads at the same addresses are stored once; 256 KiB per section, 8
+  MiB per run, `bytes_skipped` beyond), and the host compares them with the
+  candidate's, skipping the bytes each relocation may have rewritten. Widths
+  are tabled for RISC-V (including the `ADD`/`SUB`/`SET` and ULEB128
+  families) and MicroBlaze; another architecture or an unknown relocation
+  type is reported as "contents not checked", never guessed. A comment-only
+  rebuild leaves the code identical and is (correctly) still accepted.
+  Verified live on the reuse fixture: the real `pay_a.o` and a comment-only
+  rebuild resolve, the `* 5` rebuild is refused at `.text.spin+0x1c`; dl01
+  and dl09 (calls into the base image, `HI20`/`LO12` string addresses, four
+  reload cycles) show no false mismatch, and dl09's 40 generations add 21
+  recorded sections, about 7 KB.
+
 - **Objects with several sections of one name are covered** (#13). COMDAT
   groups and clang's `-fno-unique-section-names` give a `.o` many sections
   called `.text`; `addr2line -j .text` can only ever pick the first, so
@@ -85,9 +103,8 @@ until 1.0.
   Each candidate is **verified** against the sections the target actually
   loaded (name and size, standing in for the build-id a `.o` lacks); a
   mismatching or ambiguous match fails the run, an absent one is a warning
-  with the count of records dropped. A rebuild that changes no section size
-  is not detected (the target's relocated bytes are not recorded); the
-  resolved file's md5 is kept for provenance. `--obj-suffix .debug` finds unstripped
+  with the count of records dropped. The resolved file's md5 is kept for
+  provenance. `--obj-suffix .debug` finds unstripped
   host twins (`foo.o.debug`, `foo.debug`) of objects the target loaded
   stripped, and the copy with DWARF wins. Loaded but never executed code
   reports as 0% rather than being absent. The resolved file and its md5 are
