@@ -196,3 +196,46 @@ the generation-1 slice — coverage of code that ran *inside* `dlopen`,
 which the dlfcn-level notification can never attribute. The extra
 generation the later RT_CONSISTENT bump creates has an identical map and
 is harmless by design.
+
+---
+
+# One command: `report --obj-path`
+
+Measured 2026-10-08, riscv/mbv, QEMU 11.0.2, the same dl01/dl09 builds and
+the pay_a/pay_b fixture rebuilt with `build-reuse-fixture.sh`. No map files,
+no `modmap`, no per-object flags:
+
+    A=$(tcgcov rtems-args dl09.exe)   # rtl_state=0x8000bbcc,rtl_debug=0x8003d198,elf=.../dl09.exe
+    qemu-system-riscv32 ... -plugin libtcgcov.so,out=dl09.cov,mode=tb,edges=on,$A ...
+    tcgcov report dl01.cov dl09.cov --out-dir cov \
+        --obj-path build/riscv/mbv/testsuites/libtests \
+        --toolchain-prefix riscv-rtems7- --all-paths
+
+`--obj-path` is the build tree's root. Each loaded name (`/dl09-o1.o`) is
+found by basename under `dl09/`, checked against the loader's own section
+table, and reported against that `.o`:
+
+    /dl09-o1.o:.text.rtems_main_o1: 16 addrs over 4 generation(s)  [.../dl09/dl09-o1.o md5 52823b44d8d1]
+    /dl09-o1.o:.text.dl01_func1: 0 addrs over 0 generation(s)      (loaded, never called: reports 0)
+    ...
+
+Against ground truth:
+
+* **dl01**: `dl01-o1.c:43` count 2 and the loop at `:46` count 5, as in R0, and
+  now with branch outcomes (`BRDA:46,…`) too.
+* **dl09**: every line of `dl09-o1.c` that ran has count 4, which is its four
+  load/unload lifetimes summed on the same section offsets.
+* **pay_a/pay_b**: the plugin's snapshot places both objects' `.text.spin` at
+  `0x8004b2f0`, the same address the target's own RTLMAP dump prints. The
+  shared offset `0x16` carries 7 executions attributed to `pay_a.c:23` and 11
+  to `pay_b.c:16`. `pad_uncovered` reports 0 in both.
+
+**Stripped objects.** The dl09 objects were stripped (`strip --strip-debug`)
+into `target/`, and the unstripped copies renamed `sub/dl09-oN.o.debug`:
+
+    --obj-path target                         resolves, warns "has no DWARF"
+    --obj-path target:host --obj-suffix .debug picks host/sub/*.o.debug; same counts
+    --obj-path host                           "not found on --obj-path; 64 records dropped"
+
+Stripping removes only sections the loader never placed, so the stripped
+copy and its twin both pass the section check, and the one with DWARF wins.

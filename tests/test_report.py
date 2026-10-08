@@ -564,3 +564,60 @@ class TestMetadataReader(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRtemsLoaderArtifacts(ReportTestCase):
+    """An RTEMS loader-generation artifact is split before the pipeline runs.
+
+    --elf names the base image here (the artifact's loaded objects were
+    never part of it), so it must reach the base slice and must NOT override
+    the per-object slices, which are analysed against the .o that --obj-path
+    resolved and verified.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from tests.test_rtl import A_SECS, make_elf, snap
+        self.objs = os.path.join(self.d, "objs")
+        os.makedirs(self.objs)
+        self.obj = os.path.join(self.objs, "a.o")
+        with open(self.obj, "wb") as f:
+            f.write(make_elf(A_SECS))
+        gens = {"1": [snap("/a.o", 0x80050000, A_SECS)]}
+        self.cov = os.path.join(self.raw, "dl.cov")
+        write_cov(self.cov, {"target_name": "riscv32", "elf": "/gone.exe",
+                             "ctx_kind": "loader-generation",
+                             "rtl_generations": gens},
+                  [(0, 0x80000000, 3), (1, 0x80050010, 2)], ctx=True)
+
+    def elfs(self):
+        return {(self.symbolize.opt(a, "--elf"),
+                 self.symbolize.opt(a, "--section") if "--section" in a
+                 else None) for a in self.symbolize.calls}
+
+    def test_split_with_elf_for_the_base_only(self):
+        rc, err = self.run_report(self.cov, "--elf", self.elf,
+                                  "--obj-path", self.objs, "--all-paths")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.elfs(), {(self.elf, None),
+                                       (self.obj, ".text.f"),
+                                       (self.obj, ".text.g")})
+
+    def test_without_obj_path_the_base_is_still_reported(self):
+        rc, err = self.run_report(self.cov, "--elf", self.elf, "--all-paths")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.elfs(), {(self.elf, None)})
+        self.assertIn("pass --obj-path", err)
+
+    def test_a_mismatching_object_fails_the_run(self):
+        from tests.test_rtl import B_SECS, make_elf
+        with open(self.obj, "wb") as f:
+            f.write(make_elf(B_SECS))
+        rc, err = self.run_report(self.cov, "--elf", self.elf,
+                                  "--obj-path", self.objs, "--all-paths")
+        self.assertEqual(rc, 1)
+        self.assertIn("--obj-no-verify", err)
+        rc, err = self.run_report(self.cov, "--elf", self.elf,
+                                  "--obj-path", self.objs, "--all-paths",
+                                  "--obj-no-verify")
+        self.assertEqual(rc, 0, err)

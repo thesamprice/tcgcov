@@ -356,7 +356,8 @@ def read_edges(path):
     return read_all(path)[3]
 
 
-def write_cov(path, meta, records, edges=None, record_type=1, ctx=False):
+def write_cov(path, meta, records, edges=None, record_type=1, ctx=False,
+              edges_recorded=False):
     """Write a TCGCOV artifact: the inverse of read_all/read_full.
 
     With ctx=False (the default), a TCGCOV1 file: `records` is a list of
@@ -368,10 +369,14 @@ def write_cov(path, meta, records, edges=None, record_type=1, ctx=False):
     (ctx, addr, count) and `edges` is (ctx, src, dst, count); both are
     sorted before writing, per the format's (ctx, addr) / (ctx, src, dst)
     ordering rule. `meta` is the metadata dict, serialized as UTF-8 JSON.
+
+    edges_recorded=True sets the edge flags even when `edges` is empty: a
+    slice cut from an edges=on artifact that happens to hold no edge of its
+    own still had edges recorded, and must not read as an edges=off run.
     """
     blob = json.dumps(meta, sort_keys=True).encode("utf-8")
     flags = FLAG_HAS_COUNTS
-    if edges:
+    if edges or edges_recorded:
         flags |= FLAG_HAS_EDGES | FLAG_EDGE_COUNTS
     if ctx:
         flags |= FLAG_HAS_CTX

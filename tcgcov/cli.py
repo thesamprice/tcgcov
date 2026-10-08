@@ -3,7 +3,8 @@
 import argparse
 
 from . import (addr2line, branches, contexts, coverable, lcov, merge, dump,
-               modmap, report, restrict, gap, rebase)
+               modmap, report, restrict, gap, rebase, rtl,
+               rtems_args)
 from . import __version__
 
 # (subcommand name, module, short help). The module supplies add_arguments(p)
@@ -22,6 +23,11 @@ SUBCOMMANDS = [
      "list a TCGCOV2 artifact's contexts, or extract one as TCGCOV1"),
     ("modmap", modmap,
      "slice a .cov by a JSON module map into per-section artifacts"),
+    ("rtl-split", rtl,
+     "split an RTEMS loader-generation .cov by --obj-path into per-object "
+     "slices"),
+    ("rtems-args", rtems_args,
+     "print the -plugin options for RTEMS loader mode from the base ELF"),
     ("lcov", lcov, "symbolized JSONL -> per-test LCOV .info"),
     ("merge", merge, "merge per-test .info -> aggregate (by source+line)"),
     ("restrict", restrict,

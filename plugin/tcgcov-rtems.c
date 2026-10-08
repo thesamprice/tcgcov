@@ -40,6 +40,7 @@
 #define RTL_LM_SECADDR   12        /* link_map.sec_addr[6] (rap regions) */
 #define RTL_LM_NEXT      44        /* link_map.l_next */
 #define RTL_SD_NAME      0         /* section_detail.name (char*) */
+#define RTL_SD_OFFSET    4         /* section_detail.offset (from its rap base) */
 #define RTL_SD_SIZE      8         /* section_detail.size */
 #define RTL_SD_RAPID     12        /* section_detail.rap_id */
 #define RTL_SD_STRIDE    16
@@ -138,8 +139,10 @@ static void rtl_snapshot(CovState *s, uint64_t gen)
             g_string_append(s->rtl_snaps, "{\"name\": \"");
             json_escape_append(s->rtl_snaps, name);
             g_string_append_printf(s->rtl_snaps,
-                                   "\", \"size\": %" PRIu32
+                                   "\", \"offset\": %" PRIu32
+                                   ", \"size\": %" PRIu32
                                    ", \"rap\": %" PRIu32 "}",
+                                   rtl_read_u32(sd + RTL_SD_OFFSET, &ok),
                                    rtl_read_u32(sd + RTL_SD_SIZE, &ok),
                                    rtl_read_u32(sd + RTL_SD_RAPID, &ok));
         }

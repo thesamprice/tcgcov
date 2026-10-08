@@ -468,6 +468,12 @@ What it does that a shell loop would not:
 - **Slices cut by `tcgcov modmap` are analysed against their own object**, so a
   directory of dynamically-loaded-object slices needs no per-object flags
   (see [`docs/DYNAMIC-OBJECTS.md`](docs/DYNAMIC-OBJECTS.md)).
+- **RTEMS loader-mode artifacts are split automatically.** With `--obj-path
+  DIR` (repeatable, or `:`-separated, searched recursively including `*.a`
+  members — GDB's `solib-search-path`, for `.o` files), every `dlopen`'d object
+  is reported against its own `.o`, verified against the sections the target
+  loaded. `--obj-suffix .debug` finds unstripped twins of stripped objects.
+  See [`docs/RTEMS-DL.md`](docs/RTEMS-DL.md).
 
 **Where the ELF comes from.** Each artifact already carries it: the plugin's
 `elf=` argument is copied into `metadata.elf` at record time, which is why
@@ -612,9 +618,9 @@ Read these before trusting a number.
   runtime lands at addresses the static ELF does not describe, so it needs a
   runtime module map. That map now exists for **RTEMS libdl** (`dlopen`'d
   `ET_REL` objects): a plugin mode reads the loader's rendezvous, records a
-  per-object map into the artifact, and `tcgcov modmap` attributes and rebases
-  each object per section — with address reuse across load/unload kept apart by
-  a loader generation. See [`docs/RTEMS-DL.md`](docs/RTEMS-DL.md). Linux **kernel
+  per-object map into the artifact, and `tcgcov report --obj-path DIR` finds
+  each object's `.o`, attributes and rebases it per section — with address
+  reuse across load/unload kept apart by a loader generation. See [`docs/RTEMS-DL.md`](docs/RTEMS-DL.md). Linux **kernel
   modules** are handled by `rebase` (fixed placement), and same-VA **processes**
   by `ctx=on`. What is **not** handled is the **Linux `ET_DYN` / `ld.so`
   shared-library** rendezvous — no code walks a Linux dynamic linker; that route
