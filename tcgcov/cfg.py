@@ -1368,6 +1368,35 @@ def parse_objdump(text, profile):
     return insns
 
 
+def section_text(text, section):
+    """Keep only the disassembly of one section (all of its blocks).
+
+    In a relocatable object every section starts at address 0, so the
+    addresses of different sections overlap: an analysis that takes "offset
+    0x30" from the whole-file disassembly picks up every section's 0x30.
+    Anything per-section (`--section`) must look at that section's
+    instructions alone. Works on a whole-file `objdump -d` capture, so one
+    disassembly per ELF can still serve every section. The file-format
+    preamble is kept (detect_arch reads it); the section header line is kept
+    so instructions still carry their section.
+
+    Raises ValueError when the section has no disassembly at all: an empty
+    result would read downstream as "no code here", i.e. 100% or 0 branches.
+    """
+    out, keep, found = [], True, False
+    for line in text.splitlines():
+        m = SECTION_RE.match(line)
+        if m:
+            keep = m.group(1) == section
+            found = found or keep
+        if keep:
+            out.append(line)
+    if not found:
+        raise ValueError("no disassembly for section %s (not an executable "
+                         "section of this ELF?)" % section)
+    return "\n".join(out) + "\n"
+
+
 def disassemble(objdump, elf):
     """Return the stdout of `objdump -d ELF` (raises on failure).
 

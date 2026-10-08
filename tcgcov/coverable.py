@@ -43,7 +43,7 @@ import subprocess
 import sys
 
 from . import dwarfline
-from .cfg import match_insn_line
+from .cfg import match_insn_line, section_text
 from .symbolize import iter_covered_lines
 from .cliargs import add_symbolize_args
 from .paths import path_options, normalize_path
@@ -106,6 +106,11 @@ def objdump_addresses(args, objdump):
     else:
         addrs, text = disassemble_addresses(objdump, args.elf)
         source = objdump
+    if getattr(args, "section", None):
+        # Every section of a relocatable object starts at 0: the whole-file
+        # address set would mix every section's offsets together.
+        text = section_text(text, args.section)
+        addrs = parse_addresses(text)
 
     if addrs:
         return addrs
@@ -126,7 +131,8 @@ def objdump_inventory(args, opts, objdump, addr2line):
     addrs = objdump_addresses(args, objdump)
     seen = {}
     for norm, line, func, _depth, addr in iter_covered_lines(
-            addr2line, args.elf, addrs, opts):
+            addr2line, args.elf, addrs, opts,
+            section=getattr(args, "section", None)):
         seen.setdefault((norm, line, func), addr)
     return seen, len(addrs)
 
@@ -143,6 +149,16 @@ def dwarf_inventory(args, opts):
     from `.symtab` (the line table has none); they only feed LCOV FN records,
     never the line denominator.
     """
+    if getattr(args, "section", None) or _is_relocatable(args.elf):
+        # A .o's line table is unrelocated: every sequence starts at 0,
+        # address advances (RISC-V ADD/SUB pairs) and string offsets are
+        # filled in by relocations this reader does not apply, and nothing
+        # says which section a sequence belongs to. Its rows would be wrong
+        # or empty, so say why instead of "check --source-root".
+        raise RuntimeError(
+            f"{args.elf}: the DWARF denominator does not support relocatable "
+            f"objects or --section (the line table needs relocating); use the "
+            f"objdump denominator")
     elf = dwarfline.read_elf(args.elf)
     functions = dwarfline.FunctionIndex(elf)
     seen = {}
@@ -155,6 +171,19 @@ def dwarf_inventory(args, opts):
             continue
         seen.setdefault((norm, line, functions.at(addr)), addr)
     return seen, rows
+
+
+def _is_relocatable(path):
+    """True for an ET_REL object (a .o); False when it cannot be read."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(18)
+    except OSError:
+        return False
+    if len(head) < 18 or head[:4] != b"\x7fELF":
+        return False
+    order = "little" if head[5] == 1 else "big"
+    return int.from_bytes(head[16:18], order) == 1
 
 
 def cross_check_messages(objdump_seen, dwarf_seen):
@@ -273,7 +302,11 @@ def run(args):
             return 1
         used, detail = "dwarf", f"{rows} line-table rows"
 
-    if used == "objdump" and getattr(args, "cross_check", True):
+    # Nothing to cross-check a relocatable object against: the DWARF side
+    # cannot read one (see dwarf_inventory).
+    if used == "objdump" and getattr(args, "cross_check", True) \
+            and not getattr(args, "section", None) \
+            and not _is_relocatable(args.elf):
         try:
             other, _rows = dwarf_inventory(args, opts)
         except (OSError, RuntimeError) as e:
