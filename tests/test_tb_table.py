@@ -91,6 +91,23 @@ class ExpansionTest(Fixture):
         self.assertNotIn(0x102, read_all(self.path, ctx=2)[2])
         self.assertEqual(read_all(self.path, ctx=2)[2][0x100], 6)
 
+    def test_two_codes_with_one_start_and_length_stay_apart(self):
+        # Review of PR #27: a reused address (or two processes) can hold
+        # different code of the same length. Each keeps its own instruction
+        # sizes, and an exit names its entry by index, not by (start, size).
+        a_sizes, b_sizes = bytes([2, 2, 4]), bytes([4, 4])
+        self.write([(0x100, 8)],
+                   [(0x100, 3, 1, a_sizes), (0x100, 5, 1, b_sizes)],
+                   [(0x100, 8, 0x104, 2, 1)])     # B left before 0x104, 2x
+        _m, hdr, _r, _e = read_full(self.path, expand=False)
+        entries, exits = fmt.unpack_tb_table(open(self.path, "rb").read(),
+                                             hdr)
+        self.assertEqual([e[6] for e in entries], [a_sizes, b_sizes])
+        self.assertEqual(exits, [(1, 0x104, 2)])
+        # A: 0x100, 0x102, 0x104 three times; B: 0x100 five, 0x104 three.
+        self.assertEqual(read_all(self.path)[2],
+                         {0x100: 8, 0x102: 3, 0x104: 6})
+
     def test_a_start_the_table_does_not_cover_is_kept(self):
         self.write([(0x100, 2), (0x200, 9)], [(0x100, 2, 1, SIZES)])
         self.assertEqual(read_all(self.path)[2][0x200], 9)
@@ -118,6 +135,14 @@ class ValidationTest(Fixture):
         hdr = fmt.parse_header(open(self.path, "rb").read())
         self.patch(hdr["tb_offset"] + 16, "<I", 13)  # entry size 12 -> 13
         with self.assertRaisesRegex(ValueError, "add up"):
+            read_full(self.path)
+
+    def test_an_exit_naming_the_wrong_entry_is_refused(self):
+        self.write([(0x100, 1)], [(0x100, 1, 1, SIZES)],
+                   [(0x100, 12, 0x106, 1)])
+        hdr = fmt.parse_header(open(self.path, "rb").read())
+        self.patch(hdr["exit_offset"] + 28, "<I", 5)  # tb_index
+        with self.assertRaisesRegex(ValueError, "names entry 5"):
             read_full(self.path)
 
     def test_exit_section_size_is_checked(self):

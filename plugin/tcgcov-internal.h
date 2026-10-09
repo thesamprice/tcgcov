@@ -109,9 +109,10 @@ typedef struct {
      */
     const void *cur_tb;
     GHashTable *exits;         /* TbExit* -> same, keyed on (ctx,tb,pc) */
+    uint64_t cur_tb_ctx;       /* context the block was entered (counted) in */
     bool prev_valid;
     bool cur_done;
-    char pad[TCGCOV_CACHELINE - 2 * sizeof(uint64_t) - 4 * sizeof(void *)
+    char pad[TCGCOV_CACHELINE - 3 * sizeof(uint64_t) - 4 * sizeof(void *)
              - 2 * sizeof(bool)];
 } VcpuState;
 

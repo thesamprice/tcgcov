@@ -345,7 +345,7 @@ typedef struct {
     uint64_t pc;
     uint64_t count;
     uint32_t tb_size;
-    uint32_t reserved;
+    uint32_t tb_index;             /* the TB entry, 0-based in table order */
 } ExitRec;
 
 G_STATIC_ASSERT(sizeof(ExitRec) == 40);
@@ -512,7 +512,12 @@ static gboolean exit_equal(gconstpointer a, gconstpointer b)
  */
 static void record_exit(VcpuState *v, const CovTb *ctb, uint64_t pc)
 {
-    TbExit key = { v->cur_ctx, ctb, pc, 0 };
+    /*
+     * The context the block was entered -- and counted -- in, not the
+     * current one: the RTEMS loader hooks change the generation from an
+     * instruction callback inside a block.
+     */
+    TbExit key = { v->cur_tb_ctx, ctb, pc, 0 };
     TbExit *e;
 
     if (v->exits == NULL) {
@@ -555,6 +560,7 @@ static inline void tb_enter(CovState *s, unsigned int cpu_index,
         record_exit(v, v->cur_tb, ctb->tb_vaddr);
     }
     v->cur_tb = ctb;
+    v->cur_tb_ctx = v->cur_ctx;
     v->cur_done = false;
 }
 
@@ -1454,49 +1460,63 @@ static guint merge_addrs(GArray *pairs)
 /* TB table (tb_table=on).                                            */
 /* ------------------------------------------------------------------ */
 
+/*
+ * One TB table entry being built. Its identity is (ctx, start, length, the
+ * instruction sizes): two different pieces of code can share a start and a
+ * length -- a reused load address, two processes -- yet split into
+ * different instructions, and must not be expanded with one another's.
+ */
 typedef struct {
     TbEntry e;
-    const uint8_t *sizes;          /* of the first translation seen */
+    const uint8_t *sizes;
+    guint index;                   /* position in the written table */
 } TbAgg;
 
 static guint tbagg_hash(gconstpointer p)
 {
-    const TbEntry *e = p;
-    uint64_t h = e->addr * 0x9E3779B97F4A7C15ULL;
+    const TbAgg *a = p;
+    uint64_t h = a->e.addr * 0x9E3779B97F4A7C15ULL;
 
-    h ^= e->size + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
-    h ^= e->ctx + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+    h ^= a->e.size + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+    h ^= a->e.ctx + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+    for (uint16_t i = 0; i < a->e.n_insns; i++) {
+        h = (h ^ a->sizes[i]) * 0x100000001B3ULL;
+    }
     return (guint)(h ^ (h >> 32));
 }
 
-static gboolean tbagg_equal(gconstpointer a, gconstpointer b)
+static gboolean tbagg_equal(gconstpointer pa, gconstpointer pb)
 {
-    const TbEntry *x = a;
-    const TbEntry *y = b;
+    const TbAgg *x = pa;
+    const TbAgg *y = pb;
 
-    return x->ctx == y->ctx && x->addr == y->addr && x->size == y->size;
+    return x->e.ctx == y->e.ctx && x->e.addr == y->e.addr &&
+           x->e.size == y->e.size && x->e.n_insns == y->e.n_insns &&
+           memcmp(x->sizes, y->sizes, x->e.n_insns) == 0;
 }
 
-/* The aggregate for (ctx, ctb's extent), created from ctb on first sight. */
+/* The aggregate for (ctx, ctb's code), created from ctb on first sight. */
 static TbAgg *tbagg_get(GHashTable *t, uint64_t ctx, const CovTb *ctb)
 {
-    TbEntry key = { ctx, ctb->tb_vaddr, 0, ctb->size, 0, 0 };
+    TbAgg key = { { ctx, ctb->tb_vaddr, 0, ctb->size, ctb->n_insns, 0 },
+                  ctb->insn_sizes, 0 };
     TbAgg *a = g_hash_table_lookup(t, &key);
 
     if (a == NULL) {
         a = g_new0(TbAgg, 1);
-        a->e = key;
-        a->e.n_insns = ctb->n_insns;
-        a->sizes = ctb->insn_sizes;
-        g_hash_table_insert(t, &a->e, a);
+        *a = key;
+        g_hash_table_insert(t, a, a);
     }
     return a;
 }
 
 static gint tbagg_cmp(gconstpointer pa, gconstpointer pb)
 {
-    const TbEntry *a = &(*(TbAgg *const *)pa)->e;
-    const TbEntry *b = &(*(TbAgg *const *)pb)->e;
+    const TbAgg *x = *(TbAgg *const *)pa;
+    const TbAgg *y = *(TbAgg *const *)pb;
+    const TbEntry *a = &x->e;
+    const TbEntry *b = &y->e;
+    int c;
 
     if (a->ctx != b->ctx) {
         return a->ctx < b->ctx ? -1 : 1;
@@ -1504,7 +1524,14 @@ static gint tbagg_cmp(gconstpointer pa, gconstpointer pb)
     if (a->addr != b->addr) {
         return a->addr < b->addr ? -1 : 1;
     }
-    return a->size < b->size ? -1 : (a->size > b->size);
+    if (a->size != b->size) {
+        return a->size < b->size ? -1 : 1;
+    }
+    if (a->n_insns != b->n_insns) {
+        return a->n_insns < b->n_insns ? -1 : 1;
+    }
+    c = memcmp(x->sizes, y->sizes, a->n_insns);
+    return c < 0 ? -1 : (c > 0);
 }
 
 static gint exitrec_cmp(gconstpointer pa, gconstpointer pb)
@@ -1512,14 +1539,8 @@ static gint exitrec_cmp(gconstpointer pa, gconstpointer pb)
     const ExitRec *a = pa;
     const ExitRec *b = pb;
 
-    if (a->ctx != b->ctx) {
-        return a->ctx < b->ctx ? -1 : 1;
-    }
-    if (a->tb_addr != b->tb_addr) {
-        return a->tb_addr < b->tb_addr ? -1 : 1;
-    }
-    if (a->tb_size != b->tb_size) {
-        return a->tb_size < b->tb_size ? -1 : 1;
+    if (a->tb_index != b->tb_index) {
+        return a->tb_index < b->tb_index ? -1 : 1;
     }
     return a->pc < b->pc ? -1 : (a->pc > b->pc);
 }
@@ -1534,15 +1555,17 @@ static gint exitrec_cmp(gconstpointer pa, gconstpointer pb)
  */
 static GPtrArray *collect_tb_table(CovState *s, GArray *exits)
 {
-    GHashTable *aggs = g_hash_table_new_full(tbagg_hash, tbagg_equal,
-                                             NULL, g_free);
+    /* aggs' values are owned by `out` once kept; zero-count ones are freed
+     * below. trans owns its own. */
+    GHashTable *aggs = g_hash_table_new(tbagg_hash, tbagg_equal);
     GHashTable *trans = g_hash_table_new_full(tbagg_hash, tbagg_equal,
                                               NULL, g_free);
     GPtrArray *out = g_ptr_array_new_with_free_func(g_free);
+    GPtrArray *dead = g_ptr_array_new_with_free_func(g_free);
     GHashTableIter it;
     gpointer k, v;
 
-    /* Translations per extent, whatever the context. */
+    /* Translations per distinct code, whatever the context. */
     for (guint i = 0; i < s->blocks->len; i++) {
         const CovTb *ctb = g_ptr_array_index(s->blocks, i);
         TbAgg *a;
@@ -1581,21 +1604,21 @@ static GPtrArray *collect_tb_table(CovState *s, GArray *exits)
     g_hash_table_iter_init(&it, aggs);
     while (g_hash_table_iter_next(&it, &k, &v)) {
         TbAgg *a = v;
-        TbEntry tk = a->e;
+        TbAgg tk = *a;
         TbAgg *t;
 
-        tk.ctx = 0;
+        tk.e.ctx = 0;
         t = g_hash_table_lookup(trans, &tk);
         a->e.translations = t ? t->e.translations : 1;
-        if (a->e.count) {
-            g_hash_table_iter_steal(&it);
-            g_ptr_array_add(out, a);
-        }
+        g_ptr_array_add(a->e.count ? out : dead, a);
     }
     g_ptr_array_sort(out, tbagg_cmp);
-    g_hash_table_destroy(aggs);
-    g_hash_table_destroy(trans);
+    for (guint i = 0; i < out->len; i++) {
+        ((TbAgg *)g_ptr_array_index(out, i))->index = i;
+    }
 
+    /* Each exit names its entry by index: (start, length) alone would not
+     * tell two different pieces of code at the same address apart. */
     for (size_t i = 0; i < s->vcpu_cap; i++) {
         GHashTable *t = s->vcpu ? s->vcpu[i].exits : NULL;
 
@@ -1605,9 +1628,16 @@ static GPtrArray *collect_tb_table(CovState *s, GArray *exits)
         g_hash_table_iter_init(&it, t);
         while (g_hash_table_iter_next(&it, &k, &v)) {
             const TbExit *e = v;
-            ExitRec r = { e->ctx, e->tb->tb_vaddr, e->pc, e->count,
-                          e->tb->size, 0 };
+            TbAgg key = { { e->ctx, e->tb->tb_vaddr, 0, e->tb->size,
+                            e->tb->n_insns, 0 }, e->tb->insn_sizes, 0 };
+            TbAgg *a = g_hash_table_lookup(aggs, &key);
+            ExitRec r;
 
+            if (a == NULL || a->e.count == 0) {
+                continue;                  /* cannot happen: it was entered */
+            }
+            r = (ExitRec){ e->ctx, e->tb->tb_vaddr, e->pc, e->count,
+                           e->tb->size, a->index };
             g_array_append_val(exits, r);
         }
     }
@@ -1628,6 +1658,9 @@ static GPtrArray *collect_tb_table(CovState *s, GArray *exits)
         }
         g_array_set_size(exits, w + 1);
     }
+    g_hash_table_destroy(aggs);
+    g_hash_table_destroy(trans);
+    g_ptr_array_free(dead, TRUE);
     return out;
 }
 

@@ -743,30 +743,33 @@ bytes: the 88 bytes of §2 followed by
 | 128    | 8    | `uint64` | `exit_size`   | `exit_count` × the exit record size. |
 
 **TB entry** — 24 bytes (32 with `HAS_CTX`, the `uint64 ctx` leading as in
-§11), one per distinct executed extent, sorted by (ctx, addr, size):
+§11), one per distinct executed **code**: (ctx, start, length, instruction
+sizes). Two different pieces of code can share a start and a length — a
+reused load address, two processes — and then have one entry each. Sorted by
+(ctx, addr, size, n_insns, instruction sizes):
 
 | Offset | Size | Type     | Field          | Meaning |
 |-------:|-----:|----------|----------------|---------|
 | 0      | 8    | `uint64` | `addr`         | Block start: equals one address record. |
-| 8      | 8    | `uint64` | `count`        | Executions of blocks with this start **and** this extent. A start retranslated with a different extent has one entry per extent; their counts sum to the address record's. |
+| 8      | 8    | `uint64` | `count`        | Executions of blocks with this start and this code. A start translated with a different extent or code has one entry each; their counts sum to the address record's. |
 | 16     | 4    | `uint32` | `size`         | Byte length of the block. |
 | 20     | 2    | `uint16` | `n_insns`      | Instructions in the block. |
-| 22     | 2    | `uint16` | `translations` | How many times QEMU translated this extent, saturating at `0xFFFF`. Above 1 it means the translation cache was flushed or the code was rewritten. |
+| 22     | 2    | `uint16` | `translations` | How many times QEMU translated this code, saturating at `0xFFFF`. Above 1 it means the translation cache was flushed or the code was rewritten. |
 
 After the last entry come the instruction sizes: `n_insns` bytes per entry,
 in entry order, each the byte length of one instruction of the block (they sum
 to `size`). Extent and sizes are taken at the block's **first** translation.
 
-**Early exit** — 32 bytes (40 with `HAS_CTX`, ctx leading), sorted by (ctx,
-tb_addr, tb_size, pc):
+**Early exit** — 32 bytes (40 with `HAS_CTX`, ctx leading: the context the
+block was **entered** in), sorted by (tb_index, pc):
 
 | Offset | Size | Type     | Field     | Meaning |
 |-------:|-----:|----------|-----------|---------|
-| 0      | 8    | `uint64` | `tb_addr` | The block left early (its entry is (`tb_addr`, `tb_size`)). |
+| 0      | 8    | `uint64` | `tb_addr` | Start of the block left early (its entry's `addr`). |
 | 8      | 8    | `uint64` | `pc`      | The **first instruction of that block that did not run**; every instruction before it did. |
 | 16     | 8    | `uint64` | `count`   | How many executions of the block ended there. |
-| 24     | 4    | `uint32` | `tb_size` | |
-| 28     | 4    | `uint32` | reserved  | Zero. |
+| 24     | 4    | `uint32` | `tb_size` | Its entry's `size`. |
+| 28     | 4    | `uint32` | `tb_index`| The entry this exit applies to, 0-based in table order. `tb_addr`/`tb_size` alone do not identify it when two codes share them; a reader checks they match the indexed entry. |
 
 The plugin records an early exit when a block is left before its last
 instruction runs: an **interrupt** taken inside it (`pc` = the interrupted
@@ -780,7 +783,7 @@ says whether it was available.
 
 **Expansion.** An instruction at address `a` in an entry ran
 
-    count(entry) − Σ count(exit) for the entry's exits with pc ≤ a
+    count(entry) − Σ count(exit) over the exits naming the entry with pc ≤ a
 
 times; a reader adds that over every entry containing `a` and drops
 instructions outside the metadata `filters`. On the riscv reuse fixture

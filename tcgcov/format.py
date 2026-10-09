@@ -212,8 +212,9 @@ def unpack_tb_table(data, hdr):
     """Decode the TB table -> (entries, exits); ([], []) without one.
 
     entries: [(ctx, addr, count, size, n_insns, translations, insn_sizes)],
-    insn_sizes a bytes object of n_insns sizes. exits: [(ctx, tb_addr,
-    tb_size, pc, count)]. ctx is None in a version-1 file.
+    insn_sizes a bytes object of n_insns sizes. exits: [(tb_index, pc,
+    count)], tb_index the entry it applies to. ctx is None in a version-1
+    file.
     """
     if not hdr["flags"] & FLAG_HAS_TB_TABLE or not hdr.get("tb_count"):
         return [], []
@@ -246,9 +247,14 @@ def unpack_tb_table(data, hdr):
     for i in range(hdr["exit_count"]):
         o = hdr["exit_offset"] + i * xsz
         ctx = struct.unpack_from("<Q", data, o)[0] if has_ctx else None
-        tb_addr, pc, count, tb_size, _res = struct.unpack_from(
+        tb_addr, pc, count, tb_size, index = struct.unpack_from(
             "<QQQII", data, o + lead)
-        exits.append((ctx, tb_addr, tb_size, pc, count))
+        if index >= n or entries[index][:2] != (ctx, tb_addr) or \
+                entries[index][3] != tb_size:
+            raise ValueError("TB table: exit record %d names entry %d, "
+                             "which is not block 0x%x (%d bytes)"
+                             % (i, index, tb_addr, tb_size))
+        exits.append((index, pc, count))
     return entries, exits
 
 
@@ -266,11 +272,12 @@ def expand_tb_records(entries, exits, filters=()):
     reported, as in the other modes.
     """
     by_tb = {}
-    for ctx, tb_addr, tb_size, pc, count in exits:
-        by_tb.setdefault((ctx, tb_addr, tb_size), []).append((pc, count))
+    for index, pc, count in exits:
+        by_tb.setdefault(index, []).append((pc, count))
     out = {}
-    for ctx, addr, count, size, _n, _trans, isz in entries:
-        early = sorted(by_tb.get((ctx, addr, size), ()))
+    for index, (ctx, addr, count, size, _n, _trans, isz) in \
+            enumerate(entries):
+        early = sorted(by_tb.get(index, ()))
         k, left, a = 0, count, addr
         for width in isz:
             while k < len(early) and early[k][0] <= a:
@@ -526,7 +533,9 @@ def write_cov(path, meta, records, edges=None, record_type=1, ctx=False,
 
     tb_table (with HAS_TB_TABLE and the 136-byte header, FORMAT.md section
     12) is [(addr, count, translations, insn_sizes)] -- (ctx, ...) first with
-    ctx=True -- and tb_exits [(tb_addr, tb_size, pc, count)], likewise.
+    ctx=True -- and tb_exits [(tb_addr, tb_size, pc, count)], likewise; an
+    exit applies to the first entry with that (ctx, addr, size) in table
+    order, or give a sixth/fifth element, the entry's index, explicitly.
     """
     blob = json.dumps(meta, sort_keys=True).encode("utf-8")
     flags = FLAG_HAS_COUNTS
@@ -553,18 +562,26 @@ def write_cov(path, meta, records, edges=None, record_type=1, ctx=False,
     if tb_table is not None:
         lead = 1 if ctx else 0
         entries, sizes = b"", b""
-        for e in sorted(tb_table):
+        table = sorted(tb_table)
+        first = {}
+        for i, e in enumerate(table):
             prefix = struct.pack("<Q", e[0]) if ctx else b""
             addr, count, trans, isz = e[lead:]
             entries += prefix + struct.pack("<QQIHH", addr, count, sum(isz),
                                             len(isz), trans)
             sizes += bytes(isz)
+            first.setdefault((e[0] if ctx else None, addr, sum(isz)), i)
         exits = b""
-        for x in sorted(tb_exits or []):
+        for x in sorted(tb_exits or [],
+                        key=lambda x: (first.get(((x[0] if ctx else None),)
+                                                 + tuple(x[lead:lead + 2])),
+                                       x[lead + 2])):
             prefix = struct.pack("<Q", x[0]) if ctx else b""
-            tb_addr, tb_size, pc, count = x[lead:]
+            tb_addr, tb_size, pc, count = x[lead:lead + 4]
+            index = x[lead + 4] if len(x) > lead + 4 else \
+                first[(x[0] if ctx else None, tb_addr, tb_size)]
             exits += prefix + struct.pack("<QQQII", tb_addr, pc, count,
-                                          tb_size, 0)
+                                          tb_size, index)
         tb_off = records_off + records_size + edges_size
         tb_size = len(entries) + len(sizes)
         hdr += struct.pack(HEADER_EXT_FMT, len(tb_table), tb_off, tb_size,
