@@ -73,11 +73,11 @@ the build rather than emitting an unreadable file.
 | 0      | 8    | `char[8]`  | `magic`           | `"TCGCOV1\0"` — the ASCII bytes `54 43 47 43 4F 56 31 00`. The trailing NUL is part of the magic, not a terminator. |
 | 8      | 2    | `uint16`   | `version`         | Format version: `1`, or `2` when the artifact may carry context records (§11). The magic never changes — this field is the format signal, and a reader must reject values it does not know (a version-2 file with `HAS_CTX` would mis-stride a version-1 reader). |
 | 10     | 2    | `uint16`   | `endian`          | Byte order of every multi-byte field in this file: `1` = little-endian, `2` = big-endian. The current writer always emits `1`. |
-| 12     | 4    | `uint32`   | `header_size`     | Size of this header in bytes. Always `88` for TCGCOV1. See §7. |
+| 12     | 4    | `uint32`   | `header_size`     | Size of this header in bytes: `88`, or `136` for the extended header that `HAS_TB_TABLE` requires (§12). See §7. |
 | 16     | 4    | `uint32`   | `record_type`     | Granularity of the address records: `1` = `TB_ADDR` (each record is a translation-block start address), `2` = `INSN_ADDR` (each record is a single instruction address). |
 | 20     | 4    | `uint32`   | `flags`           | Bitfield, see §3. |
 | 24     | 8    | `uint64`   | `record_count`    | Number of address records. |
-| 32     | 8    | `uint64`   | `metadata_offset` | Absolute file offset of the metadata JSON. Always `88`. |
+| 32     | 8    | `uint64`   | `metadata_offset` | Absolute file offset of the metadata JSON. Equals `header_size`. |
 | 40     | 8    | `uint64`   | `metadata_size`   | Length of the metadata JSON in bytes. **Not** NUL-terminated and the length does **not** include a NUL. |
 | 48     | 8    | `uint64`   | `records_offset`  | Absolute file offset of the first address record. Equals `metadata_offset + metadata_size`. |
 | 56     | 8    | `uint64`   | `records_size`    | Total size of the address record section = `record_count * address_record_size` (see §4). |
@@ -102,6 +102,7 @@ TCGCOV1 — offsets `0..87` are entirely accounted for by the table above.
 | 0   | `0x1` | `HAS_COUNTS`  | Each **address** record carries an execution count and is 16 bytes instead of 8. Applies only to the address record section. |
 | 1   | `0x2` | `HAS_EDGES`   | An edge section is present. `edge_count`/`edges_offset`/`edges_size` are meaningful. |
 | 2   | `0x4` | `EDGE_COUNTS` | Each **edge** record carries a traversal count and is 24 bytes instead of 16. Only meaningful when `HAS_EDGES` is also set; readers should ignore it otherwise. |
+| 4   | `0x10` | `HAS_TB_TABLE` | A TB table and an early-exit section follow the edges, located by the extended 136-byte header (§12). Written with `mode=tb` and `mode=tb-insn-fast`. Unknown to an older reader, which still reads every section it knows: none of them moves. |
 | 3   | `0x8` | `HAS_CTX`     | **Version 2 only.** Every address and edge record is prefixed with a `uint64` address-space context ID; see §11. Illegal with `version = 1` — a version-1 reader would mis-stride the sections, which is exactly why the version field exists and why a reader must reject versions it does not know. |
 
 All other bits are reserved and are written as zero. A reader that encounters
@@ -716,3 +717,84 @@ default, so v1-era consumers work on v2 files unchanged. Slicing one context
 (`read_all(path, ctx=N)`, or `tcgcov contexts FILE --extract N -o OUT` to
 materialize a TCGCOV1 file) is what makes per-process coverage: symbolize
 the slice against that process's ELF and the entire v1 pipeline applies.
+
+---
+
+## 12. TB table: block extents and early exits
+
+A `mode=tb` artifact records one address per executed translation block: its
+**start** (§4.1). The block's extent is not in those records, so a line whose
+instructions all sit mid-block would read as never executed. The TB table,
+written by the plugin by default with `mode=tb` and `mode=tb-insn-fast`
+(`tb_table=off` to omit; not with `mode=tb-insn` or `phys=on`), carries what
+QEMU hands the plugin at translation time, and a reader can expand each block
+start into the block's instructions with **exact** counts.
+
+**Flag and header.** `HAS_TB_TABLE` (`0x10`) is set, and the header is 136
+bytes: the 88 bytes of §2 followed by
+
+| Offset | Size | Type     | Field         | Meaning |
+|-------:|-----:|----------|---------------|---------|
+| 88     | 8    | `uint64` | `tb_count`    | TB table entries. |
+| 96     | 8    | `uint64` | `tb_offset`   | Absolute offset of the TB table: right after the edges (or the address records, without edges). |
+| 104    | 8    | `uint64` | `tb_size`     | Entries **plus** the instruction-size bytes that follow them. |
+| 112    | 8    | `uint64` | `exit_count`  | Early-exit records. |
+| 120    | 8    | `uint64` | `exit_offset` | Absolute offset of the early exits: `tb_offset + tb_size`. |
+| 128    | 8    | `uint64` | `exit_size`   | `exit_count` × the exit record size. |
+
+**TB entry** — 24 bytes (32 with `HAS_CTX`, the `uint64 ctx` leading as in
+§11), one per distinct executed **code**: (ctx, start, length, instruction
+sizes). Two different pieces of code can share a start and a length — a
+reused load address, two processes — and then have one entry each. Sorted by
+(ctx, addr, size, n_insns, instruction sizes):
+
+| Offset | Size | Type     | Field          | Meaning |
+|-------:|-----:|----------|----------------|---------|
+| 0      | 8    | `uint64` | `addr`         | Block start: equals one address record. |
+| 8      | 8    | `uint64` | `count`        | Executions of blocks with this start and this code. A start translated with a different extent or code has one entry each; their counts sum to the address record's. |
+| 16     | 4    | `uint32` | `size`         | Byte length of the block. |
+| 20     | 2    | `uint16` | `n_insns`      | Instructions in the block. |
+| 22     | 2    | `uint16` | `translations` | How many times QEMU translated this code, saturating at `0xFFFF`. Above 1 it means the translation cache was flushed or the code was rewritten. |
+
+After the last entry come the instruction sizes: `n_insns` bytes per entry,
+in entry order, each the byte length of one instruction of the block (they sum
+to `size`). Extent and sizes are taken at the block's **first** translation.
+
+**Early exit** — 32 bytes (40 with `HAS_CTX`, ctx leading: the context the
+block was **entered** in), sorted by (tb_index, pc):
+
+| Offset | Size | Type     | Field     | Meaning |
+|-------:|-----:|----------|-----------|---------|
+| 0      | 8    | `uint64` | `tb_addr` | Start of the block left early (its entry's `addr`). |
+| 8      | 8    | `uint64` | `pc`      | The **first instruction of that block that did not run**; every instruction before it did. |
+| 16     | 8    | `uint64` | `count`   | How many executions of the block ended there. |
+| 24     | 4    | `uint32` | `tb_size` | Its entry's `size`. |
+| 28     | 4    | `uint32` | `tb_index`| The entry this exit applies to, 0-based in table order. `tb_addr`/`tb_size` alone do not identify it when two codes share them; a reader checks they match the indexed entry. |
+
+The plugin records an early exit when a block is left before its last
+instruction runs: an **interrupt** taken inside it (`pc` = the interrupted
+instruction), an **exception** raised by one of its instructions (`pc` = the
+instruction after it: the faulting one was reached), or a block **abandoned
+and resumed** inside itself with no event reported — with `icount`, an
+instruction that touches an I/O device mid-block ends the block and is
+re-executed as the start of a new one (`pc` = that instruction). The first two
+need the discontinuity callback (plugin API ≥ 5); metadata `tb_exits_tracked`
+says whether it was available.
+
+**Expansion.** An instruction at address `a` in an entry ran
+
+    count(entry) − Σ count(exit) over the exits naming the entry with pc ≤ a
+
+times; a reader adds that over every entry containing `a` and drops
+instructions outside the metadata `filters`. On the riscv reuse fixture
+(`examples/rtems-dl`) the expansion of a `mode=tb` run equals a `mode=tb-insn`
+run on all 13,399 instructions (the idle loop's count aside, which depends on
+when QEMU was stopped). The reference reader (`tcgcov.format.read_full`)
+expands automatically and reports `record_type` 2; `expand=False` returns the
+raw block starts. A `mode=tb-insn-fast` artifact's records (each instruction
+of a block at the block's full count, over-reporting a block left early) are
+replaced by the expansion the same way, which makes them exact.
+
+**Metadata** adds `"tb_table": true`, `"tb_translations"` (translations of
+in-range blocks over the run) and `"tb_exits_tracked"`.
+

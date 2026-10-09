@@ -174,6 +174,7 @@ Plugin arguments are `key=value`, comma-separated:
 | `elf=` | `""` | path to the ELF, copied into the artifact's metadata so the host tools need no manifest |
 | `test_id=`, `bsp=` | `""` | free-form labels (run name, board/platform) copied into the metadata |
 | `verbose=` | `off` | log a one-line summary at exit |
+| `tb_table=` | `on` with `tb`/`tb-insn-fast` | write each executed block's extent, instruction sizes, translation count and early exits ([`docs/FORMAT.md`](docs/FORMAT.md) §12); refused with `tb-insn` or `phys=on` |
 | `flush_at=` | *(none)* | `0xADDR`: also write the artifact when this address first executes, for guests whose shutdown crashes QEMU (whose abort skips the normal exit write). Single-CPU machines only. `tcgcov rtems-args` sets it to RTEMS `_Terminate` |
 | `rtl_state=`, `rtl_debug=`, `rtl_load=` | *(none)* | RTEMS loader mode, see [`docs/RTEMS-DL.md`](docs/RTEMS-DL.md); `tcgcov rtems-args IMAGE` prints them |
 
@@ -193,11 +194,15 @@ finds out immediately rather than getting an artifact it did not ask for.
 
 | `mode=` | Records | Fidelity |
 |---|---|---|
-| `tb` | one address per executed block (its start) | exact for what it claims: reaching a block proves its first instruction was reached |
+| `tb` | one address per executed block (its start), plus the **TB table** | **exact per instruction** once read: the table gives each block's extent and where it was left early, and the reader expands block starts into instructions with exact counts |
 | `tb-insn` *(default)* | every instruction that individually executed | **exact** — an execution callback per instruction, so an instruction after an abort point (exception, interrupt) is never reported |
-| `tb-insn-fast` | every instruction the block was *translated* with, gated on block entry | cheap, but **over-reports**: a block that aborts part way through still reports all of its instructions |
+| `tb-insn-fast` | every instruction the block was *translated* with, gated on block entry, plus the TB table | cheap; on its own it **over-reports** a block that aborts part way, and the TB table's early exits correct that on read |
 
 The artifact records which fidelity it was produced at, so a reader can tell.
+The TB table (`tb_table=on` by default with `tb` and `tb-insn-fast`, see
+[`docs/FORMAT.md`](docs/FORMAT.md) §12) makes `mode=tb` give the same
+per-instruction counts as `tb-insn` at block cost: on the riscv reuse fixture
+all 13,399 instructions agree.
 
 **How it works.** A translation callback records each block and its in-range
 instruction addresses; a minimal execution callback bumps that address's
@@ -251,7 +256,8 @@ survives all the way to `DA:<line>,<count>` in the LCOV output, so the same HTML
 report doubles as a hotspot view. A line's count is the **max** over its
 instruction addresses, so it is not inflated by how many instructions the line
 compiled into; in `mode=tb` and `mode=tb-insn-fast` every instruction of a block
-shares that block's entry count. The counter is 64-bit, because an idle loop
+shares that block's entry count, less the executions that left the block before
+reaching it (the TB table's early exits). The counter is 64-bit, because an idle loop
 overflows 32 bits easily.
 
 This used to be the optional `counts=1`. It is now unconditional, and the

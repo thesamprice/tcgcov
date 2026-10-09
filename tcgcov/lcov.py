@@ -29,6 +29,10 @@ import sys
 from collections import defaultdict
 
 
+# Covered lines from which a 100% result is suspicious rather than plausible.
+COMPLETE_COVERAGE_SUSPECT = 50
+
+
 def load(path):
     """Parse symbolized JSONL.
 
@@ -153,12 +157,14 @@ def run(args):
     # every covered line becomes its own denominator and the report reads
     # 100.0%. Counting the surplus is what makes that detectable.
     coverable_surplus = 0
+    declared_total = 0
     with open(args.out, "w") as out:
         for sf in sorted(all_files):
             covered = cov_lines.get(sf, set())
             declared = cab_lines.get(sf, set())
             coverable = declared | covered  # never lose a hit
             coverable_surplus += len(declared - covered)
+            declared_total += len(declared)
             # Functions: union; declaration line preferred from coverable.
             funcs = dict(cab_funcs.get(sf, {}))
             for fn, ln in cov_funcs.get(sf, {}).items():
@@ -196,7 +202,12 @@ def run(args):
             total_lf += len(coverable)
             total_lh += len(covered)
 
-    if args.coverable and not coverable_surplus:
+    # A small inventory can genuinely be fully covered: one short function in
+    # a per-section slice of a loaded object, measured exactly. Only an
+    # empty inventory, or "everything covered" across a large one, points at
+    # a missing or wrong denominator.
+    if args.coverable and not coverable_surplus and \
+            (not declared_total or total_lh >= COMPLETE_COVERAGE_SUSPECT):
         print(f"warning: {args.coverable} adds no lines beyond the covered "
               f"set, so the denominator is missing and every percentage below "
               f"is 100% by construction. Either the coverable inventory is "

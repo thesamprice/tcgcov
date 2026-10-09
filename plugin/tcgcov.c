@@ -99,6 +99,13 @@ enum {
      * version-1 file, whose reader would mis-stride the sections.
      */
     TCGCOV_FLAG_HAS_CTX     = 0x8,
+    /*
+     * A TB table and an early-exit section follow the edges (FORMAT.md
+     * section 12), and the header is the 136-byte extended form that
+     * locates them. Unknown to an older reader, which still reads every
+     * section it knows: none of them moves.
+     */
+    TCGCOV_FLAG_HAS_TB_TABLE = 0x10,
 };
 
 /* All multi-byte header fields are little-endian on disk. */
@@ -118,7 +125,16 @@ typedef struct tcgcov_header {
     uint64_t edge_count;
     uint64_t edges_offset;
     uint64_t edges_size;
+    /* Extended header (header_size 136), only with HAS_TB_TABLE: */
+    uint64_t tb_count;             /* TB table entries */
+    uint64_t tb_offset;
+    uint64_t tb_size;              /* entries + the instruction-size bytes */
+    uint64_t exit_count;           /* early-exit records */
+    uint64_t exit_offset;
+    uint64_t exit_size;
 } tcgcov_header;
+
+#define TCGCOV_HEADER_BASE 88      /* the header without the extension */
 
 /*
  * The on-disk header is the wire contract with the offline reader; it must be
@@ -127,7 +143,7 @@ typedef struct tcgcov_header {
  * attribute is needed - but assert it so a hostile ABI fails the build rather
  * than silently emitting an unreadable file.
  */
-G_STATIC_ASSERT(sizeof(tcgcov_header) == 88);
+G_STATIC_ASSERT(sizeof(tcgcov_header) == 136);
 
 /*
  * The total size only proves the struct as a whole is 88 bytes; it would still
@@ -149,6 +165,12 @@ G_STATIC_ASSERT(offsetof(tcgcov_header, records_size)    == 56);
 G_STATIC_ASSERT(offsetof(tcgcov_header, edge_count)      == 64);
 G_STATIC_ASSERT(offsetof(tcgcov_header, edges_offset)    == 72);
 G_STATIC_ASSERT(offsetof(tcgcov_header, edges_size)      == 80);
+G_STATIC_ASSERT(offsetof(tcgcov_header, tb_count)        == 88);
+G_STATIC_ASSERT(offsetof(tcgcov_header, tb_offset)       == 96);
+G_STATIC_ASSERT(offsetof(tcgcov_header, tb_size)         == 104);
+G_STATIC_ASSERT(offsetof(tcgcov_header, exit_count)      == 112);
+G_STATIC_ASSERT(offsetof(tcgcov_header, exit_offset)     == 120);
+G_STATIC_ASSERT(offsetof(tcgcov_header, exit_size)       == 128);
 
 CovState g_state;
 
@@ -188,6 +210,16 @@ typedef struct {
      * execution fast path never has to walk the filter ranges.
      */
     uint64_t last_insn_vaddr;
+
+    /*
+     * TB table (tb_table=on), fixed at translation: the block's byte length,
+     * its instruction count and each instruction's size -- every
+     * instruction of the block, filtered or not, so the extent is the
+     * block's own. A retranslation is a new CovTb with its own copy.
+     */
+    uint32_t size;
+    uint16_t n_insns;
+    uint8_t *insn_sizes;
 } CovTb;
 
 /*
@@ -277,6 +309,51 @@ typedef struct {
     uint64_t count;
 } CtxTbCount;
 
+/*
+ * An early exit: the vCPU left block `tb` at `pc` (an exception raised by
+ * the instruction at pc, or an interrupt taken before it) without reaching
+ * its last instruction. Per-vCPU, same ownership rule as the edge tables.
+ */
+typedef struct {
+    uint64_t ctx;
+    const CovTb *tb;
+    uint64_t pc;
+    uint64_t count;
+} TbExit;
+
+/*
+ * On-disk TB table entry (FORMAT.md section 12): 24 bytes, 32 with ctx (the
+ * ctx field leads, as in the other v2 records). The instruction sizes of
+ * all entries follow the entries, n_insns bytes each, in entry order.
+ */
+typedef struct {
+    uint64_t ctx;
+    uint64_t addr;
+    uint64_t count;
+    uint32_t size;
+    uint16_t n_insns;
+    uint16_t translations;         /* saturates at 0xFFFF */
+} TbEntry;
+
+G_STATIC_ASSERT(sizeof(TbEntry) == 32);
+G_STATIC_ASSERT(offsetof(TbEntry, addr) == 8);
+
+/* On-disk early-exit record: 32 bytes, 40 with ctx (ctx leads). */
+typedef struct {
+    uint64_t ctx;
+    uint64_t tb_addr;
+    uint64_t pc;
+    uint64_t count;
+    uint32_t tb_size;
+    uint32_t tb_index;             /* the TB entry, 0-based in table order */
+} ExitRec;
+
+G_STATIC_ASSERT(sizeof(ExitRec) == 40);
+G_STATIC_ASSERT(offsetof(ExitRec, tb_addr) == 8);
+
+
+/* tb_table= as given: -1 when absent (the mode decides), else 0/1. */
+static int g_tb_table_arg = -1;
 
 /* One-shot latch for the "cpu_index out of range" diagnostic. */
 static gint g_vcpu_overflow_warned;
@@ -408,6 +485,83 @@ static gboolean ctxtb_equal(gconstpointer a, gconstpointer b)
     const CtxTbCount *cb = b;
 
     return ca->ctx == cb->ctx && ca->tb == cb->tb;
+}
+
+static guint exit_hash(gconstpointer p)
+{
+    const TbExit *e = p;
+    uint64_t h = (uint64_t)(uintptr_t)e->tb * 0x9E3779B97F4A7C15ULL;
+
+    h ^= e->pc + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+    h ^= e->ctx + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+    return (guint)(h ^ (h >> 32));
+}
+
+static gboolean exit_equal(gconstpointer a, gconstpointer b)
+{
+    const TbExit *ea = a;
+    const TbExit *eb = b;
+
+    return ea->ctx == eb->ctx && ea->tb == eb->tb && ea->pc == eb->pc;
+}
+
+/*
+ * Record that this vCPU left block `ctb` early: `pc` is the FIRST
+ * instruction of the block that did not run in that execution (everything
+ * before it did). FORMAT.md section 12.
+ */
+static void record_exit(VcpuState *v, const CovTb *ctb, uint64_t pc)
+{
+    /*
+     * The context the block was entered -- and counted -- in, not the
+     * current one: the RTEMS loader hooks change the generation from an
+     * instruction callback inside a block.
+     */
+    TbExit key = { v->cur_tb_ctx, ctb, pc, 0 };
+    TbExit *e;
+
+    if (v->exits == NULL) {
+        v->exits = g_hash_table_new_full(exit_hash, exit_equal, g_free, NULL);
+    }
+    e = g_hash_table_lookup(v->exits, &key);
+    if (!e) {
+        e = g_new0(TbExit, 1);
+        *e = key;
+        g_hash_table_insert(v->exits, e, e);
+    }
+    e->count++;
+}
+
+static inline bool tb_holds(const CovTb *ctb, uint64_t pc)
+{
+    return pc >= ctb->tb_vaddr && pc - ctb->tb_vaddr < ctb->size;
+}
+
+/*
+ * Block entry with tb_table=on: this vCPU is now inside `ctb` and has not
+ * reached its last instruction. Called from the TB-entry callbacks.
+ *
+ * If the previous block did not reach its last instruction either, and this
+ * one starts inside it, QEMU abandoned it part way and resumed here with no
+ * interrupt or exception to report it: with icount, an instruction touching
+ * an I/O device mid-block ends the block and is re-executed as the start of
+ * a new one (cpu_io_recompile). That is an early exit at this pc.
+ */
+static inline void tb_enter(CovState *s, unsigned int cpu_index,
+                            const CovTb *ctb)
+{
+    VcpuState *v = vcpu_slot(s, cpu_index);
+
+    if (G_UNLIKELY(v == NULL)) {
+        return;
+    }
+    if (v->cur_tb != NULL && !v->cur_done &&
+        tb_holds(v->cur_tb, ctb->tb_vaddr)) {
+        record_exit(v, v->cur_tb, ctb->tb_vaddr);
+    }
+    v->cur_tb = ctb;
+    v->cur_tb_ctx = v->cur_ctx;
+    v->cur_done = false;
 }
 
 /*
@@ -545,6 +699,9 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     if (g_state.edges) {
         record_edge(&g_state, cpu_index, ctb->tb_vaddr);
     }
+    if (g_state.tb_table) {
+        tb_enter(&g_state, cpu_index, ctb);
+    }
 }
 
 /*
@@ -584,6 +741,9 @@ static void vcpu_tb_exec_ctx(unsigned int cpu_index, void *udata)
 
     if (s->edges) {
         record_edge(s, cpu_index, ctb->tb_vaddr);
+    }
+    if (s->tb_table) {
+        tb_enter(s, cpu_index, ctb);
     }
 }
 
@@ -637,6 +797,22 @@ static void vcpu_last_insn_exec(unsigned int cpu_index, void *udata)
     if (G_LIKELY(v != NULL)) {
         v->prev_src = ctb->last_insn_vaddr;
         v->prev_valid = true;
+        v->cur_done = true;
+    }
+}
+
+/*
+ * Last-instruction callback for tb_table=on when the edge callback above is
+ * not registered (edges off, or the last instruction out of range): the
+ * block ran to its end, so a discontinuity now is not an early exit.
+ */
+static void vcpu_tb_done(unsigned int cpu_index, void *udata)
+{
+    VcpuState *v = vcpu_slot(&g_state, cpu_index);
+
+    (void)udata;
+    if (G_LIKELY(v != NULL)) {
+        v->cur_done = true;
     }
 }
 
@@ -659,15 +835,47 @@ static void vcpu_discon(qemu_plugin_id_t id, unsigned int cpu_index,
                         uint64_t from_pc, uint64_t to_pc)
 {
     VcpuState *v = vcpu_slot(&g_state, cpu_index);
+    const CovTb *ctb;
 
     (void)id;
-    (void)type;
-    (void)from_pc;
     (void)to_pc;
 
-    if (G_LIKELY(v != NULL)) {
-        v->prev_valid = false;
+    if (G_UNLIKELY(v == NULL)) {
+        return;
     }
+    v->prev_valid = false;
+
+    /*
+     * An early exit: the vCPU is inside a block that has not reached its
+     * last instruction, and the event's PC lies in that block -- the
+     * instructions after from_pc did not run in this execution. An event
+     * between blocks has from_pc outside the block (or the block done).
+     */
+    ctb = v->cur_tb;
+    if (g_state.tb_table && ctb != NULL && !v->cur_done &&
+        tb_holds(ctb, from_pc)) {
+        /*
+         * An interrupt is taken before the instruction at from_pc, so that
+         * is the first one that did not run. An exception is raised BY the
+         * instruction at from_pc, which was reached: the first one that did
+         * not run is the next.
+         */
+        uint64_t pc = from_pc;
+
+        if (type == QEMU_PLUGIN_DISCON_EXCEPTION) {
+            uint64_t a = ctb->tb_vaddr;
+
+            for (size_t i = 0; i < ctb->n_insns; i++) {
+                a += ctb->insn_sizes[i];
+                if (a > from_pc) {
+                    pc = a;
+                    break;
+                }
+            }
+        }
+        record_exit(v, ctb, pc);
+    }
+    v->cur_tb = NULL;
 }
 #endif
 
@@ -753,7 +961,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         return;
     }
 
-    if (s->edges && n > 0) {
+    if ((s->edges || s->tb_table) && n > 0) {
         last_insn = qemu_plugin_tb_get_insn(tb, n - 1);
     }
 
@@ -771,7 +979,25 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         g_ptr_array_add(s->blocks, ctb);
     }
 
-    /* last_insn is non-NULL only when edges are on, which guarantees ctb. */
+    /*
+     * The block's extent, fixed now, at its translation. Every instruction
+     * counts, filtered or not: the extent is the block's own.
+     */
+    if (s->tb_table && ctb != NULL && n > 0) {
+        uint64_t end = qemu_plugin_insn_vaddr(last_insn) +
+                       qemu_plugin_insn_size(last_insn);
+
+        ctb->size = (uint32_t)(end - tb_vaddr);
+        ctb->n_insns = (uint16_t)MIN(n, 0xFFFF);
+        ctb->insn_sizes = g_new(uint8_t, ctb->n_insns);
+        for (size_t i = 0; i < ctb->n_insns; i++) {
+            ctb->insn_sizes[i] = (uint8_t)qemu_plugin_insn_size(
+                qemu_plugin_tb_get_insn(tb, i));
+        }
+        s->tb_translations++;
+    }
+
+    /* last_insn is non-NULL only with edges or tb_table, both with ctb. */
     if (last_insn != NULL && ctb != NULL) {
         uint64_t last_vaddr = qemu_plugin_insn_vaddr(last_insn);
 
@@ -837,6 +1063,9 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      */
     if (s->edges && last_in_range) {
         qemu_plugin_register_vcpu_insn_exec_cb(last_insn, vcpu_last_insn_exec,
+                                               QEMU_PLUGIN_CB_NO_REGS, ctb);
+    } else if (s->tb_table && last_insn != NULL) {
+        qemu_plugin_register_vcpu_insn_exec_cb(last_insn, vcpu_tb_done,
                                                QEMU_PLUGIN_CB_NO_REGS, ctb);
     }
 
@@ -956,6 +1185,13 @@ static char *build_metadata_json(CovState *s, uint64_t record_count,
      * want them must tolerate their absence in older files.
      */
     json_append_str(m, "insn_fidelity", fidelity_name(s->mode));
+    if (s->tb_table) {
+        g_string_append_printf(m, "  \"tb_table\": true,\n"
+                               "  \"tb_translations\": %" PRIu64 ",\n"
+                               "  \"tb_exits_tracked\": %s,\n",
+                               s->tb_translations,
+                               TCGCOV_HAVE_DISCON ? "true" : "false");
+    }
     if (s->flush_at) {
         g_string_append_printf(m, "  \"flush_at\": \"0x%" PRIx64 "\",\n",
                                s->flush_at);
@@ -1220,6 +1456,241 @@ static guint merge_addrs(GArray *pairs)
  * records_size must already be set. When edges are disabled all three edge
  * fields are zero and flag bit1 stays clear.
  */
+/* ------------------------------------------------------------------ */
+/* TB table (tb_table=on).                                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * One TB table entry being built. Its identity is (ctx, start, length, the
+ * instruction sizes): two different pieces of code can share a start and a
+ * length -- a reused load address, two processes -- yet split into
+ * different instructions, and must not be expanded with one another's.
+ */
+typedef struct {
+    TbEntry e;
+    const uint8_t *sizes;
+    guint index;                   /* position in the written table */
+} TbAgg;
+
+static guint tbagg_hash(gconstpointer p)
+{
+    const TbAgg *a = p;
+    uint64_t h = a->e.addr * 0x9E3779B97F4A7C15ULL;
+
+    h ^= a->e.size + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+    h ^= a->e.ctx + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+    for (uint16_t i = 0; i < a->e.n_insns; i++) {
+        h = (h ^ a->sizes[i]) * 0x100000001B3ULL;
+    }
+    return (guint)(h ^ (h >> 32));
+}
+
+static gboolean tbagg_equal(gconstpointer pa, gconstpointer pb)
+{
+    const TbAgg *x = pa;
+    const TbAgg *y = pb;
+
+    return x->e.ctx == y->e.ctx && x->e.addr == y->e.addr &&
+           x->e.size == y->e.size && x->e.n_insns == y->e.n_insns &&
+           memcmp(x->sizes, y->sizes, x->e.n_insns) == 0;
+}
+
+/* The aggregate for (ctx, ctb's code), created from ctb on first sight. */
+static TbAgg *tbagg_get(GHashTable *t, uint64_t ctx, const CovTb *ctb)
+{
+    TbAgg key = { { ctx, ctb->tb_vaddr, 0, ctb->size, ctb->n_insns, 0 },
+                  ctb->insn_sizes, 0 };
+    TbAgg *a = g_hash_table_lookup(t, &key);
+
+    if (a == NULL) {
+        a = g_new0(TbAgg, 1);
+        *a = key;
+        g_hash_table_insert(t, a, a);
+    }
+    return a;
+}
+
+static gint tbagg_cmp(gconstpointer pa, gconstpointer pb)
+{
+    const TbAgg *x = *(TbAgg *const *)pa;
+    const TbAgg *y = *(TbAgg *const *)pb;
+    const TbEntry *a = &x->e;
+    const TbEntry *b = &y->e;
+    int c;
+
+    if (a->ctx != b->ctx) {
+        return a->ctx < b->ctx ? -1 : 1;
+    }
+    if (a->addr != b->addr) {
+        return a->addr < b->addr ? -1 : 1;
+    }
+    if (a->size != b->size) {
+        return a->size < b->size ? -1 : 1;
+    }
+    if (a->n_insns != b->n_insns) {
+        return a->n_insns < b->n_insns ? -1 : 1;
+    }
+    c = memcmp(x->sizes, y->sizes, a->n_insns);
+    return c < 0 ? -1 : (c > 0);
+}
+
+static gint exitrec_cmp(gconstpointer pa, gconstpointer pb)
+{
+    const ExitRec *a = pa;
+    const ExitRec *b = pb;
+
+    if (a->tb_index != b->tb_index) {
+        return a->tb_index < b->tb_index ? -1 : 1;
+    }
+    return a->pc < b->pc ? -1 : (a->pc > b->pc);
+}
+
+/*
+ * Build the TB table: one entry per distinct (ctx, start, length) that
+ * executed, its count summed over every translation with that extent and
+ * `translations` the number of those translations (saturating). Returns
+ * the sorted entries (TbAgg*, owned by the returned array) and fills
+ * `exits` with the merged, sorted early-exit records. Called with the vCPUs
+ * quiescent (or, at flush_at, single-CPU only), like the other collectors.
+ */
+static GPtrArray *collect_tb_table(CovState *s, GArray *exits)
+{
+    /* aggs' values are owned by `out` once kept; zero-count ones are freed
+     * below. trans owns its own. */
+    GHashTable *aggs = g_hash_table_new(tbagg_hash, tbagg_equal);
+    GHashTable *trans = g_hash_table_new_full(tbagg_hash, tbagg_equal,
+                                              NULL, g_free);
+    GPtrArray *out = g_ptr_array_new_with_free_func(g_free);
+    GPtrArray *dead = g_ptr_array_new_with_free_func(g_free);
+    GHashTableIter it;
+    gpointer k, v;
+
+    /* Translations per distinct code, whatever the context. */
+    for (guint i = 0; i < s->blocks->len; i++) {
+        const CovTb *ctb = g_ptr_array_index(s->blocks, i);
+        TbAgg *a;
+
+        if (ctb->n_insns == 0) {
+            continue;
+        }
+        a = tbagg_get(trans, 0, ctb);
+        if (a->e.translations < 0xFFFF) {
+            a->e.translations++;
+        }
+        if (!s->ctx) {
+            TbAgg *c = tbagg_get(aggs, 0, ctb);
+
+            c->e.count += __atomic_load_n(&ctb->count, __ATOMIC_RELAXED);
+        }
+    }
+    if (s->ctx) {
+        for (size_t i = 0; i < s->vcpu_cap; i++) {
+            GHashTable *t = s->vcpu[i].ctx_tbs;
+
+            if (t == NULL) {
+                continue;
+            }
+            g_hash_table_iter_init(&it, t);
+            while (g_hash_table_iter_next(&it, &k, &v)) {
+                const CtxTbCount *c = v;
+
+                if (c->tb->n_insns) {
+                    tbagg_get(aggs, c->ctx, c->tb)->e.count += c->count;
+                }
+            }
+        }
+    }
+
+    g_hash_table_iter_init(&it, aggs);
+    while (g_hash_table_iter_next(&it, &k, &v)) {
+        TbAgg *a = v;
+        TbAgg tk = *a;
+        TbAgg *t;
+
+        tk.e.ctx = 0;
+        t = g_hash_table_lookup(trans, &tk);
+        a->e.translations = t ? t->e.translations : 1;
+        g_ptr_array_add(a->e.count ? out : dead, a);
+    }
+    g_ptr_array_sort(out, tbagg_cmp);
+    for (guint i = 0; i < out->len; i++) {
+        ((TbAgg *)g_ptr_array_index(out, i))->index = i;
+    }
+
+    /* Each exit names its entry by index: (start, length) alone would not
+     * tell two different pieces of code at the same address apart. */
+    for (size_t i = 0; i < s->vcpu_cap; i++) {
+        GHashTable *t = s->vcpu ? s->vcpu[i].exits : NULL;
+
+        if (t == NULL) {
+            continue;
+        }
+        g_hash_table_iter_init(&it, t);
+        while (g_hash_table_iter_next(&it, &k, &v)) {
+            const TbExit *e = v;
+            TbAgg key = { { e->ctx, e->tb->tb_vaddr, 0, e->tb->size,
+                            e->tb->n_insns, 0 }, e->tb->insn_sizes, 0 };
+            TbAgg *a = g_hash_table_lookup(aggs, &key);
+            ExitRec r;
+
+            if (a == NULL || a->e.count == 0) {
+                continue;                  /* cannot happen: it was entered */
+            }
+            r = (ExitRec){ e->ctx, e->tb->tb_vaddr, e->pc, e->count,
+                           e->tb->size, a->index };
+            g_array_append_val(exits, r);
+        }
+    }
+    g_array_sort(exits, exitrec_cmp);
+    /* Merge the same exit seen through several translations or vCPUs. */
+    if (exits->len > 1) {
+        guint w = 0;
+
+        for (guint r = 1; r < exits->len; r++) {
+            ExitRec *a = &g_array_index(exits, ExitRec, w);
+            ExitRec *b = &g_array_index(exits, ExitRec, r);
+
+            if (exitrec_cmp(a, b) == 0) {
+                a->count += b->count;
+            } else {
+                g_array_index(exits, ExitRec, ++w) = *b;
+            }
+        }
+        g_array_set_size(exits, w + 1);
+    }
+    g_hash_table_destroy(aggs);
+    g_hash_table_destroy(trans);
+    g_ptr_array_free(dead, TRUE);
+    return out;
+}
+
+static bool write_all(FILE *f, const void *buf, size_t len);
+
+static bool write_tb_table(CovState *s, FILE *f, GPtrArray *tbs,
+                           GArray *exits)
+{
+    bool ok = true;
+    size_t esz = s->ctx ? sizeof(TbEntry) : sizeof(TbEntry) - 8;
+    size_t xsz = s->ctx ? sizeof(ExitRec) : sizeof(ExitRec) - 8;
+    size_t skip = s->ctx ? 0 : 8;  /* v1 records omit the leading ctx */
+
+    for (guint i = 0; ok && i < tbs->len; i++) {
+        const TbAgg *a = g_ptr_array_index(tbs, i);
+
+        ok = write_all(f, (const char *)&a->e + skip, esz);
+    }
+    for (guint i = 0; ok && i < tbs->len; i++) {
+        const TbAgg *a = g_ptr_array_index(tbs, i);
+
+        ok = write_all(f, a->sizes, a->e.n_insns);
+    }
+    for (guint i = 0; ok && i < exits->len; i++) {
+        ok = write_all(f, (const char *)&g_array_index(exits, ExitRec, i)
+                          + skip, xsz);
+    }
+    return ok;
+}
+
 static void fill_edge_header(CovState *s, tcgcov_header *h, uint64_t n_edges)
 {
     if (!s->edges) {
@@ -1404,10 +1875,13 @@ static void write_artifact(CovState *s)
 {
     GArray *pairs;
     GArray *edges;
+    GPtrArray *tbs = NULL;
+    GArray *exits = g_array_new(FALSE, FALSE, sizeof(ExitRec));
     guint n_addrs, n_edges;
     char *meta;
     size_t meta_size;
     tcgcov_header h;
+    uint32_t hsize = s->tb_table ? sizeof(h) : TCGCOV_HEADER_BASE;
     char *tmp = NULL;
     FILE *f;
     bool ok;
@@ -1415,6 +1889,9 @@ static void write_artifact(CovState *s)
     g_mutex_lock(&s->lock);
     pairs = s->ctx ? collect_ctx_addrs(s) : collect_addrs(s);
     edges = collect_edges(s);
+    if (s->tb_table) {
+        tbs = collect_tb_table(s, exits);
+    }
     g_mutex_unlock(&s->lock);
 
     n_addrs = s->ctx ? merge_ctx_addrs(pairs) : merge_addrs(pairs);
@@ -1433,7 +1910,7 @@ static void write_artifact(CovState *s)
     memcpy(h.magic, TCGCOV_MAGIC, 8);
     h.version = s->ctx ? 2 : 1;
     h.endian = 1;                          /* file is written little-endian */
-    h.header_size = (uint32_t)sizeof(h);
+    h.header_size = hsize;          /* 88, or 136 with the TB table */
     h.record_type = mode_is_insn_granular(s->mode) ? TCGCOV_REC_INSN_ADDR
                                                    : TCGCOV_REC_TB_ADDR;
     h.flags = TCGCOV_FLAG_HAS_COUNTS;
@@ -1441,12 +1918,30 @@ static void write_artifact(CovState *s)
         h.flags |= TCGCOV_FLAG_HAS_CTX;
     }
     h.record_count = n_addrs;
-    h.metadata_offset = sizeof(h);
+    h.metadata_offset = hsize;
     h.metadata_size = meta_size;
-    h.records_offset = sizeof(h) + meta_size;
+    h.records_offset = hsize + meta_size;
     h.records_size = (uint64_t)n_addrs * (s->ctx ? sizeof(CtxAddrCount)
                                                  : sizeof(AddrCount));
     fill_edge_header(s, &h, n_edges);
+    if (tbs != NULL) {
+        uint64_t sizes = 0;
+
+        for (guint i = 0; i < tbs->len; i++) {
+            sizes += ((TbAgg *)g_ptr_array_index(tbs, i))->e.n_insns;
+        }
+        h.flags |= TCGCOV_FLAG_HAS_TB_TABLE;
+        h.tb_count = tbs->len;
+        h.tb_offset = s->edges ? h.edges_offset + h.edges_size
+                               : h.records_offset + h.records_size;
+        h.tb_size = tbs->len * (uint64_t)(s->ctx ? sizeof(TbEntry)
+                                                 : sizeof(TbEntry) - 8)
+                    + sizes;
+        h.exit_count = exits->len;
+        h.exit_offset = h.tb_offset + h.tb_size;
+        h.exit_size = exits->len * (uint64_t)(s->ctx ? sizeof(ExitRec)
+                                                     : sizeof(ExitRec) - 8);
+    }
 
     f = open_tmp(s->out_path, &tmp);
     if (!f) {
@@ -1454,7 +1949,7 @@ static void write_artifact(CovState *s)
         goto out;
     }
 
-    ok = write_all(f, &h, sizeof(h)) && write_all(f, meta, meta_size);
+    ok = write_all(f, &h, hsize) && write_all(f, meta, meta_size);
     for (guint i = 0; ok && i < n_addrs; i++) {
         /* Both structs are exactly their on-disk record. */
         if (s->ctx) {
@@ -1466,6 +1961,9 @@ static void write_artifact(CovState *s)
         }
     }
     ok = ok && write_edges(s, f, edges, n_edges);
+    if (tbs != NULL) {
+        ok = ok && write_tb_table(s, f, tbs, exits);
+    }
 
     /*
      * On any failure the temporary is removed and the rename is skipped: a
@@ -1496,6 +1994,10 @@ out:
     g_free(meta);
     g_array_free(pairs, TRUE);
     g_array_free(edges, TRUE);
+    g_array_free(exits, TRUE);
+    if (tbs != NULL) {
+        g_ptr_array_free(tbs, TRUE);
+    }
 }
 
 static void plugin_exit(qemu_plugin_id_t id, void *userdata)
@@ -1661,6 +2163,13 @@ static bool parse_arg(CovState *s, const char *arg)
         return parse_bool_arg(k, v, &s->edges);
     } else if (g_strcmp0(k, "ctx") == 0) {
         return parse_bool_arg(k, v, &s->ctx);
+    } else if (g_strcmp0(k, "tb_table") == 0) {
+        bool on;
+
+        if (!parse_bool_arg(k, v, &on)) {
+            return false;
+        }
+        g_tb_table_arg = on;
     } else if (g_strcmp0(k, "phys") == 0) {
         return parse_bool_arg(k, v, &s->phys);
     } else if (g_strcmp0(k, "rtl_state") == 0) {
@@ -1867,11 +2376,29 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         return -1;
     }
 
-    if (s->edges || s->ctx) {
+    /*
+     * The TB table is on by default where the address records are block
+     * starts (tb, tb-insn-fast). tb-insn already records every instruction
+     * and keeps no block counts; phys=on would give a block crossing a page
+     * a physical extent that need not be contiguous.
+     */
+    if (g_tb_table_arg == -1) {
+        s->tb_table = s->mode != TCGCOV_MODE_TB_INSN && !s->phys;
+    } else if (g_tb_table_arg) {
+        if (s->mode == TCGCOV_MODE_TB_INSN || s->phys) {
+            g_printerr("tcgcov: tb_table=on needs mode=tb or tb-insn-fast, "
+                       "and phys=off\n");
+            g_printerr("tcgcov: refusing to start\n");
+            return -1;
+        }
+        s->tb_table = true;
+    }
+
+    if (s->edges || s->ctx || s->tb_table) {
         alloc_vcpu_table(s, info);
         qemu_plugin_register_vcpu_init_cb(id, vcpu_init);
     }
-    if (s->edges) {
+    if (s->edges || s->tb_table) {
 #if TCGCOV_HAVE_DISCON
         qemu_plugin_register_vcpu_discon_cb(
             id,

@@ -15,9 +15,11 @@ import os
 import struct
 import sys
 
-from .format import (parse_header, unpack_records, unpack_edges,
+from .format import (FLAG_HAS_TB_TABLE, parse_header, unpack_records,
+                     unpack_edges,
                      unpack_ctx_records, unpack_ctx_edges, REC_TYPE,
-                     HEADER_FMT, MAGIC, FLAG_HAS_COUNTS,
+                     HEADER_FMT, HEADER_EXT_FMT, HEADER_EXT_SIZE, MAGIC,
+                     FLAG_HAS_COUNTS,
                      FLAG_HAS_EDGES, FLAG_EDGE_COUNTS, FLAG_HAS_CTX,
                      CTX_UNAVAILABLE)
 
@@ -79,7 +81,13 @@ def write_scrubbed(src_path, dst_path):
     edges = data[hdr["edges_offset"]:hdr["edges_offset"] + hdr["edges_size"]] \
         if hdr["edges_size"] else b""
 
-    hsize = struct.calcsize(HEADER_FMT)
+    has_tb = bool(hdr["flags"] & FLAG_HAS_TB_TABLE)
+    tb = data[hdr["tb_offset"]:hdr["tb_offset"] + hdr["tb_size"]] \
+        if has_tb else b""
+    exits = data[hdr["exit_offset"]:hdr["exit_offset"] + hdr["exit_size"]] \
+        if has_tb and hdr["exit_size"] else b""
+
+    hsize = HEADER_EXT_SIZE if has_tb else struct.calcsize(HEADER_FMT)
     meta_off = hsize
     rec_off = meta_off + len(new_meta)
     edge_off = rec_off + len(records) if edges else 0
@@ -92,10 +100,15 @@ def write_scrubbed(src_path, dst_path):
         hdr["record_type"], hdr["flags"], hdr["record_count"],
         meta_off, len(new_meta), rec_off, len(records),
         hdr["edge_count"], edge_off, len(edges))
+    if has_tb:
+        tb_off = rec_off + len(records) + len(edges)
+        header += struct.pack(HEADER_EXT_FMT, hdr["tb_count"], tb_off,
+                              len(tb), hdr["exit_count"], tb_off + len(tb),
+                              len(exits))
 
     tmp = dst_path + ".tmp"
     with open(tmp, "wb") as f:
-        f.write(header + new_meta + records + edges)
+        f.write(header + new_meta + records + edges + tb + exits)
     os.replace(tmp, dst_path)
 
 
@@ -171,6 +184,11 @@ def load(path):
         "records_size": hdr["records_size"],
         "edge_count": hdr["edge_count"], "edges_size": hdr["edges_size"],
     }
+    if flags & FLAG_HAS_TB_TABLE:
+        # The block extents behind a mode=tb artifact (FORMAT.md section 12);
+        # the addresses below are the raw block starts.
+        header.update({"has_tb_table": True, "tb_count": hdr["tb_count"],
+                       "exit_count": hdr["exit_count"]})
     return header, meta, addrs, counts, edges, ctx_summary
 
 

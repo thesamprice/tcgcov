@@ -77,11 +77,22 @@ class TestCoverableDenominator(unittest.TestCase):
 
     def test_coverable_from_the_wrong_binary_is_flagged(self):
         # Right shape, wrong file: nothing it lists survives the union, so the
-        # denominator again collapses onto the covered set.
+        # denominator again collapses onto the covered set. Across a large
+        # covered set, 100% is not believable.
+        lines = list(range(100, 160))
+        write_jsonl(self.cov, covered_records(lines))
+        write_jsonl(self.cab, covered_records(lines[:10]))
+        _rc, err = self._run("--coverable", self.cab)
+        self.assertEqual(self._totals(), (60, 60))
+        self.assertIn("warning", err.lower())
+
+    def test_a_small_fully_covered_inventory_is_not_flagged(self):
+        # One short function measured exactly (a per-section slice of a
+        # loaded object, say) really can be 100% covered.
         write_jsonl(self.cab, covered_records([10, 11]))
         _rc, err = self._run("--coverable", self.cab)
         self.assertEqual(self._totals(), (2, 2))
-        self.assertIn("warning", err.lower())
+        self.assertNotIn("warning", err.lower())
 
     def test_no_coverable_flag_is_not_warned_about(self):
         # Covered-only mode is a documented mode, not a broken denominator.

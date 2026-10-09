@@ -37,7 +37,8 @@ import os
 import re
 import sys
 
-from .format import read_all, write_cov, parse_header
+from .format import (read_all, write_cov, parse_header,
+                     effective_record_type)
 
 
 def _to_int(v):
@@ -143,7 +144,7 @@ def slice_cov(cov_path, windows, out_dir, ctx=None):
         m["rebased_window"] = "0x%x" % (w["end"] - w["start"])
         m["rebased_to"] = "0x0"
         write_cov(out, m, recs, kept_edges.get(i, []),
-                  record_type=hdr["record_type"])
+                  record_type=effective_record_type(hdr))
         outputs.append({"object": w["object"], "section": w["section"],
                         "file": w["file"], "out": out,
                         "records": len(recs),

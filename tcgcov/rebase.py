@@ -18,7 +18,8 @@ dropped records and edges is always printed -- silent truncation reads as
 import argparse
 import sys
 
-from .format import read_all, write_cov, parse_header
+from .format import (read_all, write_cov, parse_header,
+                     effective_record_type)
 
 
 def add_arguments(parser):
@@ -52,7 +53,7 @@ def run(args):
     meta["rebased_from"] = "0x%x" % args.base
     meta["rebased_window"] = "0x%x" % args.size
     meta["rebased_to"] = "0x%x" % args.to
-    write_cov(args.out, meta, kept, kept_edges, record_type=hdr["record_type"])
+    write_cov(args.out, meta, kept, kept_edges, record_type=effective_record_type(hdr))
 
     print(f"{args.cov}: kept {len(kept)}/{len(records)} records, "
           f"{len(kept_edges)}/{len(edges) if edges else 0} edges in "
