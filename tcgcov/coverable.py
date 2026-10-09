@@ -16,14 +16,15 @@ Two denominator sources, selected with --denominator:
   dwarf    Read `.debug_line` directly (tcgcov.dwarfline, pure stdlib): the
            line-number program already maps code addresses to (file, line) for
            all code, executed or not. No objdump, no addr2line. A relocatable
-           object (.o, .ko) is relocated first, and --section keeps the rows of
-           that section's sequences. Slightly less conservative -- a line-table
-           row is not proof that an instruction was emitted at that address --
-           and it does not see inlined CALL SITES, which addr2line -i reports
-           as extra frames. On a real picolibc image the DWARF denominator was
-           a strict subset of the objdump one: 662 identical lines plus 15
-           inlined call sites only objdump found. `lcov` unions the covered
-           lines into the denominator, so no hit is lost to that difference.
+           object (.o, .ko) is relocated first, and --section keeps that
+           section's lines. It reproduces what addr2line -i reports for each
+           instruction (dwarfline.iter_coverable_lines): per address the LAST
+           line-table row, plus the call site of every inlined range, counting
+           only code inside an executable section. On riscv and MicroBlaze
+           RTEMS images and objects it equals the objdump denominator exactly,
+           except where real code at address 0 (MicroBlaze vectors) overlaps
+           the debug info the linker left for discarded code there -- 23 of
+           ~13,300 lines, where addr2line's own pick is also wrong.
 
   auto     (default) objdump first, DWARF as a fallback when the objdump path
            fails or yields nothing usable. An unrecognized disassembly layout
@@ -51,14 +52,13 @@ from .paths import path_options, normalize_path
 
 DENOMINATOR_SOURCES = ("objdump", "dwarf", "auto")
 
-# Cross-check tolerances. The two sources are not expected to agree exactly:
-# addr2line -i adds the inlined call sites that a line-table row does not
-# mention, and the line table can name an address in a section objdump did not
-# disassemble. Only a difference big enough to mean "one of these parsers is
-# broken" is worth a warning.
+# Cross-check tolerances. The two sources compute the same thing (the DWARF
+# side models addr2line -i, call sites included), but debug info for code the
+# linker discarded can overlap real code at low addresses, so a handful of
+# lines may differ. Only a difference big enough to mean "one of these
+# parsers is broken" is worth a warning.
 CROSS_CHECK_MIN_LINES = 5       # absolute floor, so tiny binaries stay quiet
-CROSS_CHECK_FRACTION = 0.05     # of the union, for the DWARF-only direction
-CROSS_CHECK_INLINE_FRACTION = 0.5   # of the union, for the objdump-only one
+CROSS_CHECK_FRACTION = 0.05     # of the union, either direction
 
 
 def parse_addresses(text):
@@ -161,7 +161,7 @@ def dwarf_inventory(args, opts):
     base = dwarfline.section_base(elf, section) if section else 0
     seen = {}
     rows = 0
-    for addr, path, line, sec in dwarfline.iter_line_rows_by_section(
+    for addr, path, line, sec in dwarfline.iter_coverable_lines(
             elf, section):
         rows += 1
         norm = normalize_path(path, opts.source_root, opts.markers, opts.roots,
@@ -187,8 +187,6 @@ def cross_check_messages(objdump_seen, dwarf_seen):
     only_dwarf = b - a
     only_objdump = a - b
     margin = max(CROSS_CHECK_MIN_LINES, int(union * CROSS_CHECK_FRACTION))
-    inline_margin = max(CROSS_CHECK_MIN_LINES,
-                        int(union * CROSS_CHECK_INLINE_FRACTION))
 
     msgs = []
     if not a & b:
@@ -203,13 +201,12 @@ def cross_check_messages(objdump_seen, dwarf_seen):
             f"the DWARF line table names {len(only_dwarf)} source lines the "
             f"objdump denominator does not (of {union} total), e.g. {sample}. "
             f"The disassembly may be being parsed incompletely")
-    if len(only_objdump) > inline_margin:
+    if len(only_objdump) > margin:
         sample = ", ".join(f"{f}:{ln}" for f, ln in sorted(only_objdump)[:3])
         msgs.append(
             f"the objdump denominator names {len(only_objdump)} source lines "
             f"the DWARF line table does not (of {union} total), e.g. {sample}. "
-            f"Inlined call sites explain some of this, but not usually this "
-            f"many")
+            f"The DWARF reader may be missing call sites or sequences")
     return msgs
 
 

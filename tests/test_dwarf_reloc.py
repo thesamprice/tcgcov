@@ -29,7 +29,7 @@ DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data",
                     "rtl-reloc")
 with open(os.path.join(DATA, "expected.json")) as _f:
     EXPECTED = json.load(_f)
-FIXTURES = sorted(EXPECTED)
+FIXTURES = sorted(f for f in EXPECTED if f.endswith(".o"))
 
 
 def rows_of(path):
@@ -106,15 +106,38 @@ class DwarfDenominatorTest(unittest.TestCase):
                     self.assertEqual(self.inventory(f, sec),
                                      {tuple(x) for x in lines})
 
-    def test_superset_of_objdump_at_O2(self):
-        # Several rows at one address (-O2): addr2line reports only the last,
-        # the line table names them all -- never fewer lines. Function names
+    def test_matches_objdump_at_O2_with_inlining(self):
+        # Issue #23: per address only the last line-table row counts (what
+        # addr2line reports), plus the call site of every inlined range --
+        # pad_called/spin are inlined into pay_entry at -O2. Function names
         # differ on inlined lines (addr2line names the inlined function,
         # .symtab the one it was inlined into), so compare (file, line).
-        f = "pay_a-riscv32-O2.o"
-        for sec, lines in EXPECTED[f]["objdump_lines"].items():
-            got = {(fl, ln) for fl, ln, _fn in self.inventory(f, sec)}
-            self.assertLessEqual({(fl, ln) for fl, ln, _fn in lines}, got)
+        lines = EXPECTED["pay_a-riscv32-O2.o"]["objdump_lines"][".text.pay_entry"]
+        want = {(fl, ln) for fl, ln, _fn in lines}
+        for f, sec in (("pay_a-riscv32-O2.o", ".text.pay_entry"),
+                       ("pay_a-riscv32-O2-linked.elf", ".text")):
+            with self.subTest(f):
+                got = {(fl, ln) for fl, ln, _fn in self.inventory(f, sec)}
+                self.assertEqual(got, want)
+
+    def test_debug_info_of_discarded_code_is_not_coverable(self):
+        # gc.c's dropped() is removed by --gc-sections; its line rows stay,
+        # relocated near 0 (0x10, 0x28, 0x2c on MicroBlaze, whose address
+        # advances are constants). Only code inside an executable section
+        # counts, so its lines are not in the denominator -- as with objdump.
+        with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as t:
+            out = t.name
+        self.addCleanup(os.unlink, out)
+        rc = coverable.main(["--elf", os.path.join(DATA, "gc-microblaze.elf"),
+                             "--denominator", "dwarf", "--all-paths",
+                             "--no-cross-check", "--out", out])
+        self.assertEqual(rc, 0)
+        with open(out) as fh:
+            got = {(r["file"], r["line"]) for r in map(json.loads, fh)}
+        want = {(fl, ln) for fl, ln, _fn in
+                EXPECTED["gc-microblaze.elf"]["objdump_lines"][""]}
+        self.assertEqual(got, want)
+        self.assertNotIn(("/src/gc.c", 5), got)
 
     def test_linked_image_section_offsets_keep_their_function_names(self):
         # Review of PR #24: in a linked image, --section rows are offsets

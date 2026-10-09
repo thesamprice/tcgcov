@@ -41,7 +41,8 @@ from collections import namedtuple
 
 __all__ = ["DwarfError", "LineRow", "ElfInfo", "FunctionIndex",
            "SUPPORTED_VERSIONS", "read_elf", "parse_line_section",
-           "iter_line_rows", "iter_line_rows_by_section"]
+           "iter_line_rows", "iter_line_rows_by_section",
+           "iter_coverable_lines", "iter_inline_call_sites"]
 
 
 class DwarfError(RuntimeError):
@@ -70,6 +71,7 @@ SUPPORTED_VERSIONS = (2, 3, 4, 5)
 _WANTED_SECTIONS = (
     ".debug_line", ".debug_line_str", ".debug_str", ".debug_str_offsets",
     ".debug_info", ".debug_abbrev", ".symtab", ".strtab",
+    ".debug_rnglists", ".debug_ranges", ".debug_addr",
 )
 
 _SHF_COMPRESSED = 0x800
@@ -213,10 +215,15 @@ class _Reader:
 #   per index. line_sections: .debug_line offset -> the section index an
 #   address operand there was relocated against (set_address -> section).
 # machine: e_machine.
+# reloc_targets: for each relocated debug section, {offset: section index}
+#   of its absolute relocations against allocated sections (line_sections is
+#   the .debug_line one). exec_ranges: [(start, end)] of the executable
+#   sections of a linked image -- where real code is; code the linker
+#   discarded keeps debug info relocated to (near) 0, outside all of them.
 ElfInfo = namedtuple("ElfInfo", "path sections little is64 relocatable "
                                 "section_names section_addrs line_sections "
-                                "machine",
-                     defaults=(False, (), (), None, 0))
+                                "machine reloc_targets exec_ranges",
+                     defaults=(False, (), (), None, 0, None, ()))
 
 
 def _string_at(table, offset):
@@ -337,14 +344,18 @@ def read_elf(path, wanted=_WANTED_SECTIONS):
                                  % (path, name, e))
         sections[key] = raw
 
-    line_sections = None
+    targets = {}
     relocatable = e_type == _ET_REL
     if relocatable:
-        line_sections = _relocate_debug(path, data, headers, names, index_of,
-                                        sections, little, is64, e_machine)
+        targets = _relocate_debug(path, data, headers, names, index_of,
+                                  sections, little, is64, e_machine)
+    exec_ranges = tuple(sorted(
+        (h[5], h[5] + h[4]) for h in headers
+        if h[2] & _SHF_EXECINSTR_FLAG and h[4] and not relocatable))
     return ElfInfo(path, sections, little, is64, relocatable, tuple(names),
-                   tuple((h[5], h[4]) for h in headers), line_sections,
-                   e_machine)
+                   tuple((h[5], h[4]) for h in headers),
+                   targets.get(".debug_line"), e_machine, targets,
+                   exec_ranges)
 
 
 # --------------------------------------------------------------------------
@@ -363,7 +374,9 @@ def read_elf(path, wanted=_WANTED_SECTIONS):
 _ET_REL = 1
 _SHT_RELA, _SHT_REL = 4, 9
 _SHF_ALLOC_FLAG = 0x2
-_RELOCATED = (".debug_line", ".debug_info", ".debug_str_offsets")
+_RELOCATED = (".debug_line", ".debug_info", ".debug_str_offsets",
+              ".debug_rnglists", ".debug_ranges", ".debug_addr")
+_SHF_EXECINSTR_FLAG = 0x4
 
 _ABS, _ADD, _SUB, _SET, _SET6, _SUB6, _SET_ULEB, _SUB_ULEB = range(8)
 # e_machine -> {r_type: (operation, width)}; width in bytes.
@@ -415,9 +428,10 @@ def _relocate_debug(path, data, headers, names, index_of, sections, little,
                     is64, machine):
     """Apply the relocations of the debug sections in `sections`, in place.
 
-    Returns {.debug_line offset: section index} for the absolute
-    relocations in .debug_line whose symbol lives in an allocated section:
-    the sections the line table's set_address operands point into.
+    Returns {debug section: {offset: section index}} for the absolute
+    relocations whose symbol lives in an allocated section: the sections
+    the line table's set_address operands, and the address attributes and
+    range lists, point into.
     """
     prefix = "<" if little else ">"
     symtab_cache = {}
@@ -439,7 +453,7 @@ def _relocate_debug(path, data, headers, names, index_of, sections, little,
         return symtab_cache[link]
 
     ops = _RELOC_OPS.get(machine)
-    line_sections = {}
+    targets = {}
     for key in _RELOCATED:
         target = index_of.get(key)
         if target is None:
@@ -453,6 +467,7 @@ def _relocate_debug(path, data, headers, names, index_of, sections, little,
                              "whose relocations this reader does not know"
                              % (path, machine))
         buf = bytearray(sections[key])
+        where = targets.setdefault(key, {})
         for rh in relocs:
             rela = rh[1] == _SHT_RELA
             ent = (24 if is64 else 12) if rela else (16 if is64 else 8)
@@ -502,12 +517,11 @@ def _relocate_debug(path, data, headers, names, index_of, sections, little,
                 else:                                   # _SUB6
                     new = (cur & 0xC0) | ((cur - value - a) & 0x3F)
                 struct.pack_into(fmt, buf, r_off, new & mask)
-                if key == ".debug_line" and kind == _ABS and \
-                        0 < shndx < len(headers) and \
+                if kind == _ABS and 0 < shndx < len(headers) and \
                         headers[shndx][2] & _SHF_ALLOC_FLAG:
-                    line_sections[r_off] = shndx
+                    where[r_off] = shndx
         sections[key] = bytes(buf)
-    return line_sections
+    return targets
 
 
 # --------------------------------------------------------------------------
@@ -1097,6 +1111,300 @@ def section_base(elf, section):
     if section is None or elf.relocatable:
         return 0
     return elf.section_addrs[elf.section_names.index(section)][0]
+
+
+# --------------------------------------------------------------------------
+# Coverable lines: what `addr2line -i` would report for every instruction
+# --------------------------------------------------------------------------
+#
+# The objdump denominator resolves each instruction through `addr2line -i`,
+# which reports, per address, the LAST line-table row at that address, plus
+# for inlined code the call site of every inlined frame. Counting every row
+# instead (several rows share an address at -O2: declarations, views) gave
+# 37% more lines than objdump on a riscv RTEMS image while missing the call
+# sites (issue #23). iter_coverable_lines reproduces addr2line's view from
+# the DWARF alone: last row per address, plus DW_AT_call_file/call_line of
+# every DW_TAG_inlined_subroutine whose code survived linking.
+
+_TAG_INLINED_SUBROUTINE = 0x1D
+_AT_LOW_PC, _AT_HIGH_PC, _AT_RANGES = 0x11, 0x12, 0x55
+_AT_CALL_FILE, _AT_CALL_LINE = 0x58, 0x59
+_AT_ADDR_BASE, _AT_RNGLISTS_BASE = 0x73, 0x74
+_FORM_ADDR, _FORM_ADDRX = 0x01, (0x1B, 0x29, 0x2A, 0x2B, 0x2C)
+_FORM_RNGLISTX = 0x23
+
+
+class _AddrSpace:
+    """Resolve addresses (and, in a .o, their section) for one unit."""
+
+    def __init__(self, elf, addr_size, offset_size):
+        self.elf = elf
+        self.asz = addr_size
+        self.osz = offset_size
+        self.addr_base = 8 if offset_size == 4 else 16
+        self.rnglists_base = 12 if offset_size == 4 else 20
+        self.targets = elf.reloc_targets or {}
+
+    def sec(self, name, offset):
+        return self.targets.get(name, {}).get(offset)
+
+    def addrx(self, index):
+        data = self.elf.sections.get(".debug_addr", b"")
+        off = self.addr_base + index * self.asz
+        r = _Reader(data, self.elf.little, off, ".debug_addr")
+        return r.uint(self.asz), self.sec(".debug_addr", off)
+
+    def ranges(self, value, form, version, base):
+        """[(start, end, section)] of a DW_AT_ranges value."""
+        if version >= 5:
+            data = self.elf.sections.get(".debug_rnglists", b"")
+            if form == _FORM_RNGLISTX:
+                r = _Reader(data, self.elf.little,
+                            self.rnglists_base + value * self.osz,
+                            ".debug_rnglists")
+                off = self.rnglists_base + r.uint(self.osz)
+            else:
+                off = value
+            return self._rnglist(data, off, base)
+        return self._ranges_v4(self.elf.sections.get(".debug_ranges", b""),
+                               value, base)
+
+    def _rnglist(self, data, off, base):
+        out = []
+        r = _Reader(data, self.elf.little, off, ".debug_rnglists")
+        b_addr, b_sec = base
+        while True:
+            kind = r.u8()
+            if kind == 0:                                 # end_of_list
+                return out
+            if kind == 1:                                 # base_addressx
+                b_addr, b_sec = self.addrx(r.uleb())
+            elif kind == 2:                               # startx_endx
+                (a, sa), (b, _sb) = self.addrx(r.uleb()), self.addrx(r.uleb())
+                out.append((a, b, sa))
+            elif kind == 3:                               # startx_length
+                a, sa = self.addrx(r.uleb())
+                out.append((a, a + r.uleb(), sa))
+            elif kind == 4:                               # offset_pair
+                start, end = r.uleb(), r.uleb()
+                out.append((b_addr + start, b_addr + end, b_sec))
+            elif kind == 5:                               # base_address
+                pos = r.pos
+                b_addr = r.uint(self.asz)
+                b_sec = self.sec(".debug_rnglists", pos)
+            elif kind in (6, 7):                          # start_end/_length
+                pos = r.pos
+                a = r.uint(self.asz)
+                b = r.uint(self.asz) if kind == 6 else a + r.uleb()
+                out.append((a, b, self.sec(".debug_rnglists", pos)))
+            else:
+                raise DwarfError("unknown DW_RLE kind %d" % kind)
+
+    def _ranges_v4(self, data, off, base):
+        out = []
+        r = _Reader(data, self.elf.little, off, ".debug_ranges")
+        b_addr, b_sec = base
+        top = (1 << (8 * self.asz)) - 1
+        while True:
+            pos = r.pos
+            start, end = r.uint(self.asz), r.uint(self.asz)
+            if start == 0 and end == 0 and \
+                    self.sec(".debug_ranges", pos) is None:
+                return out
+            if start == top:                              # base selection
+                b_addr, b_sec = end, self.sec(".debug_ranges",
+                                              pos + self.asz)
+                continue
+            sec = self.sec(".debug_ranges", pos)
+            if sec is not None:                           # relocated pair
+                out.append((start, end, sec))
+            else:
+                out.append((b_addr + start, b_addr + end, b_sec))
+
+
+def iter_inline_call_sites(elf):
+    """Yield (start, end, file, line, section) per inlined code range.
+
+    One entry per address range of every DW_TAG_inlined_subroutine: its
+    DW_AT_call_file/DW_AT_call_line is the caller's line that addr2line -i
+    reports for any address in the range. `section` is known only in a
+    relocatable object. Best effort per unit, like _unit_metadata: a unit
+    that cannot be walked contributes nothing rather than stopping the rest.
+    """
+    info = elf.sections.get(".debug_info", b"")
+    abbrev_data = elf.sections.get(".debug_abbrev", b"")
+    line = elf.sections.get(".debug_line", b"")
+    if not info or not abbrev_data or not line:
+        return
+    strings = (elf.sections.get(".debug_str", b""),
+               elf.sections.get(".debug_line_str", b""))
+    metadata = _unit_metadata(elf)
+    abbrev_cache = {}
+    r = _Reader(info, elf.little, 0, ".debug_info")
+    while r.pos + 11 <= len(info):
+        length = r.u32()
+        offset_size = 4
+        if length == 0xFFFFFFFF:
+            offset_size = 8
+            length = r.u64()
+        elif length >= 0xFFFFFFF0 or length == 0:
+            return
+        unit_end = r.pos + length
+        if unit_end > len(info):
+            return
+        out = []
+        try:
+            version = r.u16()
+            if version >= 5:
+                unit_type = r.u8()
+                addr_size = r.u8()
+                abbrev_off = r.uint(offset_size)
+                if unit_type in (2, 6):
+                    r.skip(8 + offset_size)
+                elif unit_type in (4, 5):
+                    r.skip(8)
+            else:
+                abbrev_off = r.uint(offset_size)
+                addr_size = r.u8()
+            if abbrev_off not in abbrev_cache:
+                abbrev_cache[abbrev_off] = _parse_abbrev(
+                    abbrev_data, abbrev_off, elf.little)
+            abbrevs = abbrev_cache[abbrev_off]
+            space = _AddrSpace(elf, addr_size, offset_size)
+            header, file_cache, base = None, {}, (0, None)
+            while r.pos < unit_end:
+                code = r.uleb()
+                if not code:
+                    continue
+                tag, attrs = abbrevs[code]
+                vals = {}
+                for attr, form, const in attrs:
+                    pos = r.pos
+                    vals[attr] = (form, pos, _read_form(
+                        r, form, offset_size, addr_size, strings, const))
+                if header is None and tag in (_TAG_COMPILE_UNIT,
+                                              _TAG_SKELETON_UNIT):
+                    for attr, target in ((_AT_ADDR_BASE, "addr_base"),
+                                         (_AT_RNGLISTS_BASE,
+                                          "rnglists_base")):
+                        if isinstance(vals.get(attr, (0, 0, None))[2], int):
+                            setattr(space, target, vals[attr][2])
+                    base = _pc_value(space, vals.get(_AT_LOW_PC))
+                    stmt = vals.get(_AT_STMT_LIST, (0, 0, None))[2]
+                    if isinstance(stmt, int):
+                        lr = _Reader(line, elf.little, stmt, ".debug_line")
+                        header = _parse_header(lr, stmt, elf.little,
+                                               elf.sections, metadata)
+                    continue
+                if tag != _TAG_INLINED_SUBROUTINE or header is None:
+                    continue
+                call_file = vals.get(_AT_CALL_FILE, (0, 0, None))[2]
+                call_line = vals.get(_AT_CALL_LINE, (0, 0, None))[2]
+                if not isinstance(call_file, int) or not call_line:
+                    continue
+                path = _resolve_file(header, call_file, file_cache)
+                if path is None:
+                    continue
+                for start, end, sec in _die_ranges(space, vals, version,
+                                                   base):
+                    if end > start:
+                        out.append((start, end, path, call_line, sec))
+        except (DwarfError, struct.error, KeyError):
+            out = []                        # one bad unit must not lose the rest
+        r.pos = unit_end
+        for item in out:
+            yield item
+
+
+def _pc_value(space, val):
+    """(address, section) of a low_pc-style attribute value, or (0, None)."""
+    if val is None:
+        return 0, None
+    form, pos, value = val
+    if not isinstance(value, int):
+        return 0, None
+    if form in _FORM_ADDRX:
+        return space.addrx(value)
+    return value, space.sec(".debug_info", pos)
+
+
+def _die_ranges(space, vals, version, base):
+    if _AT_RANGES in vals:
+        form, _pos, value = vals[_AT_RANGES]
+        if isinstance(value, int):
+            return space.ranges(value, form, version, base)
+        return []
+    if _AT_LOW_PC not in vals or _AT_HIGH_PC not in vals:
+        return []
+    low, sec = _pc_value(space, vals[_AT_LOW_PC])
+    form, _pos, high = vals[_AT_HIGH_PC]
+    if not isinstance(high, int):
+        return []
+    if form == _FORM_ADDR or form in _FORM_ADDRX:
+        high = _pc_value(space, vals[_AT_HIGH_PC])[0]
+    else:
+        high = low + high                   # DWARF 4+: an offset from low
+    return [(low, high, sec)]
+
+
+def iter_coverable_lines(elf, section=None):
+    """Yield (address, file, line, section): addr2line -i's view of the code.
+
+    Per address the last line-table row (what addr2line reports), plus the
+    call site of every inlined range -- the line set the objdump denominator
+    gets by resolving each instruction with `addr2line -i`. In a linked image
+    only addresses inside an executable section count: code the linker
+    discarded keeps its debug info, relocated to (near) 0. With `section`,
+    only that section's lines, as 0-based offsets into it.
+    """
+    if not isinstance(elf, ElfInfo):
+        elf = read_elf(elf)
+    want, base, end = _section_window(elf, section)
+
+    def live(address, sec):
+        if elf.relocatable:
+            return sec is not None and (want is None or sec == want)
+        if want is not None:
+            return base <= address < end
+        if not elf.exec_ranges:             # no section table to go by:
+            return address != 0             # the address-0 rule alone
+        return any(lo <= address < hi for lo, hi in elf.exec_ranges)
+
+    last = {}
+    data = elf.sections.get(".debug_line", b"")
+    if not data:
+        raise DwarfError("%s: no .debug_line section (build with -g?)"
+                         % elf.path)
+    for row in parse_line_section(data, elf.little, elf.sections,
+                                  _unit_metadata(elf), elf.line_sections):
+        if row.end_sequence or not row.line or row.file is None:
+            continue
+        if not live(row.address, row.section):
+            continue
+        key = (row.section, row.address)
+        last.pop(key, None)                 # keep the LAST row, in order
+        last[key] = (row.file, row.line)
+    for (sec, address), (path, line) in last.items():
+        yield address - base, path, line, sec
+    for start, stop, path, line, sec in iter_inline_call_sites(elf):
+        if live(start, sec):
+            yield start - base, path, line, sec
+
+
+def _section_window(elf, section):
+    """(index, base, end) for a --section filter; (None, 0, None) without."""
+    if section is None:
+        return None, 0, None
+    if section not in elf.section_names:
+        raise DwarfError("%s: no section %s" % (elf.path, section))
+    if elf.section_names.count(section) > 1:
+        raise DwarfError("%s: several sections are named %s"
+                         % (elf.path, section))
+    want = elf.section_names.index(section)
+    if elf.relocatable:
+        return want, 0, None
+    start, size = elf.section_addrs[want]
+    return want, start, start + size
 
 
 def iter_line_rows_by_section(elf, section=None):

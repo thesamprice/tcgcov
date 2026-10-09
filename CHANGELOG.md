@@ -57,6 +57,22 @@ until 1.0.
 
 ### Fixed
 
+- **The DWARF denominator counts what addr2line reports** (#23). It took
+  every line-table row, so several rows at one address (`-O2` declarations,
+  views) were each counted, while the inlined call sites `addr2line -i`
+  reports were missed: 37% more lines than the objdump denominator on a riscv
+  RTEMS image (15,201 vs 11,130), and a cross-check warning on every report.
+  `dwarfline.iter_coverable_lines` now keeps the last row per address, adds
+  the `DW_AT_call_file`/`DW_AT_call_line` of every inlined range (walking
+  `.debug_info`, with `.debug_rnglists`/`.debug_ranges` and `.debug_addr`,
+  relocated in a `.o`), and counts only code inside an executable section.
+  On riscv and MicroBlaze RTEMS images and on every loaded-object section it
+  now equals the objdump denominator exactly; the one residue is MicroBlaze's
+  vector table at address 0, where 10–23 lines overlap debug info the linker
+  left for discarded code (addr2line's own pick is wrong there too). The
+  cross-check uses one 5% tolerance in both directions and is silent on all
+  of these runs (it warned 9 times before).
+
 - **`--section` on a relocatable object now means that section only** (#12).
   Every section of a `.o` starts at address 0, but `coverable` neither
   restricted the disassembly to the section nor passed `-j` to addr2line,

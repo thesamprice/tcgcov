@@ -1,4 +1,25 @@
 {
+ "gc-microblaze.elf": {
+  "objdump_lines": {
+   "": [
+    [
+     "/src/gc.c",
+     9,
+     "entry"
+    ],
+    [
+     "/src/gc.c",
+     10,
+     "entry"
+    ],
+    [
+     "/src/gc.c",
+     11,
+     "entry"
+    ]
+   ]
+  }
+ },
  "pay_a-microblaze-O0.o": {
   "objdump_lines": {
    ".text.pad_called": [
