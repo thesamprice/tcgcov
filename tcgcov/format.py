@@ -70,6 +70,16 @@ FLAG_HAS_COUNTS = 0x1
 FLAG_HAS_EDGES = 0x2
 FLAG_EDGE_COUNTS = 0x4
 FLAG_HAS_CTX = 0x8
+FLAG_HAS_TB_TABLE = 0x10
+
+# Extended header (FORMAT.md section 12), present with HAS_TB_TABLE: six
+# uint64 after the 88-byte base, locating the TB table and the early exits.
+HEADER_EXT_FMT = "<QQQQQQ"
+HEADER_EXT_FIELDS = ("tb_count", "tb_offset", "tb_size",
+                     "exit_count", "exit_offset", "exit_size")
+HEADER_EXT_SIZE = HEADER_SIZE + struct.calcsize(HEADER_EXT_FMT)   # 136
+TB_ENTRY_SIZE = 24                  # + 8 with HAS_CTX
+EXIT_SIZE = 32                      # + 8 with HAS_CTX
 
 # The producer's "no context available" marker (QEMU_PLUGIN_CTX_UNAVAILABLE).
 CTX_UNAVAILABLE = 2**64 - 1
@@ -139,8 +149,18 @@ def parse_header(data, path="<data>", total_size=None):
         raise ValueError(f"{path}: header_size {declared} is smaller than the "
                          f"{HEADER_SIZE}-byte TCGCOV1 header")
 
+    names = ["metadata", "records", "edges"]
+    if hdr["flags"] & FLAG_HAS_TB_TABLE:
+        if declared < HEADER_EXT_SIZE or len(data) < HEADER_EXT_SIZE:
+            raise ValueError(f"{path}: HAS_TB_TABLE set but the header is "
+                             f"{declared} bytes, not the {HEADER_EXT_SIZE}-"
+                             f"byte extended form")
+        hdr.update(zip(HEADER_EXT_FIELDS, struct.unpack_from(
+            HEADER_EXT_FMT, data, HEADER_SIZE)))
+        names += ["tb", "exit"]
+
     size = len(data) if total_size is None else total_size
-    for name in ("metadata", "records", "edges"):
+    for name in names:
         off, sz = hdr[name + "_offset"], hdr[name + "_size"]
         if not sz:
             continue                       # absent section; offset is unused
@@ -165,7 +185,102 @@ def parse_header(data, path="<data>", total_size=None):
         if hdr["edges_size"] % stride:
             raise ValueError(f"{path}: edges_size {hdr['edges_size']} is not "
                              f"a multiple of the {stride}-byte edge stride")
+    if flags & FLAG_HAS_TB_TABLE:
+        esz = TB_ENTRY_SIZE + (8 if has_ctx else 0)
+        xsz = EXIT_SIZE + (8 if has_ctx else 0)
+        if hdr["tb_size"] < hdr["tb_count"] * esz:
+            raise ValueError(f"{path}: tb_size {hdr['tb_size']} is too small "
+                             f"for {hdr['tb_count']} TB entries")
+        if hdr["exit_size"] != hdr["exit_count"] * xsz:
+            raise ValueError(f"{path}: exit_size {hdr['exit_size']} is not "
+                             f"{hdr['exit_count']} x {xsz}-byte exit records")
     return hdr
+
+
+def effective_record_type(hdr):
+    """The record type read_full/read_all actually return for this header.
+
+    A mode=tb artifact with a TB table is expanded on read into instruction
+    records, so a tool that writes what it read must label it type 2.
+    """
+    if hdr["record_type"] == 1 and hdr["flags"] & FLAG_HAS_TB_TABLE:
+        return 2
+    return hdr["record_type"]
+
+
+def unpack_tb_table(data, hdr):
+    """Decode the TB table -> (entries, exits); ([], []) without one.
+
+    entries: [(ctx, addr, count, size, n_insns, translations, insn_sizes)],
+    insn_sizes a bytes object of n_insns sizes. exits: [(ctx, tb_addr,
+    tb_size, pc, count)]. ctx is None in a version-1 file.
+    """
+    if not hdr["flags"] & FLAG_HAS_TB_TABLE or not hdr.get("tb_count"):
+        return [], []
+    has_ctx = bool(hdr["flags"] & FLAG_HAS_CTX)
+    lead = 8 if has_ctx else 0
+    esz = TB_ENTRY_SIZE + lead
+    n, off = hdr["tb_count"], hdr["tb_offset"]
+    sizes_off = off + n * esz
+    sizes_end = off + hdr["tb_size"]
+    entries = []
+    for i in range(n):
+        o = off + i * esz
+        ctx = struct.unpack_from("<Q", data, o)[0] if has_ctx else None
+        addr, count, size, n_insns, trans = struct.unpack_from(
+            "<QQIHH", data, o + lead)
+        if sizes_off + n_insns > sizes_end:
+            raise ValueError("TB table: instruction sizes run past tb_size")
+        isz = data[sizes_off:sizes_off + n_insns]
+        sizes_off += n_insns
+        if sum(isz) != size:
+            raise ValueError("TB table: block at 0x%x has size %d but its "
+                             "instructions add up to %d" % (addr, size,
+                                                             sum(isz)))
+        entries.append((ctx, addr, count, size, n_insns, trans, bytes(isz)))
+    if sizes_off != sizes_end:
+        raise ValueError("TB table: %d trailing bytes after the instruction "
+                         "sizes" % (sizes_end - sizes_off))
+    exits = []
+    xsz = EXIT_SIZE + lead
+    for i in range(hdr["exit_count"]):
+        o = hdr["exit_offset"] + i * xsz
+        ctx = struct.unpack_from("<Q", data, o)[0] if has_ctx else None
+        tb_addr, pc, count, tb_size, _res = struct.unpack_from(
+            "<QQQII", data, o + lead)
+        exits.append((ctx, tb_addr, tb_size, pc, count))
+    return entries, exits
+
+
+def _in_filters(addr, filters):
+    return not filters or any(lo <= addr < hi for lo, hi in filters)
+
+
+def expand_tb_records(entries, exits, filters=()):
+    """Block entries -> {(ctx, insn_addr): count}, exactly.
+
+    Every instruction of an executed block ran as many times as the block
+    was entered, less the times the block was left early at or before it:
+    an exit record's pc is the first instruction that did NOT run in that
+    execution. Instructions outside the plugin's filter ranges are not
+    reported, as in the other modes.
+    """
+    by_tb = {}
+    for ctx, tb_addr, tb_size, pc, count in exits:
+        by_tb.setdefault((ctx, tb_addr, tb_size), []).append((pc, count))
+    out = {}
+    for ctx, addr, count, size, _n, _trans, isz in entries:
+        early = sorted(by_tb.get((ctx, addr, size), ()))
+        k, left, a = 0, count, addr
+        for width in isz:
+            while k < len(early) and early[k][0] <= a:
+                left -= early[k][1]
+                k += 1
+            if left > 0 and _in_filters(a, filters):
+                key = (ctx, a)
+                out[key] = out.get(key, 0) + left
+            a += width
+    return out
 
 
 def unpack_records(data, off, size, has_counts):
@@ -241,7 +356,7 @@ def read_metadata(path):
     reach a few hundred bytes of JSON at the front, so this seeks instead.
     """
     with open(path, "rb") as f:
-        head = f.read(HEADER_SIZE)
+        head = f.read(HEADER_EXT_SIZE)
         hdr = parse_header(head, path, total_size=os.fstat(f.fileno()).st_size)
         off, size = hdr["metadata_offset"], hdr["metadata_size"]
         if not size:
@@ -254,13 +369,22 @@ def read_metadata(path):
     return json.loads(raw.decode("utf-8"))
 
 
-def read_full(path):
+def read_full(path, expand=True):
     """Return (metadata, header, records, edges) with contexts preserved.
 
     records is [(ctx, addr, count)] and edges [(ctx, src, dst, count)]. For a
     file without context records (TCGCOV1, or v2 without HAS_CTX) every ctx is
     None; count is None for count-less address records. This is the one reader
     that exposes the v2 context axis raw; read_all() collapses it.
+
+    A mode=tb artifact with a TB table (HAS_TB_TABLE) is returned expanded:
+    each block start becomes the block's instructions with their exact
+    counts (expand_tb_records), and the returned header says record_type 2
+    with `tb_expanded` set -- so every consumer sees instruction-granular
+    records without knowing the table exists. A tb-insn-fast artifact's
+    records (every instruction at its block's full count) are replaced the
+    same way, which corrects them for blocks left early. expand=False
+    returns the records as written.
     """
     with open(path, "rb") as f:
         data = f.read()
@@ -278,16 +402,42 @@ def read_full(path):
             edges = unpack_ctx_edges(data, hdr["edges_offset"],
                                      hdr["edges_size"],
                                      bool(flags & FLAG_EDGE_COUNTS))
-        return meta, hdr, records, edges
+    else:
+        addrs, counts = unpack_records(data, hdr["records_offset"],
+                                       hdr["records_size"], has_counts)
+        records = [(None, a, counts[a] if counts else None) for a in addrs]
+        edges = []
+        if flags & FLAG_HAS_EDGES and hdr["edges_size"]:
+            edges = [(None, s, d, c) for s, d, c in
+                     unpack_edges(data, hdr["edges_offset"],
+                                  hdr["edges_size"],
+                                  bool(flags & FLAG_EDGE_COUNTS))]
 
-    addrs, counts = unpack_records(data, hdr["records_offset"],
-                                   hdr["records_size"], has_counts)
-    records = [(None, a, counts[a] if counts else None) for a in addrs]
-    edges = []
-    if flags & FLAG_HAS_EDGES and hdr["edges_size"]:
-        edges = [(None, s, d, c) for s, d, c in
-                 unpack_edges(data, hdr["edges_offset"], hdr["edges_size"],
-                              bool(flags & FLAG_EDGE_COUNTS))]
+    if expand and flags & FLAG_HAS_TB_TABLE and (
+            hdr["record_type"] == 1 or meta.get("mode") == "tb-insn-fast"):
+        try:
+            entries, exits = unpack_tb_table(data, hdr)
+        except (struct.error, ValueError) as e:
+            raise ValueError(f"{path}: {e}")
+        filters = []
+        for r in meta.get("filters") or []:
+            try:
+                filters.append((int(r["start"], 0), int(r["end"], 0)))
+            except (KeyError, TypeError, ValueError):
+                pass
+        expanded = expand_tb_records(entries, exits, filters)
+        if hdr["record_type"] == 1:
+            starts = {(e[0], e[1]) for e in entries}
+            for c, a, n in records:      # a start the table does not cover
+                if (c, a) not in starts:
+                    expanded[(c, a)] = expanded.get((c, a), 0) + (n or 1)
+        # tb-insn-fast records are the same blocks' instructions, each at the
+        # block's full count; the table's exits make them exact, so the
+        # expansion replaces them.
+        records = [(c, a, n) for (c, a), n in
+                   sorted(expanded.items(),
+                          key=lambda kv: (kv[0][0] or 0, kv[0][1]))]
+        hdr = dict(hdr, record_type=2, tb_expanded=True)
     return meta, hdr, records, edges
 
 
@@ -357,7 +507,7 @@ def read_edges(path):
 
 
 def write_cov(path, meta, records, edges=None, record_type=1, ctx=False,
-              edges_recorded=False):
+              edges_recorded=False, tb_table=None, tb_exits=None):
     """Write a TCGCOV artifact: the inverse of read_all/read_full.
 
     With ctx=False (the default), a TCGCOV1 file: `records` is a list of
@@ -373,6 +523,10 @@ def write_cov(path, meta, records, edges=None, record_type=1, ctx=False,
     edges_recorded=True sets the edge flags even when `edges` is empty: a
     slice cut from an edges=on artifact that happens to hold no edge of its
     own still had edges recorded, and must not read as an edges=off run.
+
+    tb_table (with HAS_TB_TABLE and the 136-byte header, FORMAT.md section
+    12) is [(addr, count, translations, insn_sizes)] -- (ctx, ...) first with
+    ctx=True -- and tb_exits [(tb_addr, tb_size, pc, count)], likewise.
     """
     blob = json.dumps(meta, sort_keys=True).encode("utf-8")
     flags = FLAG_HAS_COUNTS
@@ -382,16 +536,40 @@ def write_cov(path, meta, records, edges=None, record_type=1, ctx=False,
         flags |= FLAG_HAS_CTX
         records = sorted(records)
         edges = sorted(edges) if edges else edges
+    hsize = HEADER_EXT_SIZE if tb_table is not None else HEADER_SIZE
+    if tb_table is not None:
+        flags |= FLAG_HAS_TB_TABLE
     magic, version = MAGIC, (2 if ctx else 1)
     rec_words, edge_words = (3, 4) if ctx else (2, 3)
-    records_off = HEADER_SIZE + len(blob)
+    records_off = hsize + len(blob)
     records_size = len(records) * 8 * rec_words
     edges_off = records_off + records_size if edges else 0
     edges_size = len(edges) * 8 * edge_words if edges else 0
-    hdr = struct.pack(HEADER_FMT, magic, version, 1, HEADER_SIZE, record_type,
-                      flags, len(records), HEADER_SIZE, len(blob),
+    hdr = struct.pack(HEADER_FMT, magic, version, 1, hsize, record_type,
+                      flags, len(records), hsize, len(blob),
                       records_off, records_size,
                       len(edges) if edges else 0, edges_off, edges_size)
+    tail = b""
+    if tb_table is not None:
+        lead = 1 if ctx else 0
+        entries, sizes = b"", b""
+        for e in sorted(tb_table):
+            prefix = struct.pack("<Q", e[0]) if ctx else b""
+            addr, count, trans, isz = e[lead:]
+            entries += prefix + struct.pack("<QQIHH", addr, count, sum(isz),
+                                            len(isz), trans)
+            sizes += bytes(isz)
+        exits = b""
+        for x in sorted(tb_exits or []):
+            prefix = struct.pack("<Q", x[0]) if ctx else b""
+            tb_addr, tb_size, pc, count = x[lead:]
+            exits += prefix + struct.pack("<QQQII", tb_addr, pc, count,
+                                          tb_size, 0)
+        tb_off = records_off + records_size + edges_size
+        tb_size = len(entries) + len(sizes)
+        hdr += struct.pack(HEADER_EXT_FMT, len(tb_table), tb_off, tb_size,
+                           len(tb_exits or []), tb_off + tb_size, len(exits))
+        tail = entries + sizes + exits
     with open(path, "wb") as f:
         f.write(hdr)
         f.write(blob)
@@ -401,3 +579,4 @@ def write_cov(path, meta, records, edges=None, record_type=1, ctx=False,
         edge_fmt = "<%dQ" % edge_words
         for e in (edges or []):
             f.write(struct.pack(edge_fmt, *e))
+        f.write(tail)

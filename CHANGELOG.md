@@ -11,6 +11,27 @@ until 1.0.
 
 ### Added
 
+- **The TB table: `mode=tb` counts every instruction exactly** (#25). A
+  `mode=tb` record is a block's start; the block's extent was not stored, so
+  a line whose instructions all sit mid-block read 0 (`pay_a.c:41` in
+  `examples/rtems-dl`). The plugin now writes, by default with `mode=tb` and
+  `mode=tb-insn-fast` (`tb_table=off` to omit), a TB table: per executed
+  extent its byte length, instruction count, each instruction's size (taken
+  at first translation) and a saturating translation count, plus **early
+  exits** -- where a block was left before its last instruction, from an
+  interrupt, an exception, or (with `icount`) an I/O instruction that ends the
+  block and resumes as a new one. It follows the edges, located by a 136-byte
+  extended header (`HAS_TB_TABLE`, FORMAT.md §12); older readers still read
+  everything else. `format.read_full` expands block starts into instructions,
+  each counted as often as its block was entered less the exits at or before
+  it, so every tool sees exact instruction records unchanged. On the riscv
+  reuse fixture a `mode=tb` run now equals a `mode=tb-insn` run on all 13,399
+  instructions (the idle loop's run-length-dependent count aside), and
+  `tb-insn-fast` is corrected the same way (51 differing instructions -> 0).
+  `pay_a.c` goes from 9 to 15 of 19 lines hit, with `:41` counted. `dump`
+  shows the table, `dump --scrub-out` keeps it, and `modmap`/`rebase` label
+  expanded records as instructions.
+
 - **`flush_at=<addr>` plugin argument, and RTEMS dynamic-object coverage
   verified on MicroBlaze** (#15). RTEMS on QEMU's `petalogix-s3adsp1800`
   ends with `fatal: Microblaze: unaligned PC=ffffffff`; QEMU's abort skips
@@ -56,6 +77,11 @@ until 1.0.
   of the normal build, where `main` dropped 10 records.
 
 ### Fixed
+
+- **`lcov` no longer flags a small, fully covered inventory as a missing
+  denominator.** Exact per-instruction coverage of one short function (a
+  per-section slice of a loaded object) can be 100%; the warning now needs an
+  empty inventory or complete coverage of at least 50 lines.
 
 - **The DWARF denominator counts what addr2line reports** (#23). It took
   every line-table row, so several rows at one address (`-O2` declarations,

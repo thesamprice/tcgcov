@@ -102,9 +102,17 @@ typedef struct {
      */
     uint64_t cur_ctx;
     GHashTable *ctx_tbs;       /* CtxTbCount* -> same, keyed on (ctx,tb) */
+    /*
+     * TB table (tb_table=on): the block this vCPU entered last, whether its
+     * last instruction has been reached, and the early exits seen -- an
+     * exception or interrupt taken inside a block that had not finished.
+     */
+    const void *cur_tb;
+    GHashTable *exits;         /* TbExit* -> same, keyed on (ctx,tb,pc) */
     bool prev_valid;
-    char pad[TCGCOV_CACHELINE - 2 * sizeof(uint64_t) - 2 * sizeof(void *)
-             - sizeof(bool)];
+    bool cur_done;
+    char pad[TCGCOV_CACHELINE - 2 * sizeof(uint64_t) - 4 * sizeof(void *)
+             - 2 * sizeof(bool)];
 } VcpuState;
 
 G_STATIC_ASSERT(sizeof(VcpuState) == TCGCOV_CACHELINE);
@@ -155,6 +163,16 @@ typedef struct {
      */
     uint64_t flush_at;
     gint flushed;                  /* atomic: the flush ran */
+
+    /*
+     * tb_table=on (default with mode=tb / tb-insn-fast): write a TB table
+     * of every executed block's extent -- byte length, instruction count
+     * and each instruction's size, taken at its first translation -- with
+     * its translation count and the early exits taken inside it, so a
+     * reader can expand block starts into exact per-instruction records.
+     */
+    bool tb_table;
+    uint64_t tb_translations;      /* translations of in-range blocks */
 
     /*
      * phys=on: translations that failed the debug MMU walk and fell back to
