@@ -8,4 +8,4 @@ recursive-include plugin *.c Makefile .gitignore
 recursive-include docs *.md
 recursive-include examples *.c *.md
 recursive-include tests *.py
-recursive-include tests/data *.txt *.json *.md *.o *.elf
+recursive-include tests/data *.txt *.json *.md *.o *.elf *.c
