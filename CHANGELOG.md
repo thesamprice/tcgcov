@@ -11,6 +11,9 @@ until 1.0.
 
 ### Added
 
+- **`report --genhtml-arg=ARG`** passes ARG to genhtml after tcgcov's own
+  options (repeatable).
+
 - **The TB table: `mode=tb` counts every instruction exactly** (#25). A
   `mode=tb` record is a block's start; the block's extent was not stored, so
   a line whose instructions all sit mid-block read 0 (`pay_a.c:41` in
@@ -77,6 +80,19 @@ until 1.0.
   of the normal build, where `main` dropped 10 records.
 
 ### Fixed
+
+- **`--html` works with lcov 2.** lcov 2 refuses a trace file in which a
+  line is hit but none of its branches was evaluated ("line is hit but no
+  branches on line have been evaluated"), and genhtml failed the whole
+  report. tcgcov writes such lines faithfully: when the optimizer duplicates
+  a line, the copy that ran may hold no branch while the copies holding its
+  branches never ran (newlib's `vfprintf.c:1428` on riscv32). gcov cannot
+  produce this, so lcov reads it as corruption. Writing `0` for those
+  branches would claim they were evaluated, so the data stays as it is and
+  `report`, `restrict` and `gap` instead run genhtml with `--ignore-errors
+  inconsistent` when it belongs to lcov 2 or later. The check still prints a
+  warning. lcov 1.x, which has no such category, is detected and left alone
+  (`tcgcov/genhtml.py`).
 
 - **`lcov` no longer flags a small, fully covered inventory as a missing
   denominator.** Exact per-instruction coverage of one short function (a

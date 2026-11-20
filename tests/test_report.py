@@ -505,6 +505,20 @@ class TestHtml(ReportTestCase):
         self.assertEqual(rc, 1)
         self.assertIn("genhtml failed", err)
 
+    def test_genhtml_args_are_passed_through(self):
+        rc, _, seen = self._run_with_genhtml(
+            0, "--html", "--genhtml-arg=--title=nightly",
+            "--genhtml-arg=--legend")
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen["cmd"][-2:], ["--title=nightly", "--legend"])
+
+    def test_lcov2_inconsistent_is_ignored(self):
+        with mock.patch("tcgcov.genhtml.lcov_major", return_value=2):
+            rc, _, seen = self._run_with_genhtml(0, "--html")
+        self.assertEqual(rc, 0)
+        self.assertIn("inconsistent", seen["cmd"][
+            seen["cmd"].index("--ignore-errors") + 1])
+
     def test_branch_flag_omitted_without_branch_data(self):
         self.branches.rc = 2
         rc, _, seen = self._run_with_genhtml(0, "--html")

@@ -446,7 +446,11 @@ coverage/lcov/aggregate-<arch>.info      <- the report
 ```
 
 Add `--html` for `coverage/html/index.html` as well (that needs `genhtml` from
-lcov installed; the `.info` does not).
+lcov installed; the `.info` does not). With lcov 2, genhtml is run with
+`--ignore-errors inconsistent`: a line can be hit while none of its branches
+was evaluated, when the copy of an optimizer-duplicated line that ran holds
+no branch, and lcov 2 otherwise rejects the report. `--genhtml-arg=ARG`
+passes further options to genhtml.
 
 This is the command to use for a report. It is not a convenience wrapper over a
 pipeline you were otherwise expected to assemble: **every producer must be given
