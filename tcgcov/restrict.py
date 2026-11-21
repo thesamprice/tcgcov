@@ -25,6 +25,7 @@ from .lcov import emit_branches
 from .merge import parse_info
 from .cliargs import add_symbolize_args
 from .paths import path_options
+from . import genhtml as genhtml_mod
 
 
 def load_target_inventory(args):
@@ -88,9 +89,8 @@ def run_genhtml(info, html_dir, source_root, ok_message):
     cwd = source_root or "/"
     try:
         rc = subprocess.run(
-            ["genhtml", os.path.abspath(info),
-             "--output-directory", os.path.abspath(html_dir),
-             "--quiet", "--ignore-errors", "source"],
+            genhtml_mod.command(os.path.abspath(info),
+                                os.path.abspath(html_dir)),
             cwd=cwd).returncode
     except OSError as e:
         print(f"warning: --html requested but genhtml could not be run "

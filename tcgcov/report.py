@@ -44,6 +44,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from . import addr2line as symbolize_mod
 from . import branches as branches_mod
+from . import genhtml as genhtml_mod
 from . import cfg
 from . import coverable as coverable_mod
 from . import lcov as lcov_mod
@@ -107,6 +108,11 @@ def add_arguments(parser):
                              "(default directory: <out-dir>/html)")
     parser.add_argument("--genhtml", default="genhtml",
                         help="genhtml path (default: genhtml)")
+    parser.add_argument("--genhtml-arg", action="append", default=[],
+                        metavar="ARG", dest="genhtml_args",
+                        help="pass ARG to genhtml (repeatable), after "
+                             "tcgcov's own options; use the = form, e.g. "
+                             "--genhtml-arg=--title=nightly")
 
 
 # --- helpers ----------------------------------------------------------------
@@ -516,11 +522,10 @@ def _genhtml(args, agg, branch_coverage):
     """Render the aggregate, from the source root so relative SF paths resolve."""
     html_dir = args.html or os.path.join(args.out_dir, "html")
     os.makedirs(html_dir, exist_ok=True)
-    cmd = [args.genhtml, os.path.abspath(agg),
-           "--output-directory", os.path.abspath(html_dir),
-           "--quiet", "--ignore-errors", "source"]
-    if branch_coverage:
-        cmd.append("--branch-coverage")
+    cmd = genhtml_mod.command(os.path.abspath(agg), os.path.abspath(html_dir),
+                              genhtml=args.genhtml,
+                              branch_coverage=branch_coverage,
+                              extra=args.genhtml_args)
     # genhtml resolves relative SF paths against cwd; absolute paths
     # (--all-paths) resolve anywhere, so fall back to '/' with no source root.
     try:
